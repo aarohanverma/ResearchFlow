@@ -1,0 +1,96 @@
+# ResearchFlow — Production Docker Compose
+#
+# Prerequisites:
+#   1. Copy .env.example → .env and fill in required values.
+#   2. Run from the build/ directory:
+#        cd build && docker compose up --build
+#
+# Services exposed on host:
+#   Frontend  →  http://localhost:3000
+#   Backend   →  http://localhost:8000
+#   Postgres  →  localhost:5432  (optional, comment out port if not needed)
+
+services:
+
+  # ── PostgreSQL + pgvector ───────────────────────────────────────────────────
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: researchflow
+      POSTGRES_USER: researchflow
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-researchflow}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U researchflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (session cache, rate-limit state) ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile.backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://researchflow:${DB_PASSWORD:-researchflow}@db:5432/researchflow
+      REDIS_URL: redis://redis:6379/0
+      CACHE_BACKEND: redis
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - blobcache:/var/cache/researchflow
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  # ── Next.js frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile.frontend
+      args:
+        # This URL is baked into the client bundle — it must be the URL the
+        # *browser* uses to reach the backend. For local Docker this is
+        # http://localhost:8000. For a deployed server, change to your domain.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  blobcache:

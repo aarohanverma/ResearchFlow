@@ -1,0 +1,185 @@
+"""Anthropic LLM adapter — Haiku (cheap), Sonnet (quality), Opus (reasoning)."""
+
+import json
+import time
+from collections.abc import AsyncIterator
+from typing import Any
+
+import anthropic as anthropic_sdk
+from anthropic import AsyncAnthropic
+
+from app.adapters.llm.base import CompletionResult, LLMAdapter
+from app.core.config import settings
+
+# Thinking-capable models where we pass thinking.budget_tokens
+_THINKING_MODELS = {
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+}
+
+
+class AnthropicAdapter(LLMAdapter):
+    """LLM adapter for Anthropic's Messages API.
+
+    Uses Claude Haiku (cheap), Sonnet (quality), and Opus (reasoning) model
+    tiers. Supports extended thinking via ``reasoning_effort`` for thinking-
+    capable models defined in ``_THINKING_MODELS``.
+    """
+
+    provider_id = "anthropic"
+    cheap_model = "claude-haiku-4-5"
+    quality_model = "claude-sonnet-4-6"
+    reasoning_model = "claude-opus-4-6"
+
+    def __init__(self, api_key: str | None = None) -> None:
+        """Initialize the Anthropic async client.
+
+        Args:
+            api_key: Anthropic API key. Falls back to
+                ``settings.anthropic_api_key`` if not provided.
+        """
+        self._client = AsyncAnthropic(api_key=api_key or settings.anthropic_api_key)
+
+    def _build_thinking(self, model: str, reasoning_effort: str | None) -> dict | None:
+        """Convert our effort string to Anthropic's thinking budget."""
+        if model not in _THINKING_MODELS or reasoning_effort is None:
+            return None
+        budget_map = {"low": 2000, "medium": 8000, "high": 16000, "xhigh": 32000}
+        return {"type": "enabled", "budget_tokens": budget_map.get(reasoning_effort, 8000)}
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        *,
+        reasoning_effort: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict | None = None,
+    ) -> CompletionResult:
+        """Send a messages request to Anthropic and return the full response.
+
+        Separates system messages from the conversation and passes them via
+        Anthropic's ``system`` parameter. Enables extended thinking for
+        models in ``_THINKING_MODELS`` when ``reasoning_effort`` is set.
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content`` keys.
+                A message with ``role="system"`` is extracted and passed
+                separately.
+            model: Anthropic model identifier.
+            reasoning_effort: Effort level for thinking-capable models
+                (``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``).
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens to generate. Defaults to 4096.
+            response_format: Unused by this adapter; present for interface
+                compatibility.
+
+        Returns:
+            A ``CompletionResult`` containing the generated text (thinking
+            blocks excluded), token counts, model/provider identifiers,
+            and latency.
+        """
+        system = next((m["content"] for m in messages if m["role"] == "system"), None)
+        user_messages = [m for m in messages if m["role"] != "system"]
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens or 4096,
+            "messages": user_messages,
+        }
+        if system:
+            kwargs["system"] = system
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        thinking = self._build_thinking(model, reasoning_effort)
+        if thinking:
+            kwargs["thinking"] = thinking
+
+        start = time.monotonic()
+        resp = await self._client.messages.create(**kwargs)
+        latency = int((time.monotonic() - start) * 1000)
+
+        # Extract text (skip thinking blocks)
+        text = "".join(
+            b.text for b in resp.content
+            if hasattr(b, "text")
+        )
+        return CompletionResult(
+            text=text,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+            model_used=model,
+            provider_used=self.provider_id,
+            latency_ms=latency,
+        )
+
+    async def complete_structured(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        schema: type,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        """Request a completion and parse the response text as JSON.
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content`` keys.
+            model: Anthropic model identifier.
+            schema: Pydantic model or type describing the expected JSON
+                structure (used for documentation; validation is left to the
+                caller).
+            reasoning_effort: Effort level for thinking-capable models.
+
+        Returns:
+            Parsed JSON response as a Python dict.
+        """
+        result = await self.complete(
+            messages, model,
+            reasoning_effort=reasoning_effort,
+        )
+        return json.loads(result.text)
+
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        *,
+        reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream text chunks from an Anthropic messages request.
+
+        Separates system messages and passes them via the ``system`` parameter.
+        Enables extended thinking for models in ``_THINKING_MODELS``.
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content`` keys.
+            model: Anthropic model identifier.
+            reasoning_effort: Effort level for thinking-capable models.
+            max_tokens: Maximum tokens to generate. Defaults to 8192.
+
+        Yields:
+            String chunks of the generated text from the streaming response.
+        """
+        system = next((m["content"] for m in messages if m["role"] == "system"), None)
+        user_messages = [m for m in messages if m["role"] != "system"]
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens or 8192,
+            "messages": user_messages,
+        }
+        if system:
+            kwargs["system"] = system
+
+        thinking = self._build_thinking(model, reasoning_effort)
+        if thinking:
+            kwargs["thinking"] = thinking
+
+        async with self._client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                yield text

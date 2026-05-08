@@ -1,0 +1,17 @@
+.setup_state
+.env.local
+.env
+*.env
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+# Sphinx build output — but NOT the build/ Docker deployment directory at project root
+docs/sphinx/build/
+frontend/.next/
+*.log
+.DS_Store

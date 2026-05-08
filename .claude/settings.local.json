@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(npx tsc *)",
+      "Bash(python3 -m pytest tests/ -x -q)",
+      "Bash(python3 -m pytest tests/test_security.py tests/test_scoring.py tests/test_search_repository.py -q)",
+      "Bash(PYTHONPATH=/home/av/research_flow/backend sphinx-build -b html /home/av/research_flow/docs/sphinx/source /home/av/research_flow/docs/sphinx/build/html -q)",
+      "Bash(grep -rn \"except Exception:\\\\s*$\" /home/av/research_flow/backend/app/ --include=\"*.py\")",
+      "Bash(bash -n /home/av/research_flow/setup.sh)",
+      "Bash(python -m sphinx source build/html -q)",
+      "Bash(grep -E \"\\\\.\\(tsx?|py\\)$\")",
+      "Bash(/home/av/research_flow/backend/.venv/bin/python -m sphinx source build/html -q)",
+      "Bash(/home/av/research_flow/backend/.venv/bin/python -m sphinx source build/html)",
+      "Bash(xxd)",
+      "Bash(python3 -m sphinx source build/html -q)",
+      "Bash(python3 -m sphinx source build/html)",
+      "Bash(echo \"---EXIT: $?---\")",
+      "Bash(docker compose *)",
+      "Bash(curl -s http://localhost:8000/api/v1/settings/token-usage -H \"Authorization: Bearer test\")",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(docker exec *)",
+      "Bash(curl -sv 'http://localhost:8000/api/v1/settings/token-usage?from=2026-05-06&to=2026-05-06' -H 'Origin: http://localhost:3000' -H 'Authorization: Bearer invalid')",
+      "Bash(.venv/bin/python -c \"from app.api.v1.settings import get_token_usage; print\\('import OK'\\)\")",
+      "Bash(awk '{print $2}')",
+      "Bash(grep -E \"^    [a-z_]+ \\\\{$\" /home/av/research_flow/docs/architecture.html)",
+      "Bash(.venv/bin/pytest tests/test_api_feed.py::TestSubmitFeedback::test_valid_feedback_returns_204 -v --tb=long)",
+      "Bash(.venv/bin/pytest tests/ -q --tb=short)",
+      "Bash(.venv/bin/pytest tests/test_api_feed.py::TestSubmitFeedback::test_valid_signals_accepted --tb=short)",
+      "Bash(.venv/bin/pytest tests/test_search_repository.py -q --tb=short)",
+      "Bash(.venv/bin/pytest tests/test_search_repository.py::TestRRFFusion::test_semantic_only_results_ranked_correctly --tb=short)",
+      "Bash(make html *)",
+      "Bash(/home/av/research_flow/backend/.venv/bin/sphinx-build -b html source build/html)",
+      "Bash(.venv/bin/pytest tests/ -q)",
+      "Bash(/home/av/research_flow/backend/.venv/bin/sphinx-build -b html source build/html -q)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(d.get\\('engines',{}\\)\\); print\\(list\\(d.get\\('dependencies',{}\\).keys\\(\\)\\)[:10]\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(grep -rn \"sk-proj-[A-Za-z0-9_-]\\\\{20,\\\\}\" . --include=\"*.py\" --include=\"*.ts\" --include=\"*.tsx\" --include=\"*.md\" --include=\"*.sh\" --include=\"*.env*\")"
+    ]
+  }
+}

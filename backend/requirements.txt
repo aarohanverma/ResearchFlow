@@ -1,0 +1,79 @@
+# ─── Web framework ────────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+pgvector==0.3.6
+
+# ─── Async I/O ────────────────────────────────────────────────────────────────
+httpx==0.28.1
+aiofiles==24.1.0
+
+# ─── LLM providers ────────────────────────────────────────────────────────────
+openai==1.59.3
+anthropic==0.40.0
+google-generativeai==0.8.3
+
+# ─── LangGraph / LangChain ────────────────────────────────────────────────────
+langgraph==0.2.60
+langchain-core==0.3.36
+langsmith==0.2.3
+langchain-mcp-adapters==0.0.5
+
+# ─── Resilience ───────────────────────────────────────────────────────────────
+tenacity==9.0.0
+pybreaker==1.2.0
+
+# ─── Scheduling ───────────────────────────────────────────────────────────────
+apscheduler==3.10.4
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+bcrypt==4.3.0
+
+# ─── Pydantic / Settings ──────────────────────────────────────────────────────
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0
+
+# ─── PDF Parsing ──────────────────────────────────────────────────────────────
+marker-pdf==0.3.10
+
+# ─── Clustering ───────────────────────────────────────────────────────────────
+hdbscan==0.8.40
+numpy==2.2.1
+scikit-learn==1.6.0
+
+# ─── Email ────────────────────────────────────────────────────────────────────
+resend==2.5.1
+
+# ─── Cache (Redis) ────────────────────────────────────────────────────────────
+redis[hiredis]==5.2.1
+
+# ─── Azure (cloud tier) ───────────────────────────────────────────────────────
+azure-storage-blob==12.24.0
+azure-keyvault-secrets==4.9.0
+azure-identity==1.19.0
+
+# ─── Feed parsing ─────────────────────────────────────────────────────────────
+feedparser==6.0.11
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+cryptography==44.0.0
+orjson==3.10.12
+ujson==5.10.0
+
+# ─── Web search (LLM tool) ────────────────────────────────────────────────────
+duckduckgo-search==6.3.7      # free, no API key; default web search provider
+tavily-python==0.5.0           # optional; set TAVILY_API_KEY to enable
+
+# ─── Testing ──────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+httpx==0.28.1

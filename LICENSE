@@ -1,0 +1,248 @@
+RESEARCHFLOW LICENSE
+Source-Available · Permission-Gated · Royalty-Bearing · Attribution-Required
+
+Copyright (c) 2026 Aarohan Verma. All Rights Reserved.
+
+THIS IS NOT AN OPEN-SOURCE LICENSE. IT DOES NOT GRANT THE FREEDOMS OF
+MIT, APACHE, BSD, GPL, OR ANY OSI-APPROVED LICENSE. BY ACCESSING THIS
+REPOSITORY YOU AGREE TO THE TERMS BELOW.
+
+═══════════════════════════════════════════════════════════════════════
+SUMMARY (the three rules)
+═══════════════════════════════════════════════════════════════════════
+
+  RULE 1 — Forking, cloning, or modifying the Software requires the
+           Owner's prior WRITTEN PERMISSION. Permission is granted at
+           the Owner's sole discretion.
+
+  RULE 2 — Any USE of the Software requires PAYMENT to the Owner —
+           a one-time license fee, recurring royalty, or full purchase
+           of rights, as agreed in writing. This applies to ALL use,
+           including personal, internal, non-profit, academic, and
+           evaluation use. Permission to fork or clone (Rule 1) does
+           NOT include the right to Use.
+
+  RULE 3 — Every grant under this license requires VISIBLE ATTRIBUTION
+           to "Aarohan Verma — ResearchFlow". Failure to attribute
+           voids all granted rights immediately.
+
+The formal terms below govern. The summary is for clarity, not for
+legal interpretation.
+
+═══════════════════════════════════════════════════════════════════════
+1. DEFINITIONS
+═══════════════════════════════════════════════════════════════════════
+
+   "Software" means the source code, compiled artifacts, configuration,
+   prompts, prompt templates, system designs, documentation,
+   architecture diagrams, database schemas, and all other content in
+   this repository, plus any future updates, modifications, or
+   derivative works thereof.
+
+   "Owner" means Aarohan Verma, the sole copyright holder.
+
+   "Permission" means a written grant from the Owner — by email
+   from verma.aarohan@gmail.com or by a signed document — explicitly
+   authorising a named party to perform a specific act with respect
+   to the Software.
+
+   "Use" means any of the following acts performed by any person or
+   entity, in whole or in part, in any environment: executing;
+   running; deploying; hosting; serving; making available over a
+   network; embedding; bundling; integrating into another product;
+   training, fine-tuning, or evaluating any machine-learning model
+   on; or otherwise putting the Software into operational service.
+
+   "Derivative" means any fork, clone, modification, port,
+   translation, extension, plug-in, or other work based on the
+   Software in whole or in part.
+
+   "Attribution" means the visible credit specified in Section 5.
+
+═══════════════════════════════════════════════════════════════════════
+2. PERMITTED WITHOUT PERMISSION OR PAYMENT
+═══════════════════════════════════════════════════════════════════════
+
+   You may, without seeking Permission and without paying any fee:
+
+   (a) View the source code through a public source-hosting service
+       for personal reading and reference;
+
+   (b) Quote excerpts of the Software in reviews, criticism, academic
+       commentary, or technical writing, provided you include
+       Attribution as defined in Section 5.
+
+   No other rights are granted by default.
+
+═══════════════════════════════════════════════════════════════════════
+3. REQUIRES PERMISSION (Rule 1)
+═══════════════════════════════════════════════════════════════════════
+
+   The following acts require prior written Permission from the Owner.
+   Permission may be granted or denied at the Owner's sole discretion
+   and may be conditioned on any terms the Owner sees fit, including
+   but not limited to fees, scope limits, and time limits.
+
+   (a) Forking the repository to your own account or organisation;
+   (b) Cloning the repository for any purpose other than personal
+       reading reference;
+   (c) Mirroring or republishing the source code or any portion of it;
+   (d) Creating a Derivative.
+
+   Permission granted under this section is personal,
+   non-transferable, and revocable. Permission to fork, clone, or
+   create a Derivative does NOT include the right to Use the
+   Software or any Derivative — see Section 4.
+
+═══════════════════════════════════════════════════════════════════════
+4. REQUIRES PERMISSION + PAYMENT (Rule 2)
+═══════════════════════════════════════════════════════════════════════
+
+   Any Use of the Software, or of any Derivative of the Software,
+   requires BOTH:
+
+   (a) Written Permission from the Owner; AND
+
+   (b) Payment to the Owner of one of the following, as agreed in
+       writing between the Use Licensee and the Owner:
+
+           (i)   a one-time license fee for a defined scope of Use;
+           (ii)  a recurring royalty (per-user, per-seat,
+                 per-deployment, per-revenue, or other agreed metric);
+           (iii) full purchase of the Software's IP rights at a
+                 negotiated price.
+
+   This requirement applies WITHOUT EXCEPTION to all categories of
+   Use, including but not limited to:
+
+       - Personal Use (a single individual, on a single machine,
+         for non-commercial purposes);
+       - Internal-business Use (a private company deployment for its
+         own employees);
+       - Commercial Use (offering Software functionality to paying
+         or non-paying third parties);
+       - Non-profit, academic, research, and evaluation Use;
+       - Educational Use (classroom, course, or institutional);
+       - Government Use (any governmental or quasi-governmental body).
+
+   Permission previously granted under Section 3 (fork / clone /
+   Derivative) does NOT grant any right under this Section 4. The
+   right to Use is a separate right that must be separately granted
+   AND separately paid for, even where the Use is of a Derivative
+   created with Permission under Section 3.
+
+═══════════════════════════════════════════════════════════════════════
+5. ATTRIBUTION (Rule 3 — REQUIRED FOR EVERY GRANT)
+═══════════════════════════════════════════════════════════════════════
+
+   Every right granted under Sections 2, 3, or 4 is conditional on
+   the following Attribution being maintained at all times:
+
+   (a) SOURCE-CODE ATTRIBUTION
+       The copyright notice
+              "Copyright (c) 2026 Aarohan Verma. All Rights Reserved."
+       must be preserved verbatim in every source file of the
+       Software or any Derivative thereof.
+
+   (b) PRODUCT / UI ATTRIBUTION
+       Any product, service, or deployment that incorporates the
+       Software or a Derivative — whether public, internal, or
+       personal — must display the credit:
+
+              "Powered by ResearchFlow — © Aarohan Verma"
+
+       or equivalent wording naming "Aarohan Verma" as the original
+       author, in a location reasonably visible to the end user
+       (e.g. About page, Credits screen, settings dialogue, footer,
+       splash screen, or documentation index).
+
+   (c) DOCUMENTATION ATTRIBUTION
+       Any README, documentation site, technical specification, or
+       internal wiki for a Derivative must credit Aarohan Verma as
+       the original author of ResearchFlow and link to the
+       original repository where reasonably possible.
+
+   (d) PUBLICATION ATTRIBUTION
+       Any academic paper, blog post, conference talk, podcast,
+       press release, or marketing material that describes or
+       references the Software's design, algorithms, or
+       implementation must credit Aarohan Verma by name.
+
+   FAILURE TO MAINTAIN ATTRIBUTION at any of the above points
+   automatically and immediately voids all rights granted under
+   this license without further notice. Continued Use after such
+   voiding constitutes copyright infringement.
+
+═══════════════════════════════════════════════════════════════════════
+6. NO IMPLIED RIGHTS
+═══════════════════════════════════════════════════════════════════════
+
+   No rights are granted by implication, estoppel, exhaustion, or
+   otherwise. The Owner's silence, inaction, delay, or partial
+   enforcement of any provision shall not be construed as a grant of
+   any right or as a waiver of any right.
+
+═══════════════════════════════════════════════════════════════════════
+7. CONTACT FOR PERMISSION AND USE LICENSING
+═══════════════════════════════════════════════════════════════════════
+
+   To request Permission (Section 3) or a Use License (Section 4):
+
+       Aarohan Verma
+       verma.aarohan@gmail.com
+
+   In your inquiry, please specify:
+       - Whether you are requesting Permission, a Use License, or both
+       - Intended scope (personal / internal / commercial / academic)
+       - Deployment environment and expected user/seat count
+       - Expected revenue scale, if commercial
+       - Preferred payment structure (one-time / royalty / purchase)
+
+═══════════════════════════════════════════════════════════════════════
+8. NO WARRANTY
+═══════════════════════════════════════════════════════════════════════
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   NON-INFRINGEMENT.
+
+═══════════════════════════════════════════════════════════════════════
+9. LIMITATION OF LIABILITY
+═══════════════════════════════════════════════════════════════════════
+
+   IN NO EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, LOST
+   PROFITS, LOST DATA, OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH ANY USE OR ATTEMPTED USE OF THE SOFTWARE.
+
+═══════════════════════════════════════════════════════════════════════
+10. ENFORCEMENT
+═══════════════════════════════════════════════════════════════════════
+
+   Unauthorised Use, unauthorised forking, unauthorised cloning,
+   unauthorised creation of Derivatives, or failure to maintain
+   Attribution constitutes copyright infringement and may result in
+   civil and criminal penalties under applicable law, including but
+   not limited to 17 U.S.C. § 504 (United States), the Copyright,
+   Designs and Patents Act 1988 (United Kingdom), the Indian
+   Copyright Act 1957, and equivalent provisions in other
+   jurisdictions.
+
+   The Owner reserves the right to seek statutory damages, actual
+   damages, lost royalties, injunctive relief, and recovery of legal
+   fees from any party in violation of this license.
+
+═══════════════════════════════════════════════════════════════════════
+11. ENTIRE AGREEMENT
+═══════════════════════════════════════════════════════════════════════
+
+   This document constitutes the default license offered by the Owner
+   for the Software. A separately negotiated written license agreement
+   between a named party and the Owner shall, for that named party,
+   supersede this document to the extent of any conflict, but shall
+   not modify this document for any other party.
+
+───────────────────────────────────────────────────────────────────────
+
+END OF LICENSE

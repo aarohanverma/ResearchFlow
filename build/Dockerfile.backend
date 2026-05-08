@@ -1,0 +1,57 @@
+# ResearchFlow — Backend Production Image
+# Build context: project root (research_flow/)
+# Usage (from build/): docker build -f Dockerfile.backend -t researchflow-backend ..
+
+FROM python:3.11-slim AS base
+
+# System deps:
+#   libgomp1     — OpenMP runtime for hdbscan/numpy parallelism
+#   libgl1       — OpenCV (marker-pdf PDF parsing)
+#   libglib2.0-0 — glib (OpenCV)
+#   libsm6 libxext6 — X11 stubs for OpenCV headless mode
+#   build-essential — compile native extensions (hdbscan, asyncpg)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Dependency layer (cached unless requirements.txt changes) ─────────────────
+FROM base AS deps
+WORKDIR /deps
+COPY backend/requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ── Final runtime image ───────────────────────────────────────────────────────
+FROM base AS runtime
+WORKDIR /app
+
+# Copy installed packages from deps stage
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy application source
+COPY backend/ .
+
+# Non-root user for safety
+RUN groupadd --system --gid 1001 appgroup && \
+    useradd --system --uid 1001 --gid appgroup appuser && \
+    mkdir -p /var/cache/researchflow && \
+    chown -R appuser:appgroup /app /var/cache/researchflow
+
+USER appuser
+
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
