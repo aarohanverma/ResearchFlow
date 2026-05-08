@@ -39,6 +39,14 @@ async function request<T>(
   });
 
   if (!res.ok) {
+    if (res.status === 401) {
+      // Session expired or user deleted — clear auth and redirect to login.
+      if (typeof window !== "undefined") {
+        const { useAuthStore } = await import("@/store/auth");
+        useAuthStore.getState().logout();
+      }
+      throw new Error("Session expired. Please log in again.");
+    }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || `HTTP ${res.status}`);
   }

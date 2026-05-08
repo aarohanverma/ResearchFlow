@@ -121,6 +121,9 @@ async def get_feed(
     """
     user_repo = UserRepository(db)
     user = await user_repo.get_by_id(user_id)
+    if user is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="User not found — please log in again.")
     profile = await user_repo.get_interest_profile(user_id)
 
     scoring = ScoringService(db)

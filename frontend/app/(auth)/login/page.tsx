@@ -36,13 +36,16 @@ export default function LoginPage() {
     }
   }
 
+  const GUEST_EMAIL = "test@researchflow.ai";
+  const GUEST_PASSWORD = "ResearchFlow2024!";
+
   async function handleGuestLogin() {
     setGuestLoading(true);
     setError("");
     try {
       const data = await api.post<{ access_token: string }>("/auth/login", {
-        email: "test@researchflow.ai",
-        password: "ResearchFlow2024!",
+        email: GUEST_EMAIL,
+        password: GUEST_PASSWORD,
       });
       setToken(data.access_token);
       const user = await api.get<User>("/auth/me");

@@ -31,6 +31,69 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+_GUEST_EMAIL = "test@researchflow.ai"
+_GUEST_PASSWORD = "ResearchFlow2024!"
+
+
+async def _ensure_seed_user() -> None:
+    """Idempotently create the guest/test user and its SourceMappings on startup."""
+    from sqlalchemy import select as _select
+    from app.db.session import async_session_factory
+    from app.core.security import hash_password
+    from app.models.user import User, UserProviderSettings, UserInterestProfile, ExpertiseLevel, Orientation
+    from app.models.graph import NamespaceSubscription, SourceMapping
+
+    _DEFAULT_NS = [
+        ("cs.AI",  "arxiv_rss", "cs.AI"),
+        ("cs.ML",  "arxiv_rss", "cs.LG"),
+        ("cs.NLP", "arxiv_rss", "cs.CL"),
+    ]
+
+    async with async_session_factory() as db:
+        row = await db.execute(_select(User).where(User.email == _GUEST_EMAIL))
+        user = row.scalar_one_or_none()
+
+        if not user:
+            user = User(
+                email=_GUEST_EMAIL,
+                hashed_password=hash_password(_GUEST_PASSWORD),
+                display_name="Guest Researcher",
+                expertise_level=ExpertiseLevel.practitioner,
+                orientation=Orientation.both,
+                onboarding_complete=True,
+            )
+            db.add(user)
+            await db.flush()
+            db.add(UserProviderSettings(user_id=user.id))
+            db.add(UserInterestProfile(user_id=user.id))
+            log.info("seed user created: %s", _GUEST_EMAIL)
+
+        for ns_key, source_name, arxiv_cat in _DEFAULT_NS:
+            sub = await db.execute(
+                _select(NamespaceSubscription).where(
+                    NamespaceSubscription.user_id == user.id,
+                    NamespaceSubscription.namespace_key == ns_key,
+                )
+            )
+            if not sub.scalar_one_or_none():
+                db.add(NamespaceSubscription(user_id=user.id, namespace_key=ns_key))
+
+            mapping = await db.execute(
+                _select(SourceMapping).where(
+                    SourceMapping.namespace_key == ns_key,
+                    SourceMapping.source_name == source_name,
+                )
+            )
+            if not mapping.scalar_one_or_none():
+                db.add(SourceMapping(
+                    namespace_key=ns_key,
+                    source_name=source_name,
+                    external_category_key=arxiv_cat,
+                ))
+
+        await db.commit()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     """Startup: create DB tables (dev), start scheduler. Shutdown: stop scheduler."""
@@ -96,6 +159,13 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         log.info("idea_capsules schema migration complete")
     except Exception as exc:
         log.warning("idea_capsules migration skipped: %s", exc)
+
+    # Ensure the guest/test user always exists in local dev — idempotent
+    if settings.environment == "local":
+        try:
+            await _ensure_seed_user()
+        except Exception as exc:
+            log.warning("seed user creation skipped: %s", exc)
 
     start_scheduler()
     log.info("scheduler started")
