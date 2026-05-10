@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { useAuthStore } from "@/store/auth";
@@ -117,21 +117,14 @@ const DEFAULT_THRESHOLDS = {
 
 const THRESHOLDS_KEY = "genie_thresholds";
 
-function loadThresholds() {
-  if (typeof window === "undefined") return DEFAULT_THRESHOLDS;
-  try {
-    const saved = localStorage.getItem(THRESHOLDS_KEY);
-    return saved ? { ...DEFAULT_THRESHOLDS, ...JSON.parse(saved) } : DEFAULT_THRESHOLDS;
-  } catch {
-    return DEFAULT_THRESHOLDS;
-  }
-}
-
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function GeniePage() {
   const { token } = useAuthStore();
-  const { addGenieJob, genieJobs } = useJobsStore();
+  // Narrow selectors so the page doesn't re-render every time the
+  // JobsPanel polls (e.g. while a podcast generates in the background).
+  const addGenieJob = useJobsStore((s) => s.addGenieJob);
+  const genieJobs = useJobsStore((s) => s.genieJobs);
   const { selectedTopics, activeSubject, getPrimaryNamespaceKey } = useNamespaceStore();
   const searchParams = useSearchParams();
   const [mode, setMode] = useState<Mode>("manual");
@@ -147,6 +140,10 @@ export default function GeniePage() {
   const [elaborationSections, setElaborationSections] = useState<ElaborationSections>({});
   const [bgJobId, setBgJobId] = useState<string | null>(null);
   const [bgStatus, setBgStatus] = useState<string | null>(null);
+  const synthAbortRef = useRef<AbortController | null>(null);
+  // Abort the synthesize stream on unmount so navigating away doesn't
+  // leave the fetch reader hanging or cause stale state writes.
+  useEffect(() => () => synthAbortRef.current?.abort(), []);
 
   const [capsules, setCapsules] = useState<IdeaCapsule[]>([]);
   const [chatCapsule, setChatCapsule] = useState<IdeaCapsule | null>(null);
@@ -161,12 +158,25 @@ export default function GeniePage() {
   const [queryResult, setQueryResult] = useState<QueryDiscoverResult | null>(null);
   const [queryError, setQueryError] = useState<string | null>(null);
 
-  // Threshold controls — shared between manual and auto mode
-  const [thresholds, setThresholds] = useState(loadThresholds);
+  // Threshold controls — shared between manual and auto mode.
+  // Always start with DEFAULT_THRESHOLDS on first render so the
+  // server-rendered HTML matches the client; we hydrate from
+  // localStorage in a useEffect after mount to avoid hydration
+  // mismatches (which can crash the page during HMR).
+  const [thresholds, setThresholds] = useState<typeof DEFAULT_THRESHOLDS>(DEFAULT_THRESHOLDS);
   const [showConstraints, setShowConstraints] = useState(false);
 
+  useEffect(() => {
+    try {
+      const saved = typeof window !== "undefined" ? localStorage.getItem(THRESHOLDS_KEY) : null;
+      if (saved) setThresholds({ ...DEFAULT_THRESHOLDS, ...JSON.parse(saved) });
+    } catch {
+      // ignore — corrupt JSON or quota issues fall back to defaults
+    }
+  }, []);
+
   function updateThreshold(key: keyof typeof DEFAULT_THRESHOLDS, value: number) {
-    setThresholds((prev) => {
+    setThresholds((prev: typeof DEFAULT_THRESHOLDS) => {
       const next = { ...prev, [key]: value };
       try { localStorage.setItem(THRESHOLDS_KEY, JSON.stringify(next)); } catch {}
       return next;
@@ -451,11 +461,16 @@ export default function GeniePage() {
     const apiBase = process.env.NEXT_PUBLIC_API_URL || "";
     const url = `${apiBase}/api/v1/genie/synthesize`;
 
+    synthAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    synthAbortRef.current = ctrl;
+
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(geniePayload),
+        signal: ctrl.signal,
       });
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
@@ -1611,6 +1626,11 @@ function CapsuleChatOverlay({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Abort any in-flight stream when the modal unmounts so navigating
+  // away doesn't leave the fetch reader hanging.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   async function sendMessage() {
     if (!input.trim() || streaming) return;
@@ -1623,11 +1643,16 @@ function CapsuleChatOverlay({
     const url = `${apiBase}/api/v1/genie/capsules/${capsule.id}/chat`;
     setMessages((m) => [...m, { role: "assistant", content: "" }]);
 
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ message: userMsg, history: messages }),
+        signal: ctrl.signal,
       });
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
@@ -1649,7 +1674,11 @@ function CapsuleChatOverlay({
           } catch {}
         }
       }
-    } catch {}
+    } catch (err) {
+      if ((err as { name?: string })?.name === "AbortError") {
+        // expected on unmount — swallow
+      }
+    }
     setStreaming(false);
   }
 

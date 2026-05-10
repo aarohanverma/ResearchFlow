@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from uuid import UUID
 
 from sqlalchemy import select
@@ -12,6 +13,27 @@ from app.models.paper import Paper
 from app.repositories.graph import GraphRepository
 
 log = logging.getLogger(__name__)
+
+
+def _strip_llm_json_fences(text: str) -> str:
+    """Strip markdown code fences from LLM JSON output.
+
+    Handles triple-backtick json blocks and bare triple-backtick blocks.
+    Falls back to returning the original text so ``json.loads`` can attempt
+    a parse on whatever the model returned.
+
+    Args:
+        text: Raw LLM response text, possibly wrapped in markdown code fences.
+
+    Returns:
+        The inner content of the first code fence found, or ``text`` unchanged.
+    """
+    stripped = text.strip()
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", stripped, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return stripped
+
 
 # Broad domain labels — multiple namespaces can share one TOPIC
 # Subject root labels — one per broad academic field.
@@ -987,16 +1009,16 @@ class GraphService:
 
     @staticmethod
     async def clear_subgraph_cache(namespace_key: str | None = None) -> None:
-        """Invalidate cached subgraph for a namespace (or all if namespace_key is None)."""
+        """Invalidate cached subgraph for a namespace (or the global cache if namespace_key is None)."""
         try:
             from app.adapters.cache import get_cache
             cache = get_cache()
-            if namespace_key:
+            if namespace_key is not None:
                 await cache.delete(f"graph:subgraph:feed:{GraphService._ns_hash(namespace_key)}")
             else:
-                # Clear all — iterate known namespace keys
-                for k in [None, "__all__"]:
-                    await cache.delete(f"graph:subgraph:feed:{GraphService._ns_hash(k)}")
+                # Clear the global aggregated cache — the only key the API writes
+                # (API always calls get_subgraph(None, ...) so the cache key is always __all__)
+                await cache.delete(f"graph:subgraph:feed:{GraphService._ns_hash(None)}")
         except Exception:
             pass
 
@@ -1066,12 +1088,12 @@ class GraphService:
             "research": (
                 "Name areas, sub-areas, and clusters using precise academic terminology. "
                 "Prefer names that reflect the theoretical contribution or research paradigm "
-                "(e.g. 'Attention Mechanisms', 'Contrastive Representation Learning'). "
+                "(e.g. 'Variational Inference Methods', 'Causal Identification Strategies'). "
             ),
             "production": (
                 "Name areas, sub-areas, and clusters using applied, practical terminology. "
                 "Prefer problem-domain names over technique names "
-                "(e.g. 'Language Understanding & Generation', 'Visual Perception Systems'). "
+                "(e.g. 'Predictive Modeling Pipelines', 'Data-Driven Estimation Systems'). "
             ),
             "both": "",
         }.get(orientation, "")
@@ -1106,12 +1128,7 @@ class GraphService:
                 temperature=0.1,
                 max_tokens=2000,
             )
-            raw = canon_res.text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.rstrip("`").strip()
+            raw = _strip_llm_json_fences(canon_res.text)
             canonical = json.loads(raw).get("areas", {})
             log.info(
                 "build_deep_graph phase1: %d areas, %d total clusters",
@@ -1153,20 +1170,22 @@ class GraphService:
                         temperature=0.0,
                         max_tokens=3000,
                     )
-                    raw = res.text.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
-                        raw = raw.rstrip("`").strip()
+                    raw = _strip_llm_json_fences(res.text)
                     assignments: list[dict] = json.loads(raw).get("assignments", [])
                     for a in assignments:
                         area = a.get("area", "")
                         sub_area = a.get("sub_area", "")
                         cluster = a.get("cluster", "")
-                        paper_id = a.get("paper_id", "")
-                        if not all([area, sub_area, cluster, paper_id]):
+                        paper_id_raw = a.get("paper_id", "")
+                        if not all([area, sub_area, cluster, paper_id_raw]):
                             continue
+                        # Normalise UUID format — LLMs sometimes strip hyphens or add
+                        # extra whitespace, causing silent id_to_paper lookup misses.
+                        from uuid import UUID as _UUID
+                        try:
+                            paper_id = str(_UUID(str(paper_id_raw).strip()))
+                        except ValueError:
+                            paper_id = str(paper_id_raw).strip()
                         merged.setdefault(area, {}).setdefault(sub_area, {}).setdefault(cluster, []).append(paper_id)
                 except Exception as exc:
                     log.warning("build_deep_graph phase2 batch failed: %s", exc)
@@ -1188,11 +1207,7 @@ class GraphService:
                          {"role": "user", "content": f"Papers:\n{paper_block}"}],
                         model=llm.quality_model, temperature=0.2, max_tokens=4000,
                     )
-                    raw = res.text.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("```")[1]
-                        if raw.startswith("json"):
-                            raw = raw[4:]
+                    raw = _strip_llm_json_fences(res.text)
                     taxonomy_data = json.loads(raw).get("taxonomy", {})
                 except Exception as exc:
                     log.warning("build_deep_graph: fallback batch failed — %s", exc)
@@ -1271,6 +1286,50 @@ class GraphService:
             await self._db.commit()
             await GraphService.clear_subgraph_cache(namespace_key)
             await GraphService.clear_subgraph_cache(None)
+
+        # Remove stale direct SUBTOPIC→PAPER (belongs_to) edges for papers that
+        # have now been placed inside the cluster hierarchy.  These bypass edges
+        # were created by add_paper_node during ingestion and are visually noisy
+        # once the full AREA→SUB_AREA→CLUSTER→PAPER chain exists.
+        if papers_mapped > 0:
+            from sqlalchemy import delete as _del
+            # All PAPER node IDs that belong to this namespace
+            ns_paper_node_ids_res = await self._db.execute(
+                select(KnowledgeNode.id).where(
+                    KnowledgeNode.node_type == NodeType.paper,
+                    KnowledgeNode.namespace_key == namespace_key if namespace_key else KnowledgeNode.namespace_key.isnot(None),
+                )
+            )
+            ns_paper_node_ids = [r[0] for r in ns_paper_node_ids_res.fetchall()]
+
+            if ns_paper_node_ids:
+                # Papers that now have a CONCEPT-level parent (placed in a cluster)
+                cluster_parented_res = await self._db.execute(
+                    select(KnowledgeEdge.target_id).distinct().where(
+                        KnowledgeEdge.edge_type == EdgeType.belongs_to,
+                        KnowledgeEdge.target_id.in_(ns_paper_node_ids),
+                        KnowledgeEdge.source_id.in_(
+                            select(KnowledgeNode.id).where(
+                                KnowledgeNode.node_type == NodeType.concept,
+                            )
+                        ),
+                    )
+                )
+                cluster_parented_ids = [r[0] for r in cluster_parented_res.fetchall()]
+
+                if cluster_parented_ids:
+                    # Delete only the SUBTOPIC→PAPER edges for papers that are now in a cluster
+                    await self._db.execute(
+                        _del(KnowledgeEdge).where(
+                            KnowledgeEdge.edge_type == EdgeType.belongs_to,
+                            KnowledgeEdge.source_id == subtopic_node.id,
+                            KnowledgeEdge.target_id.in_(cluster_parented_ids),
+                        )
+                    )
+                    log.info(
+                        "build_deep_graph: removed %d stale subtopic→paper bypass edges",
+                        len(cluster_parented_ids),
+                    )
 
         # Add cross-paper related_to edges using stored embeddings
         related_edges = await self._build_related_edges(namespace_key, papers)

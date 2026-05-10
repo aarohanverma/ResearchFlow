@@ -149,28 +149,36 @@ async def update_profile(body: ProfileUpdateRequest, user_id: CurrentUserID, db:
 
 @router.get("/provider")
 async def get_provider_settings(user_id: CurrentUserID, db: DBSession):
-    """Return the current user's LLM and embedding provider configuration.
+    """Return the effective LLM and embedding provider configuration.
 
-    Args:
-        user_id: UUID of the authenticated user.
-        db: Injected async database session.
-
-    Returns:
-        A dict with provider and model fields, or an empty dict if no
-        provider settings row exists yet.
+    Always returns what the backend is actually running with:
+    - User's saved DB row when present.
+    - System defaults from config / .env.local otherwise.
+    - Embedding provider reflects the runtime fallback (e.g. if Gemini is
+      configured but no Google key is set, the actual OpenAI fallback is
+      returned) so the UI never shows a provider that isn't being used.
     """
+    from app.core.config import settings as _cfg
+    from app.adapters.embedding import resolve_embedding_provider
+
     repo = UserRepository(db)
     s = await repo.get_provider_settings(user_id)
-    if not s:
-        return {}
+
+    # Determine the embedding provider and model that will actually run,
+    # accounting for missing API keys and the fallback chain.
+    preferred_embed = s.embedding_provider.value if s else _cfg.default_embedding_provider
+    effective_embed_provider, effective_embed_model = resolve_embedding_provider(preferred_embed)
+    # If the user explicitly saved a model for the effective provider, respect it.
+    if s and s.embedding_provider.value == effective_embed_provider:
+        effective_embed_model = s.embedding_model
+
     return {
-        "llm_provider": s.llm_provider.value,
-        "cheap_model": s.cheap_model,
-        "quality_model": s.quality_model,
-        "reasoning_model": s.reasoning_model,
-        "embedding_provider": s.embedding_provider.value,
-        "embedding_model": s.embedding_model,
-        "embedding_dim": s.embedding_dim,
+        "llm_provider":       s.llm_provider.value  if s else _cfg.default_llm_provider,
+        "cheap_model":        s.cheap_model          if s else _cfg.default_cheap_model,
+        "quality_model":      s.quality_model        if s else _cfg.default_quality_model,
+        "reasoning_model":    s.reasoning_model      if s else _cfg.default_reasoning_model,
+        "embedding_provider": effective_embed_provider,
+        "embedding_model":    effective_embed_model,
     }
 
 

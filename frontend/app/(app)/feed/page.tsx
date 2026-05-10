@@ -355,6 +355,15 @@ export default function FeedPage() {
     setLoading(false);
   }, [selectedTopics]);
 
+  // Ref to track the active refresh poll so it can be cancelled on unmount.
+  const refreshPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (refreshPollRef.current) clearInterval(refreshPollRef.current);
+    };
+  }, []);
+
   async function handleRefresh() {
     if (refreshing) return;
     setRefreshing(true);
@@ -371,14 +380,35 @@ export default function FeedPage() {
       setRefreshing(false);
     } else {
       setRefreshMsg(`Ingesting ${triggered} namespace${triggered > 1 ? "s" : ""}…`);
-      // First reload after ~8s to show new papers (ingestion is async on backend)
-      setTimeout(() => { loadFeed(); setRefreshMsg("Generating summaries…"); }, 8000);
-      // Generate TLDRs — backend awaits all completions before responding,
-      // so reloading on resolve ensures cards show fresh TLDRs
-      api.post("/papers/generate-tldrs?limit=50")
-        .then(() => { loadFeed(); setRefreshMsg(null); })
-        .catch(() => { setRefreshMsg(null); });
-      setRefreshing(false);
+      // Poll every 10s for up to 2 minutes until papers appear, then generate TLDRs.
+      // Ingestion is fully async on the backend and typically takes 30–90s.
+      let attempts = 0;
+      const maxAttempts = 12; // 2 minutes total
+      const poll = setInterval(async () => {
+        attempts++;
+        await loadFeed();
+        // Check if we now have papers by re-reading feed state after load
+        const hasPapers = await (async () => {
+          try {
+            const r = await api.get<FeedResponse>(`/feed?namespace_key=${encodeURIComponent(selectedTopics[0] ?? "cs.AI")}&limit=1`);
+            return r.papers.length > 0;
+          } catch { return false; }
+        })();
+        if (hasPapers || attempts >= maxAttempts) {
+          clearInterval(poll);
+          refreshPollRef.current = null;
+          if (hasPapers) {
+            setRefreshMsg("Generating summaries…");
+            api.post("/papers/generate-tldrs?limit=50")
+              .then(() => { loadFeed(); setRefreshMsg(null); })
+              .catch(() => { setRefreshMsg(null); });
+          } else {
+            setRefreshMsg(null);
+          }
+          setRefreshing(false);
+        }
+      }, 10000);
+      refreshPollRef.current = poll;
     }
   }
 
@@ -498,6 +528,14 @@ export default function FeedPage() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 200, color: "#4b5563", gap: 8 }}>
                 <Loader2Icon className="animate-spin" size={18} /> Loading feed…
               </div>
+            ) : refreshing && !isSearching && filtered.length === 0 ? (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#4b5563" }}>
+                <Loader2Icon className="animate-spin" size={22} style={{ color: "#818cf8" }} />
+                <p style={{ fontSize: "13px", color: "#6b7280", margin: 0 }}>Fetching papers from arXiv…</p>
+                {refreshMsg && refreshMsg !== "Fetching from arXiv…" && (
+                  <p style={{ fontSize: "11px", color: "#4b5563", margin: 0 }}>{refreshMsg}</p>
+                )}
+              </div>
             ) : isSearching ? (
               searchResults!.length === 0 ? (
                 <div style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
@@ -517,7 +555,7 @@ export default function FeedPage() {
               )
             ) : filtered.length === 0 ? (
               <div style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
-                <p style={{ fontSize: "15px", marginBottom: 6 }}>No papers yet in {activeNs}</p>
+                <p style={{ fontSize: "15px", marginBottom: 6 }}>No papers yet</p>
                 <p style={{ fontSize: "12px", marginBottom: 16 }}>Hit the Refresh button above to fetch the latest from arXiv.</p>
                 <button
                   onClick={handleRefresh}

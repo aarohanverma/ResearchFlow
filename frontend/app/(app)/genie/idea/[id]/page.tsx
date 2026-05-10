@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import katex from "katex";
@@ -26,9 +26,13 @@ import {
   SparklesIcon,
   FileTextIcon,
 } from "lucide-react";
-import type { IdeaCapsule, DiagramSpec } from "@/types";
+import type { IdeaCapsule, DiagramSpec, GeneratedArtifact, GenerationType } from "@/types";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useAuthStore } from "@/store/auth";
+import { api } from "@/lib/api";
+import { useJobsStore } from "@/store/jobs";
+import { RefreshCwIcon } from "lucide-react";
 
 // ── Shiki singleton ───────────────────────────────────────────────────────────
 
@@ -76,7 +80,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   }
 
   return (
-    <div className="rounded-2xl overflow-hidden border border-gray-800/60 bg-[#0d0f12] shadow-xl shadow-black/50 my-1">
+    <div data-code-block className="rounded-2xl overflow-hidden border border-gray-800/60 bg-[#0d0f12] shadow-xl shadow-black/50 my-1">
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800/50">
         <div className="flex items-center gap-2.5">
           <div className="flex gap-1.5">
@@ -493,6 +497,7 @@ interface SectionDef {
   key: keyof IdeaCapsule;
   label: string;
   subtitle: string;
+  emoji: string;
   icon: React.ReactNode;
   colorClasses: { text: string; border: string; bg: string; iconBg: string; accent: string };
 }
@@ -502,6 +507,7 @@ const SECTIONS: SectionDef[] = [
     key: "hypothesis",
     label: "Hypothesis",
     subtitle: "The core scientific claim",
+    emoji: "💡",
     icon: <LightbulbIcon size={22} />,
     colorClasses: { text: "text-violet-300", border: "border-violet-800/50", bg: "bg-violet-950/20", iconBg: "bg-violet-950/60 border-violet-800/60", accent: "from-violet-500 to-purple-600" },
   },
@@ -509,6 +515,7 @@ const SECTIONS: SectionDef[] = [
     key: "rationale",
     label: "Rationale",
     subtitle: "Why this idea is worth pursuing — the scientific motivation",
+    emoji: "🎯",
     icon: <TargetIcon size={22} />,
     colorClasses: { text: "text-sky-300", border: "border-sky-800/50", bg: "bg-sky-950/20", iconBg: "bg-sky-950/60 border-sky-800/60", accent: "from-sky-500 to-blue-600" },
   },
@@ -516,6 +523,7 @@ const SECTIONS: SectionDef[] = [
     key: "mechanism",
     label: "Mechanism",
     subtitle: "How it works — the technical approach and causal chain",
+    emoji: "⚡",
     icon: <ZapIcon size={22} />,
     colorClasses: { text: "text-teal-300", border: "border-teal-800/50", bg: "bg-teal-950/20", iconBg: "bg-teal-950/60 border-teal-800/60", accent: "from-teal-400 to-cyan-500" },
   },
@@ -523,6 +531,7 @@ const SECTIONS: SectionDef[] = [
     key: "experimental_design",
     label: "Experimental Design",
     subtitle: "Concrete protocol to test the hypothesis",
+    emoji: "🧪",
     icon: <FlaskConicalIcon size={22} />,
     colorClasses: { text: "text-amber-300", border: "border-amber-800/50", bg: "bg-amber-950/20", iconBg: "bg-amber-950/60 border-amber-800/60", accent: "from-amber-400 to-orange-500" },
   },
@@ -530,6 +539,7 @@ const SECTIONS: SectionDef[] = [
     key: "predicted_outcome",
     label: "Predicted Outcomes",
     subtitle: "What success looks like — numeric targets and signals",
+    emoji: "📊",
     icon: <TargetIcon size={22} />,
     colorClasses: { text: "text-emerald-300", border: "border-emerald-800/50", bg: "bg-emerald-950/20", iconBg: "bg-emerald-950/60 border-emerald-800/60", accent: "from-emerald-400 to-teal-500" },
   },
@@ -537,6 +547,7 @@ const SECTIONS: SectionDef[] = [
     key: "anti_finding",
     label: "Anti-Finding",
     subtitle: "What would falsify or kill this idea",
+    emoji: "⚠️",
     icon: <AlertTriangleIcon size={22} />,
     colorClasses: { text: "text-rose-300", border: "border-rose-800/50", bg: "bg-rose-950/20", iconBg: "bg-rose-950/60 border-rose-800/60", accent: "from-rose-500 to-pink-600" },
   },
@@ -544,6 +555,7 @@ const SECTIONS: SectionDef[] = [
     key: "risks_and_limitations",
     label: "Risks & Limitations",
     subtitle: "Known failure modes, constraints, and boundary conditions",
+    emoji: "🔶",
     icon: <AlertTriangleIcon size={22} />,
     colorClasses: { text: "text-orange-300", border: "border-orange-800/50", bg: "bg-orange-950/20", iconBg: "bg-orange-950/60 border-orange-800/60", accent: "from-orange-500 to-amber-600" },
   },
@@ -551,6 +563,7 @@ const SECTIONS: SectionDef[] = [
     key: "open_questions",
     label: "Open Questions",
     subtitle: "What still needs to be figured out to ship this",
+    emoji: "❓",
     icon: <HelpCircleIcon size={22} />,
     colorClasses: { text: "text-purple-300", border: "border-purple-800/50", bg: "bg-purple-950/20", iconBg: "bg-purple-950/60 border-purple-800/60", accent: "from-purple-500 to-violet-600" },
   },
@@ -633,9 +646,11 @@ function SectionBlock({ def, content, index }: { def: SectionDef; content: strin
   const { label, subtitle, icon, colorClasses } = def;
   return (
     <motion.div
+      id={`genie-section-${def.key}`}
       initial={{ opacity: 0, y: 28 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1], delay: index * 0.05 }}
+      className="scroll-mt-6"
     >
       <div className="flex items-center gap-4 mb-5">
         <div className={`relative flex items-center justify-center w-14 h-14 rounded-2xl border ${colorClasses.iconBg} flex-shrink-0 shadow-xl overflow-hidden`}>
@@ -675,10 +690,12 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   async function sendMessage() {
     const text = input.trim();
@@ -687,11 +704,14 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
     setBusy(true);
     const history = messages.filter(m => !m.streaming).slice(-10).map(m => ({ role: m.role, content: m.content }));
     setMessages(prev => [...prev, { role: "user", content: text }, { role: "assistant", content: "", streaming: true }]);
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     try {
       const token = (() => { try { return JSON.parse(localStorage.getItem("rf_auth") || "{}").state?.token || ""; } catch { return ""; } })();
       const resp = await fetch(
         `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/v1/genie/capsules/${capsuleId}/chat`,
-        { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ message: text, history }) }
+        { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ message: text, history }), signal: ctrl.signal }
       );
       if (!resp.body) throw new Error("no body");
       const reader = resp.body.getReader();
@@ -716,8 +736,10 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
           } catch {}
         }
       }
-    } catch {
-      setMessages(prev => [...prev.slice(0, -1), { role: "assistant", content: "Something went wrong. Try again." }]);
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "AbortError") {
+        setMessages(prev => [...prev.slice(0, -1), { role: "assistant", content: "Something went wrong. Try again." }]);
+      }
     }
     setBusy(false);
     inputRef.current?.focus();
@@ -778,6 +800,281 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
   );
 }
 
+// ── Idea Generation Bar (same pattern as Study page) ─────────────────────────
+
+const IDEA_GEN_BUTTONS: { type: GenerationType; emoji: string; label: string }[] = [
+  { type: "podcast", emoji: "🎙", label: "Audio"  },
+  { type: "slides",  emoji: "📊", label: "Slides" },
+];
+
+function IdeaGenerationBar({ capsuleId, ddStatus }: { capsuleId: string; ddStatus: DeepDiveStatus }) {
+  const [artifacts, setArtifacts] = useState<Record<GenerationType, GeneratedArtifact | null>>({
+    podcast: null, slides: null,
+  });
+  const [loading, setLoading] = useState<Record<GenerationType, boolean>>({
+    podcast: false, slides: false,
+  });
+  const [viewer, setViewer] = useState<GenerationType | null>(null);
+  const [viewerArtifact, setViewerArtifact] = useState<GeneratedArtifact | null>(null);
+  const addGenerationJob = useJobsStore((s) => s.addGenerationJob);
+
+  useEffect(() => {
+    if (!capsuleId) return;
+    api.get<GeneratedArtifact[]>(`/generate/capsule/${capsuleId}`)
+      .then((arts) => {
+        // Backend returns newest-first. Take the first artifact seen per type
+        // so a newer running/queued artifact is never overwritten by an older
+        // completed one.
+        const map: Record<GenerationType, GeneratedArtifact | null> = {
+          podcast: null, slides: null,
+        };
+        for (const a of arts) {
+          const t = a.generation_type as GenerationType;
+          if (!map[t]) map[t] = a;
+        }
+        setArtifacts(map);
+      })
+      .catch(() => {});
+  }, [capsuleId]);
+
+  // The JobsPanel already polls /generate/jobs every 4s — read in-flight
+  // artifact status from the store rather than running a duplicate poll.
+  const fetchedCompletedRef = useRef<Set<string>>(new Set());
+  const storeGenJobs = useJobsStore((s) => s.generationJobs);
+  useEffect(() => {
+    const toFetch: { artifactId: string; genType: GenerationType }[] = [];
+    for (const gj of storeGenJobs) {
+      if (gj.source_id !== capsuleId) continue;
+      if (
+        gj.status === "completed" &&
+        !gj.blob_path &&
+        gj.artifact_id &&
+        !fetchedCompletedRef.current.has(gj.artifact_id)
+      ) {
+        fetchedCompletedRef.current.add(gj.artifact_id);
+        toFetch.push({ artifactId: gj.artifact_id, genType: gj.generation_type as GenerationType });
+      }
+    }
+
+    setArtifacts((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const gj of storeGenJobs) {
+        if (gj.source_id !== capsuleId) continue;
+        const t = gj.generation_type as GenerationType;
+        const existing = prev[t];
+        if (!existing) continue;
+        if (existing.id !== gj.artifact_id) continue;
+        if (existing.status === gj.status && existing.blob_path === gj.blob_path) continue;
+        next[t] = {
+          ...existing,
+          status: gj.status as GeneratedArtifact["status"],
+          // Never overwrite with null from JobStore (same pattern as study page)
+          blob_path: gj.blob_path ?? existing.blob_path ?? null,
+          content: gj.content ?? existing.content ?? null,
+          error_message: gj.error_message,
+          completed_at: gj.completed_at,
+        };
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+
+    for (const { artifactId, genType } of toFetch) {
+      api.get<GeneratedArtifact>(`/generate/artifact/${artifactId}`)
+        .then((art) => setArtifacts((prev) => ({ ...prev, [genType]: art })))
+        .catch(() => {});
+    }
+  }, [storeGenJobs, capsuleId]);
+
+  async function trigger(genType: GenerationType, forceRegenerate = false) {
+    setLoading((prev) => ({ ...prev, [genType]: true }));
+    const qs = forceRegenerate ? "?force_regenerate=true" : "";
+    try {
+      const resp = await api.post<{ artifact_id: string; job_id: string; status: string; source_title?: string }>(
+        `/generate/capsule/${capsuleId}/${genType}${qs}`
+      );
+      if (resp.status === "completed") {
+        const art = await api.get<GeneratedArtifact>(`/generate/artifact/${resp.artifact_id}`);
+        setArtifacts((prev) => ({ ...prev, [genType]: art }));
+      } else {
+        const sourceTitle = resp.source_title || `${genType} for idea`;
+        const optimistic: GeneratedArtifact = {
+          id: resp.artifact_id,
+          generation_type: genType,
+          source_type: "capsule",
+          source_id: capsuleId,
+          source_title: sourceTitle,
+          status: "queued",
+          blob_path: null, content: null, expertise_level: null, orientation: null,
+          provider: null, model_used: null, input_tokens: 0, output_tokens: 0,
+          generation_duration_ms: 0, error_message: null,
+          created_at: new Date().toISOString(), completed_at: null,
+        };
+        setArtifacts((prev) => ({ ...prev, [genType]: optimistic }));
+        addGenerationJob({
+          artifact_id: resp.artifact_id, job_id: resp.job_id,
+          source_type: "capsule", source_id: capsuleId,
+          generation_type: genType, title: sourceTitle,
+          status: "queued", error_message: null, blob_path: null, content: null,
+          created_at: new Date().toISOString(), completed_at: null,
+        });
+      }
+    } catch (err) {
+      console.error("generation trigger failed:", err);
+    } finally {
+      setLoading((prev) => ({ ...prev, [genType]: false }));
+    }
+  }
+
+  return (
+    <>
+      <div className="flex items-center gap-2 flex-wrap my-4 px-1">
+        <span className="text-[10px] font-semibold text-gray-600 uppercase tracking-wider">Generate:</span>
+        {ddStatus !== "done" ? (
+          IDEA_GEN_BUTTONS.map(({ type, emoji, label }) => (
+            <button
+              key={type}
+              disabled
+              title="Generate the Deep Dive first to unlock media generation"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-gray-800/50 text-gray-600 cursor-not-allowed opacity-50"
+            >
+              <span>{emoji}</span>
+              {label}
+              <span className="text-[9px] text-gray-600 ml-0.5">·&nbsp;needs deep dive</span>
+            </button>
+          ))
+        ) : (
+          IDEA_GEN_BUTTONS.map(({ type, emoji, label }) => {
+            const art = artifacts[type];
+            const isLoading = loading[type];
+            const isDone = art?.status === "completed";
+            const isRunning = art?.status === "queued" || art?.status === "running";
+
+            return (
+              <button
+                key={type}
+                onClick={() => {
+                  if (isDone) { setViewerArtifact(art); setViewer(type); return; }
+                  if (!isRunning && !isLoading) trigger(type);
+                }}
+                disabled={isLoading || isRunning}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold border transition-all disabled:opacity-60 ${
+                  isDone
+                    ? "bg-violet-600/15 border-violet-500/50 text-violet-200"
+                    : "border-gray-700/50 text-gray-400 hover:border-violet-600/40 hover:text-violet-300 hover:bg-violet-900/20"
+                }`}
+              >
+                {(isLoading || isRunning) ? (
+                  <Loader2Icon size={10} className="animate-spin" />
+                ) : (
+                  <span>{emoji}</span>
+                )}
+                {label}
+                {isDone && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 ml-0.5" />}
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      {/* Minimal inline viewer for capsule artifacts */}
+      <AnimatePresence>
+        {viewer && viewerArtifact && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+            onClick={() => setViewer(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95 }}
+              animate={{ scale: 1 }}
+              exit={{ scale: 0.95 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-gray-950 border border-gray-800 rounded-2xl w-full max-w-2xl max-h-[80vh] overflow-y-auto shadow-2xl p-6"
+            >
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-sm font-bold text-white capitalize">
+                  {IDEA_GEN_BUTTONS.find(b => b.type === viewer)?.emoji} {viewer}
+                </h3>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => { if (viewer) { trigger(viewer, true); setViewer(null); } }}
+                    title="Regenerate (background job)"
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[10px] font-semibold border border-gray-700/50 text-gray-400 hover:text-indigo-300 hover:border-indigo-500/50 hover:bg-indigo-950/20 transition-all"
+                  >
+                    <RefreshCwIcon size={10} /> Regenerate
+                  </button>
+                  <button onClick={() => setViewer(null)} className="text-gray-500 hover:text-white">
+                    <XIcon size={16} />
+                  </button>
+                </div>
+              </div>
+              {(() => {
+                const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+                // Prefer the live artifact from the store (updated by per-artifact GET)
+                // over the snapshot taken at modal-open time, so blob_path is always
+                // current even if it arrived after the user clicked "Audio"/"Slides".
+                const displayArt = (viewer && artifacts[viewer as GenerationType]) ?? viewerArtifact;
+                const blobUrl = displayArt.blob_path ? `${API}/blobs/${displayArt.blob_path}` : null;
+                const script = displayArt.content?.script as string | undefined;
+                const markdown = displayArt.content?.marp_markdown as string | undefined;
+
+                if (viewer === "podcast") {
+                  return (
+                    <div className="space-y-3">
+                      {blobUrl ? (
+                        <audio controls className="w-full rounded-xl" src={blobUrl} />
+                      ) : (
+                        <p className="text-xs text-gray-400">Audio not yet available.</p>
+                      )}
+                      {script && (
+                        <details>
+                          <summary className="text-xs font-semibold text-gray-400 cursor-pointer hover:text-gray-200">View Script</summary>
+                          <pre className="mt-2 text-[11px] text-gray-400 whitespace-pre-wrap max-h-60 overflow-y-auto bg-gray-900/60 rounded-xl p-3">{script}</pre>
+                        </details>
+                      )}
+                    </div>
+                  );
+                }
+
+                if (viewer === "slides") {
+                  if (blobUrl) {
+                    return (
+                      <div className="space-y-2">
+                        <iframe
+                          src={blobUrl}
+                          className="w-full rounded-xl border border-gray-800"
+                          style={{ height: "420px" }}
+                          title="Slide Deck"
+                        />
+                        <a href={blobUrl} download className="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300">
+                          Download HTML
+                        </a>
+                      </div>
+                    );
+                  }
+                  if (markdown) {
+                    return (
+                      <pre className="text-[11px] text-gray-400 whitespace-pre-wrap max-h-80 overflow-y-auto bg-gray-900/60 rounded-xl p-3">
+                        {markdown}
+                      </pre>
+                    );
+                  }
+                }
+
+                return null;
+              })()}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 type DeepDiveStatus = "idle" | "streaming" | "done" | "error";
@@ -786,6 +1083,7 @@ export default function IdeaDeepDivePage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const { token } = useAuthStore();
+  const addDeepDiveJob = useJobsStore((s) => s.addDeepDiveJob);
   const [capsule, setCapsule] = useState<IdeaCapsule | null>(null);
   const [status, setStatus] = useState<"loading" | "done" | "error">("loading");
   const [showChat, setShowChat] = useState(false);
@@ -797,6 +1095,14 @@ export default function IdeaDeepDivePage() {
   const [ddStatus, setDdStatus] = useState<DeepDiveStatus>("idle");
   const [ddText, setDdText] = useState("");
   const [ddStatusMsg, setDdStatusMsg] = useState("");
+
+  // Reset deep-dive state whenever the idea id changes so stale content from a
+  // previous idea never flashes while the new one is loading.
+  useEffect(() => {
+    setDdText("");
+    setDdStatus("idle");
+    setDdStatusMsg("");
+  }, [id]);
 
   function onScroll() {
     const el = scrollRef.current;
@@ -829,24 +1135,38 @@ export default function IdeaDeepDivePage() {
     if (ddStatus !== "streaming" || ddText) return; // only poll if no live stream
     if (!id || !token) return;
     const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+    // Hard deadline: surface an error if the backend never finishes within 15 min
+    // so the user is never stuck on an infinite "Background generation in progress…".
+    const deadline = setTimeout(() => {
+      clearInterval(interval);
+      setDdStatus("error");
+      setDdStatusMsg("Generation timed out. Please try again.");
+    }, 15 * 60 * 1000);
+
     const interval = setInterval(async () => {
       try {
         const r = await fetch(`${API}/api/v1/genie/capsules/${id}`, { headers: { Authorization: `Bearer ${token}` } });
         if (!r.ok) return;
         const data: IdeaCapsule = await r.json();
         if (data.deep_dive_status === "done" && data.deep_dive_content) {
+          clearTimeout(deadline);
           setDdText(data.deep_dive_content);
           setDdStatus("done");
           setDdStatusMsg("");
           clearInterval(interval);
         } else if (data.deep_dive_status === "failed") {
+          clearTimeout(deadline);
           setDdStatus("error");
           setDdStatusMsg("");
           clearInterval(interval);
         }
       } catch {}
     }, 5000);
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(deadline);
+      clearInterval(interval);
+    };
   }, [ddStatus, ddText, id, token]);
 
   async function startDeepDiveBg() {
@@ -862,6 +1182,14 @@ export default function IdeaDeepDivePage() {
       setDdStatus("streaming");
       setDdText("");
       setDdStatusMsg("Background generation started — results will appear when ready.");
+      addDeepDiveJob({
+        capsule_id: id,
+        capsule_title: capsule?.title ?? "",
+        status: "generating",
+        created_at: new Date().toISOString(),
+        completed_at: null,
+        error: null,
+      });
       setTimeout(() => deepDiveRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
     } catch (e) {
       setDdStatusMsg(`Failed to start background generation: ${String(e).slice(0, 80)}`);
@@ -871,8 +1199,33 @@ export default function IdeaDeepDivePage() {
   const diagrams = capsule?.diagrams ?? [];
   const hasDiagrams = diagrams.some(d => d.spec || d.blob_path);
 
+
+  const navItems = useMemo(() => {
+    if (!capsule || status !== "done") return [];
+    const items: { id: string; label: string; icon: string }[] = [];
+    for (const def of SECTIONS) {
+      const content = capsule[def.key] as string | null;
+      if (!content) continue;
+      items.push({ id: `genie-section-${def.key}`, label: def.label, icon: def.emoji });
+    }
+    if (capsule.poc_code) {
+      const isCode = /^```(\w*)\n([\s\S]*?)```\s*$/.test(capsule.poc_code);
+      items.push({ id: "genie-section-poc", label: isCode ? "Proof of Concept" : "Method Sketch", icon: "💻" });
+    }
+    if (capsule.source_papers?.length) items.push({ id: "genie-section-sources", label: "Source Papers", icon: "📄" });
+    if (hasDiagrams) items.push({ id: "genie-section-diagrams", label: "Diagrams", icon: "🖼" });
+    if (ddStatus !== "idle") items.push({ id: "genie-section-deepdive", label: "Full Deep Dive", icon: "🔬" });
+    return items;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [capsule, status, hasDiagrams, ddStatus]);
+
   return (
     <div className="flex h-full" style={{ background: "var(--rf-bg)" }}>
+      {/* Section navigation panel */}
+      {status === "done" && navItems.length > 0 && (
+        <SectionNavPanel items={navItems} scrollRef={scrollRef} accent="violet" />
+      )}
+
       <div
         ref={scrollRef}
         onScroll={onScroll}
@@ -918,13 +1271,15 @@ export default function IdeaDeepDivePage() {
                       <><SparklesIcon size={12} />Generate Deep Dive</>
                     )}
                   </button>
-                  <button
-                    onClick={() => setShowChat(v => !v)}
-                    className={`flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all ${showChat ? "bg-violet-600 text-white" : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"}`}
-                  >
-                    <MessageSquareIcon size={12} />
-                    {showChat ? "Close Chat" : "Ask Questions"}
-                  </button>
+                  {ddStatus === "done" && (
+                    <button
+                      onClick={() => setShowChat(v => !v)}
+                      className={`flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all ${showChat ? "bg-violet-600 text-white" : "bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"}`}
+                    >
+                      <MessageSquareIcon size={12} />
+                      {showChat ? "Close Chat" : "Ask Questions"}
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -954,6 +1309,9 @@ export default function IdeaDeepDivePage() {
           {status === "done" && capsule && (
             <>
               <CapsuleHero capsule={capsule} />
+
+              {/* Media generation bar for capsule */}
+              <IdeaGenerationBar capsuleId={capsule.id} ddStatus={ddStatus} />
               <div className="space-y-10">
                 {SECTIONS.map((def, i) => {
                   const content = capsule[def.key] as string | null;
@@ -968,7 +1326,7 @@ export default function IdeaDeepDivePage() {
                   const codeContent = fenceMatch ? fenceMatch[2].trim() : capsule.poc_code;
                   const lang = fenceMatch ? (fenceMatch[1] || "python") : "python";
                   return (
-                    <motion.div initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}>
+                    <motion.div id="genie-section-poc" initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }} className="scroll-mt-6">
                       <div className="flex items-center gap-4 mb-5">
                         <div className="relative flex items-center justify-center w-14 h-14 rounded-2xl border bg-gray-800/80 border-gray-700/60 flex-shrink-0 shadow-xl overflow-hidden">
                           <div className="absolute inset-0 bg-gradient-to-br from-gray-500 to-gray-600 opacity-15" />
@@ -997,7 +1355,7 @@ export default function IdeaDeepDivePage() {
 
                 {/* Source Papers */}
                 {capsule.source_papers && capsule.source_papers.length > 0 && (
-                  <motion.div initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}>
+                  <motion.div id="genie-section-sources" initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }} className="scroll-mt-6">
                     <div className="flex items-center gap-4 mb-5">
                       <div className="relative flex items-center justify-center w-14 h-14 rounded-2xl border bg-sky-950/60 border-sky-800/60 flex-shrink-0 shadow-xl overflow-hidden">
                         <div className="absolute inset-0 bg-gradient-to-br from-sky-500 to-blue-600 opacity-15" />
@@ -1039,7 +1397,7 @@ export default function IdeaDeepDivePage() {
 
                 {/* Diagrams */}
                 {hasDiagrams && (
-                  <motion.div initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}>
+                  <motion.div id="genie-section-diagrams" initial={{ opacity: 0, y: 28 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }} className="scroll-mt-6">
                     <div className="flex items-center gap-4 mb-5">
                       <div className="relative flex items-center justify-center w-14 h-14 rounded-2xl border bg-violet-950/60 border-violet-800/60 flex-shrink-0 shadow-xl overflow-hidden">
                         <div className="absolute inset-0 bg-gradient-to-br from-violet-500 to-purple-600 opacity-15" />
@@ -1060,11 +1418,12 @@ export default function IdeaDeepDivePage() {
                 {/* ── Deep Dive Article ── */}
                 {(ddStatus !== "idle") && (
                   <motion.div
+                    id="genie-section-deepdive"
                     ref={deepDiveRef}
                     initial={{ opacity: 0, y: 32 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-                    className="mt-4"
+                    className="mt-4 scroll-mt-6"
                   >
                     {/* Section header */}
                     <div className="flex items-center gap-4 mb-6">

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.paper import Bookmark, FeedFeedback, Paper, PaperChunk, PaperOfDay, Summary
@@ -42,20 +42,39 @@ class PaperRepository:
         return {row[0] for row in result.fetchall()}
 
     async def upsert_papers(self, papers: list[dict]) -> list[Paper]:
-        """Insert new papers — skip on conflict (external_id + namespace_key)."""
+        """Insert new papers — skip on conflict (external_id + namespace_key).
+
+        Uses a single batch SELECT to find all already-persisted papers before
+        inserting, replacing the previous per-paper SELECT loop that issued
+        N queries for N papers.
+
+        Args:
+            papers: List of normalised paper dicts from the ingestion fetch node.
+
+        Returns:
+            List of newly inserted ``Paper`` ORM objects (excludes duplicates).
+        """
+        if not papers:
+            return []
+
+        # Single query to discover which (external_id, namespace_key) pairs already exist
+        pairs = [(p["external_id"], p["namespace_key"]) for p in papers]
+        result = await self._db.execute(
+            select(Paper.external_id, Paper.namespace_key).where(
+                tuple_(Paper.external_id, Paper.namespace_key).in_(pairs)
+            )
+        )
+        existing_pairs: set[tuple[str, str]] = {
+            (row.external_id, row.namespace_key) for row in result.fetchall()
+        }
+
         new_papers: list[Paper] = []
         for data in papers:
-            existing = await self._db.execute(
-                select(Paper).where(
-                    Paper.external_id == data["external_id"],
-                    Paper.namespace_key == data["namespace_key"],
-                )
-            )
-            obj = existing.scalar_one_or_none()
-            if obj is None:
+            if (data["external_id"], data["namespace_key"]) not in existing_pairs:
                 obj = Paper(**data)
                 self._db.add(obj)
                 new_papers.append(obj)
+
         await self._db.flush()
         return new_papers
 
@@ -279,15 +298,18 @@ class PaperRepository:
             user_id: UUID of the user.
 
         Returns:
-            A list of paper UUID strings where the feedback signal is ``"like"``.
+            A deduplicated list of paper UUID strings where the feedback
+            signal is ``"like"``. DISTINCT prevents duplicate IDs when a
+            user has submitted multiple ``"like"`` signals for the same paper.
         """
+        from sqlalchemy import distinct
         result = await self._db.execute(
-            select(FeedFeedback.paper_id).where(
+            select(distinct(FeedFeedback.paper_id)).where(
                 FeedFeedback.user_id == user_id,
                 FeedFeedback.signal == "like",
             )
         )
-        return [str(row.paper_id) for row in result.fetchall()]
+        return [str(row[0]) for row in result.fetchall()]
 
     async def remove_feedback(self, user_id: UUID, paper_id: UUID, signal: str) -> None:
         """Delete a specific feedback signal for a (user, paper) pair.

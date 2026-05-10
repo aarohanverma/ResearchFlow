@@ -31,18 +31,23 @@ async def _run_ingestion_all() -> None:
 
 
 async def _rebuild_bookmark_index() -> None:
-    """Re-embed all bookmarked papers that are missing an abstract chunk."""
+    """Re-embed all bookmarked papers that are missing an abstract chunk.
+
+    Uses batch queries to find papers lacking abstract embeddings — a single
+    LEFT JOIN query per user replaces the previous per-paper ``get_chunks``
+    loop that issued one query per bookmarked paper.
+    """
     from app.adapters.embedding import get_embedding_adapter
     from app.db.session import async_session_factory
-    from app.models.paper import PaperChunk
+    from app.models.paper import Bookmark, Paper, PaperChunk
     from app.repositories.paper import PaperRepository
-    from sqlalchemy import text as sa_text
+    from sqlalchemy import distinct, select
 
     log.info("scheduler.bookmark_index_rebuild: starting")
     try:
         embed = get_embedding_adapter()
         async with async_session_factory() as db:
-            rows = await db.execute(sa_text("SELECT DISTINCT user_id FROM bookmarks"))
+            rows = await db.execute(select(distinct(Bookmark.user_id)))
             user_ids = [r[0] for r in rows.fetchall()]
 
         rebuilt = 0
@@ -50,15 +55,35 @@ async def _rebuild_bookmark_index() -> None:
             async with async_session_factory() as db:
                 repo = PaperRepository(db)
                 bookmarks = await repo.get_bookmarks(uid)
-                for bm in bookmarks:
-                    chunks = await repo.get_chunks(bm.paper_id)
-                    if any(c.section_type == "abstract" for c in chunks):
-                        continue
-                    paper = await repo.get_by_id(bm.paper_id)
-                    if not paper:
-                        continue
+                if not bookmarks:
+                    continue
+
+                bm_paper_ids = [bm.paper_id for bm in bookmarks]
+
+                # Single query: find which bookmarked papers already have an abstract chunk
+                abstract_chunk_q = await db.execute(
+                    select(PaperChunk.paper_id).where(
+                        PaperChunk.paper_id.in_(bm_paper_ids),
+                        PaperChunk.section_type == "abstract",
+                    )
+                )
+                already_embedded: set = {row[0] for row in abstract_chunk_q.fetchall()}
+
+                # Batch-fetch only the papers that need embedding
+                missing_ids = [pid for pid in bm_paper_ids if pid not in already_embedded]
+                if not missing_ids:
+                    continue
+
+                papers_q = await db.execute(
+                    select(Paper).where(Paper.id.in_(missing_ids))
+                )
+                papers_to_embed = [p for p in papers_q.scalars() if p.abstract]
+
+                for paper in papers_to_embed:
                     try:
-                        vectors = await embed.embed_texts([paper.abstract], task_type="RETRIEVAL_DOCUMENT")
+                        vectors = await embed.embed_texts(
+                            [paper.abstract], task_type="RETRIEVAL_DOCUMENT"
+                        )
                         db.add(PaperChunk(
                             paper_id=paper.id,
                             chunk_index=0,
@@ -70,7 +95,11 @@ async def _rebuild_bookmark_index() -> None:
                         ))
                         rebuilt += 1
                     except Exception as exc:
-                        log.warning("bookmark_index_rebuild: embed failed paper=%s err=%s", paper.id, exc)
+                        log.warning(
+                            "bookmark_index_rebuild: embed failed paper=%s err=%s",
+                            paper.id, exc,
+                        )
+
                 await db.commit()
 
         log.info("scheduler.bookmark_index_rebuild: done rebuilt=%d", rebuilt)
@@ -116,17 +145,30 @@ def start_scheduler() -> None:
     if _scheduler is not None:
         return
 
-    _scheduler = AsyncIOScheduler()
+    # Build and configure the scheduler before assigning to the global so
+    # that if start() raises (e.g. no running event loop on some platforms),
+    # a subsequent call to start_scheduler() will retry rather than returning
+    # early with a half-initialized, non-running scheduler reference.
+    sched = AsyncIOScheduler()
 
     # Parse cron strings from settings (format: "minute hour day month weekday")
     def _parse_cron(cron_str: str) -> dict:
-        """Convert a 5-field cron string into an APScheduler keyword-argument dict."""
+        """Convert a 5-field cron string into an APScheduler keyword-argument dict.
+
+        Raises:
+            ValueError: If ``cron_str`` does not contain exactly 5 fields.
+        """
         parts = cron_str.split()
+        if len(parts) != 5:
+            raise ValueError(
+                f"Invalid cron expression {cron_str!r}: expected 5 fields "
+                f"(minute hour day month weekday), got {len(parts)}"
+            )
         keys = ["minute", "hour", "day", "month", "day_of_week"]
         return dict(zip(keys, parts))
 
     ingestion_cron = _parse_cron(settings.ingestion_cron)
-    _scheduler.add_job(
+    sched.add_job(
         _run_ingestion_all,
         "cron",
         id="ingestion_nightly",
@@ -135,23 +177,25 @@ def start_scheduler() -> None:
     )
 
     clustering_cron = _parse_cron(settings.clustering_cron)
-    _scheduler.add_job(
+    sched.add_job(
         _run_clustering,
         "cron",
         id="clustering_weekly",
         **clustering_cron,
+        misfire_grace_time=3600,
     )
 
     xns_cron = _parse_cron(settings.cross_namespace_cron)
-    _scheduler.add_job(
+    sched.add_job(
         _run_cross_namespace_links,
         "cron",
         id="cross_namespace_weekly",
         **xns_cron,
+        misfire_grace_time=3600,
     )
 
     # Weekly nightly bookmark index rebuild — catches any papers that missed embedding
-    _scheduler.add_job(
+    sched.add_job(
         _rebuild_bookmark_index,
         "cron",
         id="bookmark_index_rebuild_weekly",
@@ -161,7 +205,8 @@ def start_scheduler() -> None:
         misfire_grace_time=3600,
     )
 
-    _scheduler.start()
+    sched.start()  # assign only after successful start
+    _scheduler = sched
     log.info("scheduler started: ingestion=%s clustering=%s", settings.ingestion_cron, settings.clustering_cron)
 
 

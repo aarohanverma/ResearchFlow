@@ -12,12 +12,20 @@ module, class, and function in the backend.
 
 .. toctree::
    :maxdepth: 3
-   :caption: Workflows
+   :caption: Workflows — Core
 
    api/workflows.ingestion
    api/workflows.study
    api/workflows.rag
    api/workflows.genie
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Workflows — Media Generation
+
+   api/workflows._generation_runtime
+   api/workflows.podcast
+   api/workflows.slides
 
 .. toctree::
    :maxdepth: 3
@@ -33,6 +41,7 @@ module, class, and function in the backend.
    api/api.v1.graph
    api/api.v1.bookmarks
    api/api.v1.settings
+   api/api.v1.generate
 
 .. toctree::
    :maxdepth: 3
@@ -44,6 +53,7 @@ module, class, and function in the backend.
    api/repositories.graph
    api/repositories.user
    api/repositories.workflow
+   api/repositories.artifact
 
 .. toctree::
    :maxdepth: 3
@@ -54,6 +64,8 @@ module, class, and function in the backend.
    api/services.namespace
    api/services.token_usage
    api/services.email_service
+   api/services.content_loader
+   api/services.job_store
 
 .. toctree::
    :maxdepth: 3
@@ -68,6 +80,8 @@ module, class, and function in the backend.
    api/adapters.sources
    api/adapters.email
    api/adapters.web_search
+   api/adapters.tts
+   api/adapters.slides
 
 .. toctree::
    :maxdepth: 3
@@ -78,6 +92,7 @@ module, class, and function in the backend.
    api/models.graph
    api/models.user
    api/models.workflow
+   api/models.artifact
 
 .. toctree::
    :maxdepth: 2

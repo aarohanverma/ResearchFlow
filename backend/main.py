@@ -99,6 +99,26 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     """Startup: create DB tables (dev), start scheduler. Shutdown: stop scheduler."""
     log.info("ResearchFlow starting — environment=%s debug=%s", settings.environment, settings.debug)
 
+    # Security guard: reject startup when JWT_SECRET is the insecure default.
+    # A forged token gives attackers full access to every user account.
+    _JWT_DEFAULT = "change-me-in-production"
+    if settings.jwt_secret == _JWT_DEFAULT:
+        if settings.environment != "local":
+            # Hard abort — running with a forgeable JWT secret in production
+            # is worse than being unavailable. The operator MUST set JWT_SECRET.
+            raise RuntimeError(
+                "FATAL: JWT_SECRET is set to the default insecure value in a "
+                f"non-local environment ({settings.environment!r}). "
+                "All tokens can be forged. "
+                "Set JWT_SECRET to a cryptographically random 32+ char string "
+                "and restart the service."
+            )
+        else:
+            log.warning(
+                "JWT_SECRET is set to the default insecure value. "
+                "Set JWT_SECRET before deploying to staging or production."
+            )
+
     if settings.environment == "local":
         from app.db.session import create_all_tables
         await create_all_tables()
@@ -146,13 +166,13 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     # Schema migrations — ADD COLUMN IF NOT EXISTS is idempotent
     try:
         from app.db.session import engine
-        from sqlalchemy import text as _text2
+        from sqlalchemy import text as _text
         async with engine.begin() as conn:
-            await conn.execute(_text2("""
+            await conn.execute(_text("""
                 ALTER TABLE idea_capsules
                 ADD COLUMN IF NOT EXISTS source_mode VARCHAR(20) NOT NULL DEFAULT 'manual'
             """))
-            await conn.execute(_text2("""
+            await conn.execute(_text("""
                 ALTER TABLE idea_capsules
                 ADD COLUMN IF NOT EXISTS source_query TEXT
             """))
@@ -160,12 +180,89 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("idea_capsules migration skipped: %s", exc)
 
+    # Ensure generated_artifacts table exists (idempotent via create_all on local)
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_generated_artifacts_user_source
+                ON generated_artifacts (user_id, source_id, generation_type)
+            """))
+            # Composite index for cache-lookup query (user, source, type, status, created_at)
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_generated_artifacts_lookup
+                ON generated_artifacts (user_id, source_id, generation_type, status, created_at DESC)
+            """))
+        log.info("generated_artifacts indexes ensured")
+    except Exception as exc:
+        log.warning("generated_artifacts index creation skipped: %s", exc)
+
+    # Index for WorkflowRepository.should_run() — called on every nightly ingestion
+    # to guard idempotency.  Without this, the query scans the whole workflow_runs
+    # table; with this index it resolves the (name, scope, date, status) lookup
+    # in O(log n).
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_workflow_runs_idempotency
+                ON workflow_runs (workflow_name, scope_key, run_date, status)
+            """))
+        log.info("workflow_runs idempotency index ensured")
+    except Exception as exc:
+        log.warning("workflow_runs index creation skipped: %s", exc)
+
+    # Add parser metadata columns to papers (idempotent)
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                ALTER TABLE papers ADD COLUMN IF NOT EXISTS parser_used VARCHAR(50)
+            """))
+            await conn.execute(_text("""
+                ALTER TABLE papers ADD COLUMN IF NOT EXISTS parser_fallback_used BOOLEAN DEFAULT FALSE
+            """))
+            await conn.execute(_text("""
+                ALTER TABLE papers ADD COLUMN IF NOT EXISTS parse_duration_ms INTEGER
+            """))
+            await conn.execute(_text("""
+                ALTER TABLE papers ADD COLUMN IF NOT EXISTS parser_confidence DOUBLE PRECISION
+            """))
+        log.info("papers parser-metadata columns ensured")
+    except Exception as exc:
+        log.warning("papers parser-metadata migration skipped: %s", exc)
+
     # Ensure the guest/test user always exists in local dev — idempotent
     if settings.environment == "local":
         try:
             await _ensure_seed_user()
         except Exception as exc:
             log.warning("seed user creation skipped: %s", exc)
+
+    # Initialise the LangGraph PostgreSQL checkpoint store so the tables
+    # exist before any workflow runs. The checkpointer is a module-level
+    # singleton that slides and podcast workflows share.
+    try:
+        from app.db.checkpointer import get_checkpointer
+        await get_checkpointer()
+        log.info("LangGraph checkpoint store ready")
+    except Exception as exc:
+        log.warning("LangGraph checkpoint store init failed (workflows will run without checkpointing): %s", exc)
+
+    # Sweep any GeneratedArtifact rows left in ``running``/``queued`` state by
+    # a previous worker crash. With checkpointing active, jobs that have partial
+    # state are re-dispatched from the last completed node rather than restarted
+    # from scratch — preventing token waste on already-completed LLM calls.
+    try:
+        from app.workflows._generation_runtime import recover_orphaned_artifacts
+        recovered = await recover_orphaned_artifacts()
+        if recovered:
+            log.info("startup recovery: %d orphaned generation job(s) processed", recovered)
+    except Exception as exc:
+        log.warning("startup recovery skipped: %s", exc)
 
     start_scheduler()
     log.info("scheduler started")
@@ -254,7 +351,36 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ── Health + debug endpoints ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
+    """Liveness probe — always returns 200 so the process is known to be up.
+
+    For a deeper readiness check (DB connectivity) call ``/health/ready``.
+    """
     return {"status": "ok", "environment": settings.environment}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness probe — verifies DB connectivity before accepting traffic.
+
+    Returns 200 when the database is reachable, 503 otherwise.
+    Suitable for Kubernetes readinessProbe / load-balancer health checks.
+    """
+    from fastapi.responses import JSONResponse as _JSONResponse
+    from app.db.session import engine
+    from sqlalchemy import text as _text
+
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(_text("SELECT 1"))
+        return {"status": "ready", "db": "ok"}
+    except Exception as exc:
+        # Log the full exception server-side (may contain connection strings).
+        # Never surface raw exception text to callers — it can expose credentials.
+        log.error("health_ready: DB connectivity check failed — %s", exc)
+        return _JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "db": "unavailable"},
+        )
 
 
 @app.get("/debug/status", include_in_schema=settings.debug)

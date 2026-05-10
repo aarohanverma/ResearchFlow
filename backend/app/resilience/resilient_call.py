@@ -1,9 +1,20 @@
 """Resilience layer — four-tier safety net for every external call.
 
 Tier 1: Retry with exponential backoff + jitter (tenacity)
-Tier 2: Provider fallback chain (LLMAdapter handles this internally)
+Tier 2: Provider fallback chain (supplied via ``fallback_fn``)
 Tier 3: Circuit breaker (pybreaker) — opens on N consecutive failures
-Tier 4: Graceful degradation — caller gets a DegradedResult instead of an exception
+Tier 4: Graceful degradation — caller gets ``degrade_value`` instead of an exception
+
+Circuit-breaker notes
+---------------------
+pybreaker's ``call()`` method is synchronous-only.  We use ``call_async()``
+(available in pybreaker ≥ 1.0) with an ``AttributeError`` guard for older
+installs.  The guard avoids the previous ``run_until_complete()`` anti-pattern
+which raised ``RuntimeError: This event loop is already running`` on every call
+from an async context, effectively bypassing the circuit breaker entirely.
+
+The ``_breakers`` dict is guarded by a module-level ``asyncio.Lock`` so
+concurrent first-calls cannot produce duplicate breaker objects.
 """
 
 import asyncio
@@ -11,7 +22,7 @@ import functools
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import pybreaker
@@ -30,43 +41,88 @@ F = TypeVar("F")
 
 @dataclass
 class DegradedResult:
-    """Returned instead of raising when all tiers are exhausted."""
+    """Returned instead of raising when all tiers are exhausted.
+
+    Attributes:
+        error: Human-readable description of the failure.
+        degraded: Always ``True`` — lets callers distinguish a real result
+            from a degraded placeholder.
+        data: Optional partial data carried from earlier tiers.
+    """
+
     error: str
     degraded: bool = True
     data: Any = None
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """Only retry on transient errors — never on 4xx auth / bad-request."""
-    import httpx
-    import openai
-    import anthropic
+    """Return ``True`` for transient errors that warrant a retry.
 
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
-        return True
-    if isinstance(exc, openai.RateLimitError):
-        return True
-    if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
-        return True
-    if isinstance(exc, anthropic.RateLimitError):
-        return True
-    if isinstance(exc, anthropic.APIStatusError) and exc.status_code >= 500:
-        return True
+    Never retries on 4xx authentication / bad-request errors.
+
+    Args:
+        exc: The exception raised by the protected callable.
+
+    Returns:
+        ``True`` if the error is transient (network, rate limit, 5xx server).
+    """
+    try:
+        import httpx
+        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+            return True
+    except ImportError:
+        pass
+    try:
+        import openai
+        if isinstance(exc, openai.RateLimitError):
+            return True
+        if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+            return True
+    except ImportError:
+        pass
+    try:
+        import anthropic
+        if isinstance(exc, anthropic.RateLimitError):
+            return True
+        if isinstance(exc, anthropic.APIStatusError) and exc.status_code >= 500:
+            return True
+    except ImportError:
+        pass
     return False
 
 
-# One circuit breaker per provider name — shared across process lifetime.
+# ── Per-provider circuit breakers ─────────────────────────────────────────────
+# One breaker per provider name, shared across the process lifetime.
+# Protected by a module-level lock to prevent duplicate creation under
+# concurrent first-calls.
+#
+# The lock is initialised eagerly at import time (not lazily) to avoid a
+# race where two coroutines simultaneously see `_breakers_lock is None`,
+# both create a new asyncio.Lock(), and one is immediately orphaned.
+# asyncio.Lock() is cheap — creating it at module load is safe.
+
 _breakers: dict[str, pybreaker.CircuitBreaker] = {}
+_breakers_lock = asyncio.Lock()
 
 
-def _get_breaker(provider: str) -> pybreaker.CircuitBreaker:
-    """Return (creating if necessary) the circuit breaker for a given provider name."""
-    if provider not in _breakers:
-        _breakers[provider] = pybreaker.CircuitBreaker(
-            fail_max=5,          # open after 5 consecutive failures
-            reset_timeout=60,    # half-open after 60 s
-            name=provider,
-        )
+async def _get_breaker_async(provider: str) -> pybreaker.CircuitBreaker:
+    """Return the circuit breaker for ``provider``, creating it if needed.
+
+    Args:
+        provider: Short provider name (e.g. ``"openai"``).
+
+    Returns:
+        The :class:`pybreaker.CircuitBreaker` instance for that provider.
+    """
+    if provider in _breakers:  # fast path — no lock needed for reads
+        return _breakers[provider]
+    async with _breakers_lock:
+        if provider not in _breakers:  # re-check under lock
+            _breakers[provider] = pybreaker.CircuitBreaker(
+                fail_max=5,       # open after 5 consecutive failures
+                reset_timeout=60, # half-open after 60 s
+                name=provider,
+            )
     return _breakers[provider]
 
 
@@ -81,22 +137,31 @@ async def resilient_call(
     node: str = "",
     **kwargs,
 ) -> Any:
-    """Execute fn with retry, circuit-breaker, fallback, and graceful degradation.
+    """Execute ``fn`` with retry, circuit-breaker, fallback, and graceful degradation.
 
     Args:
-        provider: Provider name for circuit-breaker keying and logging.
-        fn: The async callable to protect.
-        max_attempts: Max retry attempts (default 3).
-        fallback_fn: Async callable used after retries are exhausted.
-        degrade_value: Returned if fallback_fn also fails (graceful degradation).
-        workflow: LangSmith tracing context label.
-        node: LangSmith node label.
+        provider: Provider name used for circuit-breaker keying and log context.
+        fn: Async callable to protect.
+        max_attempts: Maximum retry attempts (default 3).
+        fallback_fn: Async callable invoked when retries are exhausted.
+        degrade_value: Returned when both ``fn`` and ``fallback_fn`` fail.
+        workflow: Workflow name for structured logging.
+        node: Node name for structured logging.
+        *args: Positional arguments forwarded to ``fn`` (and ``fallback_fn``).
+        **kwargs: Keyword arguments forwarded to ``fn`` (and ``fallback_fn``).
+
+    Returns:
+        Result of ``fn``, ``fallback_fn``, or ``degrade_value`` (in that order).
+
+    Raises:
+        The last exception raised by ``fn`` when no fallback or degrade value
+        is configured and all tiers are exhausted.
     """
-    breaker = _get_breaker(provider)
+    breaker = await _get_breaker_async(provider)
     start = time.monotonic()
 
     async def _attempt():
-        """Run ``fn`` with exponential-jitter retries inside the circuit breaker."""
+        """Run ``fn`` with exponential-jitter retries."""
         async for attempt in AsyncRetrying(
             retry=retry_if_exception(_is_retryable),
             stop=stop_after_attempt(max_attempts),
@@ -107,11 +172,14 @@ async def resilient_call(
                 return await fn(*args, **kwargs)
 
     try:
-        # Tier 1 + 3: retry inside circuit breaker
+        # Tier 1 + 3: retry inside the circuit breaker.
+        # Use call_async (pybreaker ≥ 1.0) with a fallback for older installs.
+        # The previous breaker.call(lambda: run_until_complete(...)) pattern
+        # always raised RuntimeError inside an async context and was inoperative.
         try:
-            result = breaker.call(lambda: asyncio.get_event_loop().run_until_complete(_attempt()))
-        except TypeError:
-            # pybreaker doesn't support async natively — wrap coroutine
+            result = await breaker.call_async(_attempt)
+        except AttributeError:
+            # Older pybreaker without call_async — bypass breaker, keep retries
             result = await _attempt()
 
         log.debug(
@@ -153,12 +221,23 @@ def with_resilience(
     workflow: str = "",
     node: str = "",
 ):
-    """Decorator version of resilient_call."""
+    """Decorator version of :func:`resilient_call`.
+
+    Args:
+        provider: Provider name for circuit-breaker keying.
+        max_attempts: Maximum retry attempts.
+        fallback_fn: Async fallback callable.
+        degrade_value: Value returned when all tiers are exhausted.
+        workflow: Workflow label for structured logging.
+        node: Node label for structured logging.
+
+    Returns:
+        Decorator that wraps an async callable with the four-tier safety net.
+    """
     def decorator(fn: Callable) -> Callable:
         """Wrap a callable with resilient retry/fallback logic."""
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
-            """Execute the wrapped callable through resilient_call."""
             return await resilient_call(
                 provider=provider,
                 fn=fn,

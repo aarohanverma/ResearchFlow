@@ -176,3 +176,39 @@ export interface SearchResponse {
   query: string;
   mode: string;
 }
+
+// ── Media generation ──────────────────────────────────────────────────────────
+
+export type GenerationType = "podcast" | "slides";
+export type SourceType = "paper" | "capsule" | "folder";
+export type GenerationSourceType = "paper" | "capsule";   // folders excluded from media generation
+export type ArtifactStatus = "queued" | "running" | "completed" | "failed";
+
+export interface GeneratedArtifact {
+  id: string;
+  generation_type: GenerationType;
+  source_type: GenerationSourceType;
+  source_id: string;
+  source_title: string;
+  status: ArtifactStatus;
+  blob_path: string | null;
+  content: Record<string, unknown> | null;
+  expertise_level: string | null;
+  orientation: string | null;
+  provider: string | null;
+  model_used: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  generation_duration_ms: number;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface TriggerResponse {
+  artifact_id: string;
+  job_id: string;
+  status: ArtifactStatus | "cached";
+  message: string;
+  source_title: string;
+}

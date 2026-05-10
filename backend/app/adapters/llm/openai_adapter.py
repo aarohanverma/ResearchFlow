@@ -6,13 +6,50 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any, Callable
 
+import httpx
 import openai
 from openai import AsyncOpenAI
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from app.adapters.llm.base import CompletionResult, LLMAdapter, ToolCall
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
+
+
+def _is_retryable_llm(exc: Exception) -> bool:
+    """Retry only on transient/server errors. Auth/bad-request errors are not retried."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError)):
+        return True
+    if isinstance(exc, openai.RateLimitError):
+        # insufficient_quota = billing failure, not transient — never retry
+        return "insufficient_quota" not in str(exc)
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", 0) >= 500:
+        return True
+    return False
+
+
+async def _call_with_retry(coro_factory):
+    """Run a no-arg async coroutine factory with exp-jitter retries.
+
+    Three attempts with 1s → up to 8s jittered backoff. Re-raises the last
+    exception if all attempts fail. Non-retryable errors propagate immediately.
+    """
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception(_is_retryable_llm),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=1, max=8),
+        reraise=True,
+    ):
+        with attempt:
+            return await coro_factory()
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -35,7 +72,9 @@ class OpenAIAdapter(LLMAdapter):
             api_key: OpenAI API key. Falls back to ``settings.openai_api_key``
                 if not provided.
         """
-        self._client = AsyncOpenAI(api_key=api_key or settings.openai_api_key)
+        # max_retries=0: tenacity handles all retries; SDK retries would stack
+        # on top and produce noisy duplicate tracebacks for the same failure.
+        self._client = AsyncOpenAI(api_key=api_key or settings.openai_api_key, max_retries=0)
 
     async def complete(
         self,
@@ -76,7 +115,9 @@ class OpenAIAdapter(LLMAdapter):
             kwargs["reasoning_effort"] = reasoning_effort
 
         start = time.monotonic()
-        resp = await self._client.chat.completions.create(**kwargs)
+        resp = await _call_with_retry(
+            lambda: self._client.chat.completions.create(**kwargs)
+        )
         latency = int((time.monotonic() - start) * 1000)
 
         usage = resp.usage
@@ -176,7 +217,9 @@ class OpenAIAdapter(LLMAdapter):
 
             start = time.monotonic()
             try:
-                resp = await self._client.chat.completions.create(**kwargs)
+                resp = await _call_with_retry(
+                    lambda: self._client.chat.completions.create(**kwargs)
+                )
             except Exception as exc:
                 log.warning("complete_with_tools: API call failed (%s) — returning last result", exc)
                 return last_result
@@ -257,8 +300,15 @@ class OpenAIAdapter(LLMAdapter):
         kwargs: dict[str, Any] = {"model": model, "messages": messages, "stream": True}
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
 
-        async with await self._client.chat.completions.create(**kwargs) as stream:
+        # Retry only the stream initiation (not mid-stream): once tokens are
+        # flowing we can't safely restart without confusing the caller.
+        stream_cm = await _call_with_retry(
+            lambda: self._client.chat.completions.create(**kwargs)
+        )
+        async with stream_cm as stream:
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content if chunk.choices else None
                 if delta:

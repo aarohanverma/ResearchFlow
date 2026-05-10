@@ -10,6 +10,8 @@ FROM python:3.11-slim AS base
 #   libglib2.0-0 — glib (OpenCV)
 #   libsm6 libxext6 — X11 stubs for OpenCV headless mode
 #   build-essential — compile native extensions (hdbscan, asyncpg)
+#   ffmpeg       — audio segment concatenation for podcast generation
+#   curl + ca-certificates + nodejs — required to run marp-cli for slide rendering
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libgl1 \
@@ -17,6 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     build-essential \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @marp-team/marp-cli@latest \
+    && apt-get purge -y curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Dependency layer (cached unless requirements.txt changes) ─────────────────

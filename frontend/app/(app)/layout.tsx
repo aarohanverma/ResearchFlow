@@ -5,7 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAuthStore } from "@/store/auth";
-import { useNamespaceStore, NAMESPACE_TREE, subjectTopics } from "@/store/namespace";
+import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
 import { useThemeStore } from "@/store/theme";
 import { logout } from "@/lib/api";
 import {
@@ -208,7 +208,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (mounted && !token) router.replace("/login"); }, [mounted, token, router]);
 
-  if (!mounted || !token) return null;
+  if (!mounted) return <div className="h-screen w-screen" style={{ background: "var(--rf-bg)" }} />;
+  if (!token) return null;
 
   const isLight = theme === "light";
 

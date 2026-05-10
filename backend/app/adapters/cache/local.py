@@ -1,6 +1,7 @@
 """Local file-based cache — zero dependencies, works offline."""
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -33,8 +34,23 @@ class LocalFileCache(CacheBackend):
         self._dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key: str) -> Path:
-        """Return the filesystem ``Path`` for a given cache key, sanitizing it for safe filenames."""
-        safe = key.replace("/", "_").replace(":", "_")[:200]
+        """Return the filesystem ``Path`` for a given cache key.
+
+        Sanitises the key for safe use as a filename. Keys longer than 180
+        characters after sanitisation get a 16-char MD5 suffix so that two
+        distinct long keys that share the same first 180 characters never map
+        to the same file (collision risk under truncation-only approach).
+
+        Args:
+            key: Raw cache key string.
+
+        Returns:
+            Absolute ``Path`` to the JSON cache file for this key.
+        """
+        safe = key.replace("/", "_").replace(":", "_")
+        if len(safe) > 180:
+            digest = hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()[:16]
+            safe = safe[:160] + "_" + digest
         return self._dir / f"{safe}.json"
 
     async def get(self, key: str) -> Any | None:
@@ -48,7 +64,7 @@ class LocalFileCache(CacheBackend):
             TTL has elapsed.
         """
         path = self._path(key)
-        if not path.exists():
+        if not await asyncio.to_thread(path.exists):
             return None
         try:
             async with aiofiles.open(path) as f:
@@ -84,7 +100,7 @@ class LocalFileCache(CacheBackend):
         """
         path = self._path(key)
         try:
-            path.unlink(missing_ok=True)
+            await asyncio.to_thread(path.unlink, missing_ok=True)
         except Exception:
             pass
 

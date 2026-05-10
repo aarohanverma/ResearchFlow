@@ -6,10 +6,42 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import anthropic as anthropic_sdk
+import httpx
 from anthropic import AsyncAnthropic
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from app.adapters.llm.base import CompletionResult, LLMAdapter
 from app.core.config import settings
+
+
+def _is_retryable_anthropic(exc: Exception) -> bool:
+    """Retry only on transient/server errors. Auth/bad-request never retried."""
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError)):
+        return True
+    if isinstance(exc, anthropic_sdk.RateLimitError):
+        return True
+    if isinstance(exc, anthropic_sdk.APIConnectionError):
+        return True
+    if isinstance(exc, anthropic_sdk.APIStatusError) and getattr(exc, "status_code", 0) >= 500:
+        return True
+    return False
+
+
+async def _call_with_retry(coro_factory):
+    """Run a coroutine factory with 3-attempt jittered exponential backoff."""
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception(_is_retryable_anthropic),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=1, max=8),
+        reraise=True,
+    ):
+        with attempt:
+            return await coro_factory()
 
 # Thinking-capable models where we pass thinking.budget_tokens
 _THINKING_MODELS = {
@@ -99,7 +131,9 @@ class AnthropicAdapter(LLMAdapter):
             kwargs["thinking"] = thinking
 
         start = time.monotonic()
-        resp = await self._client.messages.create(**kwargs)
+        resp = await _call_with_retry(
+            lambda: self._client.messages.create(**kwargs)
+        )
         latency = int((time.monotonic() - start) * 1000)
 
         # Extract text (skip thinking blocks)

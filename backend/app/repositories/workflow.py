@@ -24,6 +24,19 @@ class WorkflowRepository:
         """
         self._db = db
 
+    @staticmethod
+    def _utc_midnight(d: date | None = None) -> datetime:
+        """Convert a date to an explicit UTC-midnight datetime.
+
+        Storing a bare Python ``date`` into a ``TIMESTAMP WITH TIME ZONE``
+        column via asyncpg uses the *local* system timezone, which on IST
+        machines shifts the stored value to the previous day in UTC.  Always
+        binding an explicit UTC-aware datetime avoids that conversion.
+        """
+        if d is None:
+            d = datetime.now(timezone.utc).date()
+        return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
     async def should_run(
         self, workflow_name: str, scope_key: str, run_date: date | None = None
     ) -> bool:
@@ -44,12 +57,12 @@ class WorkflowRepository:
             ``True`` if no completed run exists for the given date, meaning the
             workflow should execute. ``False`` if it has already completed.
         """
-        today = run_date or datetime.now(timezone.utc).date()
+        run_dt = self._utc_midnight(run_date)
         result = await self._db.execute(
             select(WorkflowRun).where(
                 WorkflowRun.workflow_name == workflow_name,
                 WorkflowRun.scope_key == scope_key,
-                WorkflowRun.run_date == today,
+                WorkflowRun.run_date == run_dt,
                 WorkflowRun.status == WorkflowStatus.completed,
             )
         )
@@ -66,11 +79,10 @@ class WorkflowRepository:
         Returns:
             The UUID of the newly created ``WorkflowRun`` row.
         """
-        today = datetime.now(timezone.utc).date()
         run = WorkflowRun(
             workflow_name=workflow_name,
             scope_key=scope_key,
-            run_date=today,
+            run_date=self._utc_midnight(),
             status=WorkflowStatus.running,
         )
         self._db.add(run)

@@ -37,6 +37,30 @@ def _scalar_obj(db, obj):
     db.execute = AsyncMock(return_value=result)
 
 
+def _batch_empty(db):
+    """Make db.execute() return an empty batch result (no existing pairs).
+
+    Used for the new upsert_papers implementation that issues a single batch
+    SELECT instead of per-paper scalar lookups.
+    """
+    result = MagicMock()
+    result.fetchall.return_value = []
+    db.execute = AsyncMock(return_value=result)
+
+
+def _batch_with_pairs(db, pairs: list[tuple[str, str]]):
+    """Make db.execute() return batch rows for the given (external_id, namespace_key) pairs."""
+    result = MagicMock()
+    rows = []
+    for ext_id, ns_key in pairs:
+        row = MagicMock()
+        row.external_id = ext_id
+        row.namespace_key = ns_key
+        rows.append(row)
+    result.fetchall.return_value = rows
+    db.execute = AsyncMock(return_value=result)
+
+
 class TestGetExistingExternalIds:
     @pytest.mark.asyncio
     async def test_returns_set_of_ids(self, mock_db):
@@ -63,7 +87,8 @@ class TestGetExistingExternalIds:
 class TestUpsertPapers:
     @pytest.mark.asyncio
     async def test_inserts_new_paper(self, mock_db):
-        _scalar_none(mock_db)
+        # Batch query returns no existing pairs — paper should be inserted
+        _batch_empty(mock_db)
 
         repo = PaperRepository(mock_db)
         data = [_make_paper_data()]
@@ -75,7 +100,8 @@ class TestUpsertPapers:
 
     @pytest.mark.asyncio
     async def test_skips_existing_paper(self, mock_db, sample_paper):
-        _scalar_obj(mock_db, sample_paper)
+        # Batch query returns the existing pair — paper should be skipped
+        _batch_with_pairs(mock_db, [("2401.00001", "cs.AI")])
 
         repo = PaperRepository(mock_db)
         data = [_make_paper_data()]
@@ -86,10 +112,8 @@ class TestUpsertPapers:
 
     @pytest.mark.asyncio
     async def test_multiple_papers_new_and_existing(self, mock_db, sample_paper):
-        results = [MagicMock(), MagicMock()]
-        results[0].scalar_one_or_none.return_value = None     # first paper is new
-        results[1].scalar_one_or_none.return_value = sample_paper  # second exists
-        mock_db.execute = AsyncMock(side_effect=results)
+        # Batch query returns only the second paper as existing
+        _batch_with_pairs(mock_db, [("2401.00001", "cs.AI")])
 
         repo = PaperRepository(mock_db)
         data = [_make_paper_data(external_id="NEW001"), _make_paper_data(external_id="2401.00001")]

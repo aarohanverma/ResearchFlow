@@ -55,7 +55,10 @@ class GraphRepository:
                 KnowledgeNode.namespace_key == namespace_key,
             )
         )
-        node = result.scalar_one_or_none()
+        # Use .first() instead of scalar_one_or_none() because PostgreSQL unique
+        # constraints don't treat NULL=NULL as equal, so namespace_key=None nodes
+        # can accumulate duplicates from concurrent builds. .first() is resilient.
+        node = result.scalars().first()
         if node is None:
             # Use a SAVEPOINT so a concurrent insert (race condition) only rolls back
             # this nested transaction, not the entire outer session transaction.
@@ -78,7 +81,7 @@ class GraphRepository:
                         KnowledgeNode.namespace_key == namespace_key,
                     )
                 )
-                node = result2.scalar_one()
+                node = result2.scalars().first()
         return node
 
     async def create_edge(

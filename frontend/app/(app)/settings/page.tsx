@@ -12,7 +12,7 @@ import {
   KeyIcon, EyeIcon, EyeOffIcon, XCircleIcon, XIcon,
   BarChart3Icon,
 } from "lucide-react";
-import { useNamespaceStore, NAMESPACE_TREE, subjectTopics } from "@/store/namespace";
+import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
 
 const TABS = [
   { key: "profile",       label: "Profile",      icon: UserIcon },
@@ -93,7 +93,11 @@ function ProfilePanel() {
   useEffect(() => {
     api.get<{ display_name: string; expertise_level: string; orientation: string }>(
       "/settings/profile"
-    ).then((d) => setForm(d)).catch(() => {});
+    ).then((d) => setForm({
+      display_name: d.display_name,
+      expertise_level: (d.expertise_level as "newcomer" | "practitioner" | "expert") || "practitioner",
+      orientation: (d.orientation as "research" | "production" | "both") || "both",
+    })).catch(() => {});
   }, []);
 
   async function save() {
@@ -350,21 +354,25 @@ function TopicsPanel() {
 
 /* ── Provider Panel ───────────────────────────────────────────────────────── */
 function ProviderPanel() {
+  // Initial values match config.py defaults; overwritten by the GET response
+  // which always returns the effective backend configuration.
   const [cfg, setCfg] = useState({
     llm_provider: "openai",
     cheap_model: "gpt-4o-mini",
-    quality_model: "gpt-4o",
-    reasoning_model: "o3-mini",
-    embedding_provider: "openai",
-    embedding_model: "text-embedding-3-large",
+    quality_model: "gpt-5.4-mini",
+    reasoning_model: "gpt-5.4",
+    embedding_provider: "gemini",
+    embedding_model: "gemini-embedding-2-preview",
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    api.get<typeof cfg>("/settings/provider").then((d) => {
-      if (Object.keys(d).length > 0) setCfg((c) => ({ ...c, ...d }));
-    }).catch(() => {});
+    // Backend always returns effective settings (DB row or system defaults),
+    // so we can overwrite the local state unconditionally.
+    api.get<typeof cfg>("/settings/provider")
+      .then((d) => setCfg((c) => ({ ...c, ...d })))
+      .catch(() => {});
   }, []);
 
   async function save() {
@@ -379,11 +387,11 @@ function ProviderPanel() {
 
   const fields = [
     { key: "llm_provider",       label: "LLM Provider",       options: ["openai", "anthropic", "google"] },
-    { key: "cheap_model",        label: "Fast / Cheap Model",  options: ["gpt-4o-mini", "claude-haiku-4-5-20251001", "gemini-2.0-flash"] },
-    { key: "quality_model",      label: "Quality Model",       options: ["gpt-4o", "claude-sonnet-4-6", "gemini-2.0-pro"] },
-    { key: "reasoning_model",    label: "Reasoning Model",     options: ["o3-mini", "o3", "claude-opus-4-7"] },
-    { key: "embedding_provider", label: "Embedding Provider",  options: ["openai", "gemini", "voyage"] },
-    { key: "embedding_model",    label: "Embedding Model",     options: ["text-embedding-3-large", "gemini-embedding-2-preview", "voyage-3"] },
+    { key: "cheap_model",        label: "Fast / Cheap Model",  options: ["gpt-4o-mini", "claude-haiku-4-5", "gemini-2.0-flash"] },
+    { key: "quality_model",      label: "Quality Model",       options: ["gpt-5.4-mini", "gpt-4o", "claude-sonnet-4-6", "gemini-2.5-pro"] },
+    { key: "reasoning_model",    label: "Reasoning Model",     options: ["gpt-5.4", "o3", "o3-mini", "claude-opus-4-7", "claude-opus-4-6"] },
+    { key: "embedding_provider", label: "Embedding Provider",  options: ["gemini", "openai", "voyage"] },
+    { key: "embedding_model",    label: "Embedding Model",     options: ["gemini-embedding-2-preview", "text-embedding-3-large", "voyage-3"] },
   ] as const;
 
   return (

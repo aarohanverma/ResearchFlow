@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --turbo",
-    "build": "next build",
+    "dev": "NODE_OPTIONS=--max-old-space-size=4096 next dev",
+    "dev:turbo": "NODE_OPTIONS=--max-old-space-size=4096 next dev --turbo",
+    "build": "NODE_OPTIONS=--max-old-space-size=4096 next build",
     "start": "next start",
-    "prod": "next build && next start",
+    "prod": "npm run build && next start",
     "lint": "next lint",
     "type-check": "tsc --noEmit"
   },

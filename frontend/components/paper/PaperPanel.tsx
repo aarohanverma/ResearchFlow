@@ -47,7 +47,10 @@ export function PaperPanel({ paper, onClose }: Props) {
   const [queuing, setQueuing] = useState(false);
   const [queued, setQueued] = useState(false);
   const [showChat, setShowChat] = useState(false);
-  const { jobs, fetchJobs } = useJobsStore();
+  // Narrow selectors so this panel doesn't re-render on every
+  // unrelated jobs-store update (e.g. media generation polls).
+  const jobs = useJobsStore((s) => s.jobs);
+  const fetchJobs = useJobsStore((s) => s.fetchJobs);
   const paperJob = jobs.find(
     (j: StudyJob) => j.paper_id === paper.id && j.expertise_level === expertise
   ) ?? null;
@@ -72,6 +75,21 @@ export function PaperPanel({ paper, onClose }: Props) {
       await fetchJobs();
     } catch {}
     setQueuing(false);
+  }
+
+  // "Study now" entry: fire-and-forget the background queue so the JobsPanel
+  // shows progress with the paper title, then navigate. The page itself
+  // hits cached chunks if the bg parse beat us; otherwise it streams inline.
+  // Either way the user can leave the page safely — the bg job continues
+  // and the notification bell links them back when done.
+  async function startStudyNow() {
+    if (paperJob?.status !== "running" && paperJob?.status !== "pending") {
+      // best-effort — never block navigation on this
+      api.post(`/study/${paper.id}/queue`, { expertise_level: expertise })
+        .then(() => fetchJobs())
+        .catch(() => {});
+    }
+    router.push(`/study/${paper.id}?level=${expertise}`);
   }
 
   function openPicker(e: React.MouseEvent) {
@@ -249,7 +267,7 @@ export function PaperPanel({ paper, onClose }: Props) {
 
           <div className="flex gap-2">
             <button
-              onClick={() => router.push(`/study/${paper.id}?level=${expertise}`)}
+              onClick={startStudyNow}
               className="flex-1 py-3 flex items-center justify-center gap-2 text-sm font-semibold rounded-xl transition-all duration-200 active:scale-[0.98]"
               style={{
                 background: "linear-gradient(135deg, #6366f1, #7c3aed)",
@@ -352,6 +370,17 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Abort controller ref so we can cancel an in-flight stream when the panel
+  // unmounts or the user sends a new message before the previous one finishes.
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      // Cancel any in-flight stream when the component unmounts so the reader
+      // never tries to update state on an unmounted component.
+      abortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -362,6 +391,11 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
     if (!text || busy) return;
     setInput("");
     setBusy(true);
+
+    // Cancel any previous in-flight stream before starting a new one.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     const history = messages
       .filter((m) => !m.streaming)
@@ -390,6 +424,7 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({ message: text, expertise_level: level, history }),
+          signal: controller.signal,
         }
       );
 
@@ -421,7 +456,12 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
           } catch {}
         }
       }
-    } catch {
+    } catch (err) {
+      // AbortError is expected when the stream is cancelled on unmount or by a
+      // new send() call — don't show an error message in that case.
+      if (err instanceof Error && err.name === "AbortError") {
+        return;
+      }
       setMessages((prev) => [
         ...prev.slice(0, -1),
         { role: "assistant", content: "Something went wrong. Please try again." },

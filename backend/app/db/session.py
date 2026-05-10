@@ -12,6 +12,12 @@ engine = create_async_engine(
     pool_pre_ping=True,       # detect stale connections before use
     pool_size=10,
     max_overflow=20,
+    # Recycle at 20 min — well under Azure PostgreSQL's 30-min server-side
+    # idle timeout.  Setting recycle == idle_timeout means we sometimes
+    # hand back a connection that the server already closed, causing the
+    # next caller to get an error even with pool_pre_ping=True (pre-ping
+    # only fires when the connection is checked OUT, not during idle wait).
+    pool_recycle=1200,
 )
 
 async_session_factory = async_sessionmaker(

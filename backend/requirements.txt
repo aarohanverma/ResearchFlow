@@ -20,6 +20,7 @@ google-generativeai==0.8.3
 
 # ─── LangGraph / LangChain ────────────────────────────────────────────────────
 langgraph==0.2.60
+langgraph-checkpoint==2.1.2
 langchain-core==0.3.36
 langsmith==0.2.3
 langchain-mcp-adapters==0.0.5
@@ -41,12 +42,28 @@ pydantic-settings==2.7.0
 email-validator==2.2.0
 
 # ─── PDF Parsing ──────────────────────────────────────────────────────────────
-marker-pdf==0.3.10
+# Parser priority chain at runtime (graceful fallback at every tier):
+#   Docling (primary, structured) → Marker (high accuracy) → Gemini Vision (OCR)
+#
+# Docling brings PyTorch transitively. The parser auto-detects CUDA at runtime
+# and uses the GPU when available; otherwise it runs on CPU. On CPU-only
+# servers you can install the slimmer CPU torch wheel:
+#   pip install docling --extra-index-url https://download.pytorch.org/whl/cpu
+docling==2.93.0            # primary parser — section hierarchy, tables, equations, figures
+easyocr==1.7.2             # CPU/GPU OCR backend for Docling — handles scanned PDFs
+marker-pdf==0.3.10         # secondary parser — strong on two-column academic layouts
+pymupdf==1.27.2.3          # required by GeminiVisionFallback for page rendering
+
+# ─── Media Generation ─────────────────────────────────────────────────────────
+# Podcast: OpenAI TTS only (handled by openai client above — no extra pip deps)
+# Slides:  Marp CLI (Node.js, install separately):
+#   npm install -g @marp-team/marp-cli
 
 # ─── Clustering ───────────────────────────────────────────────────────────────
 hdbscan==0.8.40
 numpy==2.2.1
 scikit-learn==1.6.0
+numexpr==2.14.1   # must be >=2.10.1 for NumPy 2.x compatibility (marker-pdf transitive dep)
 
 # ─── Email ────────────────────────────────────────────────────────────────────
 resend==2.5.1

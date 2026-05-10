@@ -137,7 +137,7 @@ class SearchRepository:
 
         sem_results: list[dict] = []
         if query_vector:
-            sem_results = await self._semantic_search(
+            sem_results = await self.semantic_search(
                 query_vector,
                 namespace_keys=ns_list,
                 embedding_dim=embedding_dim,
@@ -265,7 +265,7 @@ class SearchRepository:
 
     # ── Semantic Search ────────────────────────────────────────────────────────
 
-    async def _semantic_search(
+    async def semantic_search(
         self,
         query_vector: list[float],
         *,

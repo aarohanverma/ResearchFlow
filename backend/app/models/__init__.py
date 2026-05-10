@@ -21,6 +21,7 @@ from app.models.paper import (
 )
 from app.models.user import Annotation, User, UserInterestProfile, UserProviderSettings
 from app.models.workflow import TokenUsage, WorkflowRun
+from app.models.artifact import GeneratedArtifact
 
 __all__ = [
     "User", "UserProviderSettings", "UserInterestProfile", "Annotation",
@@ -29,4 +30,5 @@ __all__ = [
     "KnowledgeNode", "KnowledgeEdge", "NamespaceSubscription", "SourceMapping",
     "WorkflowRun", "TokenUsage",
     "GenieElement", "IdeaCapsule", "GenieSession",
+    "GeneratedArtifact",
 ]

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { api } from "@/lib/api";
 import type { Bookmark, BookmarkFolder, Paper } from "@/types";
@@ -67,8 +68,10 @@ function BookmarksKBChat({
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   async function send() {
     const text = input.trim();
@@ -82,6 +85,9 @@ function BookmarksKBChat({
       { role: "user", content: text },
       { role: "assistant", content: "", streaming: true },
     ]);
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     try {
       const resp = await fetch(
         `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/v1/bookmarks/chat`,
@@ -95,6 +101,7 @@ function BookmarksKBChat({
             namespace_keys: namespaceKeys,
             folder_id: folderId,
           }),
+          signal: ctrl.signal,
         }
       );
       if (!resp.body) throw new Error("no body");
@@ -116,8 +123,10 @@ function BookmarksKBChat({
           } catch {}
         }
       }
-    } catch {
-      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "Something went wrong. Try again." }]);
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "AbortError") {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "Something went wrong. Try again." }]);
+      }
     }
     setBusy(false);
     inputRef.current?.focus();
@@ -370,9 +379,11 @@ function FolderSidebar({
 // ── Main page ──────────────────────────────────────────────────────────────────
 export default function BookmarksPage() {
   const { selectedTopics } = useNamespaceStore();
+  const searchParams = useSearchParams();
+  const initialFolderId = searchParams?.get("folder") ?? null;
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [folders, setFolders] = useState<BookmarkFolder[]>([]);
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(initialFolderId);
   const [selected, setSelected] = useState<Paper | null>(null);
   const [showChat, setShowChat] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -538,10 +549,11 @@ export default function BookmarksPage() {
 
             {visibleBookmarks.filter((b) => b.paper).length > 0 && (
               <button
-                onClick={() => { setSelected(null); setShowChat((v) => !v); }}
-                disabled={!indexing.ready}
+                onClick={() => { if (selectedFolderId === null) return; setSelected(null); setShowChat((v) => !v); }}
+                disabled={!indexing.ready || selectedFolderId === null}
+                title={selectedFolderId === null ? "Select a folder to chat" : undefined}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium transition-all border ${
-                  !indexing.ready
+                  !indexing.ready || selectedFolderId === null
                     ? "opacity-40 cursor-not-allowed text-gray-500 border-gray-800"
                     : showChat
                       ? "bg-indigo-600/20 text-indigo-300 border-indigo-600/40"

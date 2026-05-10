@@ -18,7 +18,7 @@ Key Design Principles
 
 * **No vendor lock-in** — every external service has a swappable adapter (LLM, embedding, blob, cache).
 * **Repository pattern** — all SQL lives in ``app/repositories/``; workflows never import SQLAlchemy directly.
-* **Prompt injection prevention** — all untrusted paper text is wrapped in ``<<DATA_START>>…<<DATA_END>>`` delimiters.
+* **Prompt injection prevention** — all untrusted paper text is wrapped in ``[START]``/``[END]`` delimiters and the system prompt explicitly instructs the model to treat it as DATA and ignore any embedded instructions.
 * **Local → Azure swap** — change four environment variables, zero code changes.
 * **SSE generator invariant** — ``yield`` must precede every potentially-failing ``await`` in async generators so the HTTP connection is always established before any exception can occur.
 
@@ -33,8 +33,8 @@ Workflows
      - Trigger
      - What it does
    * - Ingestion
-     - Nightly cron / manual API
-     - Fetch → enrich (LLM) → embed (vector) → graph update → score PoTD
+     - ``0 5 * * 2-5`` (05:00 UTC Tue–Fri) / manual API
+     - fetch_papers → store_papers → enrich_papers (LLM) → embed_papers (vector) → update_graph → score_for_potd → mark_complete. Idempotent per day via WorkflowRun. LangGraph checkpointed.
    * - Study
      - On-demand SSE
      - PDF parse → structure extract → explain (3 levels, orientation-aware) → cache per ``(paper, expertise, orientation, prompt_version)``
@@ -46,7 +46,7 @@ Workflows
      - Context gather → bridge discovery → hypothesize → critique → elaborate → save. Three modes: Manual (2–10), Auto (full feed, 2–5), Query (NL → paper discovery, 2–5). Capsules tagged by source mode.
    * - Deep Dive
      - On-demand SSE / background
-     - Two-phase: quality model draft → reasoning model judge → persist
+     - Single-pass: reasoning model generates full 11-section article grounded in source paper text, streams live, persists to ``idea_capsules.deep_dive_content``
 
 Graph Deep Build
 ----------------

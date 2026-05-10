@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # ── App ───────────────────────────────────────────────────────────────────
     environment: Literal["local", "azure"] = "local"
     debug: bool = False
+    enable_dev_reset: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     cors_origins: list[str] = ["http://localhost:3000"]
 
@@ -74,7 +75,12 @@ class Settings(BaseSettings):
     image_gen_provider: str = "openai"
 
     # ── PDF Parsing ───────────────────────────────────────────────────────────
-    pdf_parser: Literal["marker", "gemini_vision"] = "marker"
+    # PDF parser default. Marker is the safest choice for low-resource hosts
+    # (WSL, Docker on a laptop) — Docling pulls in PyTorch + EasyOCR which
+    # can spike RAM enough to crash a small VM on first parse. Set
+    # ``PDF_PARSER=docling`` explicitly when you want the richer structured
+    # parser; the runtime fallback chain handles failures either way.
+    pdf_parser: Literal["marker", "gemini_vision", "docling"] = "marker"
     marker_api_key: str = ""
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
@@ -101,9 +107,19 @@ class Settings(BaseSettings):
     breakthrough_threshold: float = Field(default=0.88, ge=0.0, le=1.0)
 
     # ── Scheduler crons (standard cron syntax) ────────────────────────────────
-    ingestion_cron: str = "59 23 * * *"
-    clustering_cron: str = "0 2 * * 0"
-    cross_namespace_cron: str = "0 3 * * 0"
+    # arXiv announces Mon–Thu 8 PM ET; RSS updates midnight ET; 1 AM ET = 05:00 UTC (EDT).
+    # New content lands Tue–Fri mornings → run ingestion on days 2–5 only.
+    # Weekly maintenance on Sunday (day 0), staggered 30 min.
+    ingestion_cron: str = "0 5 * * 2-5"
+    clustering_cron: str = "0 5 * * 0"
+    cross_namespace_cron: str = "30 5 * * 0"
+
+    # ── TTS (podcast generation) ──────────────────────────────────────────────
+    tts_provider: str = "openai"
+    tts_model: str = "tts-1-hd"
+
+    # ── Slides (Marp) ─────────────────────────────────────────────────────────
+    slides_provider: str = "marp"
 
 
 @lru_cache

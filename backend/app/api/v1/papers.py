@@ -73,7 +73,7 @@ async def get_related_papers(paper_id: UUID, db: DBSession):
         query_vec = await embed.embed_query(sem_text)
         # Pure semantic search: bypass RRF/keyword entirely so unrelated papers
         # with matching generic terms (e.g. "model", "neural") don't rank high.
-        sem_results = await search_repo._semantic_search(
+        sem_results = await search_repo.semantic_search(
             query_vec,
             embedding_dim=embed.dimensions,
             embedding_provider=embed.provider_id,
@@ -164,7 +164,7 @@ async def get_paper_tldr(paper_id: UUID, db: DBSession):
 
 
 @router.post("/generate-tldrs")
-async def batch_generate_tldrs(db: DBSession, limit: int = 50):
+async def batch_generate_tldrs(db: DBSession, user_id: CurrentUserID, limit: int = 50):
     """Batch-generate TLDRs for papers that don't have one yet."""
     from sqlalchemy import select
     from app.models.paper import Paper

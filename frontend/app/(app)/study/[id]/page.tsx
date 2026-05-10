@@ -1,8 +1,9 @@
 "use client";
 
-import { Suspense, useEffect, useRef, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
-import { useParams, useSearchParams } from "next/navigation";
+import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
+import { useParams, useSearchParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Loader2Icon,
@@ -16,11 +17,16 @@ import {
   ExternalLinkIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  MicIcon,
+  PresentationIcon,
+  DownloadIcon,
+  RefreshCwIcon,
 } from "lucide-react";
 import katex from "katex";
-import type { StudySection, Paper } from "@/types";
+import type { StudySection, Paper, GeneratedArtifact, GenerationType, GenerationSourceType } from "@/types";
 import { useAuthStore } from "@/store/auth";
-import { openSSE } from "@/lib/api";
+import { api, openSSE } from "@/lib/api";
+import { useJobsStore } from "@/store/jobs";
 
 // ── Shiki singleton ───────────────────────────────────────────────────────────
 
@@ -1085,10 +1091,15 @@ function StudyChatPanel({
   const [busy, setBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Abort any in-flight chat stream on unmount so navigating away doesn't
+  // leave the fetch hanging or cause state updates on an unmounted tree.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   async function sendMessage() {
     const text = input.trim();
@@ -1105,6 +1116,10 @@ function StudyChatPanel({
       { role: "user", content: text },
       { role: "assistant", content: "", streaming: true },
     ]);
+
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
 
     try {
       const token = (() => {
@@ -1126,6 +1141,7 @@ function StudyChatPanel({
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({ message: text, expertise_level: level, history }),
+          signal: ctrl.signal,
         }
       );
 
@@ -1157,11 +1173,13 @@ function StudyChatPanel({
           } catch {}
         }
       }
-    } catch {
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        { role: "assistant", content: "Something went wrong. Try again." },
-      ]);
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "AbortError") {
+        setMessages((prev) => [
+          ...prev.slice(0, -1),
+          { role: "assistant", content: "Something went wrong. Try again." },
+        ]);
+      }
     }
     setBusy(false);
     inputRef.current?.focus();
@@ -1268,15 +1286,421 @@ function StudyChatPanel({
   );
 }
 
+// ── Media Generation Bar ──────────────────────────────────────────────────────
+
+const GEN_BUTTONS: { type: GenerationType; icon: React.ElementType; label: string; color: string }[] = [
+  { type: "podcast", icon: MicIcon,          label: "Audio",  color: "violet" },
+  { type: "slides",  icon: PresentationIcon, label: "Slides", color: "blue" },
+];
+
+const GEN_COLOR_MAP: Record<string, { btn: string; active: string; badge: string }> = {
+  violet: {
+    btn:    "border-violet-700/40 hover:border-violet-500/60 hover:bg-violet-900/30 text-violet-300",
+    active: "bg-violet-600/20 border-violet-500/60 text-violet-200",
+    badge:  "bg-violet-600 text-white",
+  },
+  blue: {
+    btn:    "border-blue-700/40 hover:border-blue-500/60 hover:bg-blue-900/30 text-blue-300",
+    active: "bg-blue-600/20 border-blue-500/60 text-blue-200",
+    badge:  "bg-blue-600 text-white",
+  },
+};
+
+function MediaGenerationBar({ sourceId, sourceTitle, sourceType }: { sourceId: string; sourceTitle: string; sourceType: GenerationSourceType }) {
+  // Media generation is level-independent — grounded in abstract + PDF only.
+  // User's orientation/expertise from Settings drives the generation style.
+  const [allArtifacts, setAllArtifacts] = React.useState<GeneratedArtifact[]>([]);
+  const [loading, setLoading] = React.useState<Record<GenerationType, boolean>>({
+    podcast: false, slides: false,
+  });
+  const [viewer, setViewer] = React.useState<GenerationType | null>(null);
+  const addGenerationJob = useJobsStore((s) => s.addGenerationJob);
+
+  // Show the most recent artifact per type regardless of study depth level.
+  // allArtifacts is newest-first from the API so the first entry per type wins.
+  const artifacts = React.useMemo<Record<GenerationType, GeneratedArtifact | null>>(() => {
+    const map: Record<GenerationType, GeneratedArtifact | null> = { podcast: null, slides: null };
+    for (const a of allArtifacts) {
+      const t = a.generation_type as GenerationType;
+      if (!map[t]) map[t] = a;
+    }
+    return map;
+  }, [allArtifacts]);
+
+  // On mount, fetch all existing artifacts for this source (all expertise levels at once).
+  React.useEffect(() => {
+    if (!sourceId) return;
+    api.get<GeneratedArtifact[]>(`/generate/${sourceType}/${sourceId}`)
+      .then((arts) => setAllArtifacts(arts))
+      .catch(() => {});
+  }, [sourceId, sourceType]);
+
+  // Mirror in-flight jobs from the global store into allArtifacts (status updates only).
+  // The JobsPanel polls /generate/jobs every 4s — we piggyback on that instead of polling ourselves.
+  const fetchedCompletedRef = React.useRef<Set<string>>(new Set());
+  const storeGenJobs = useJobsStore((s) => s.generationJobs);
+  React.useEffect(() => {
+    const relevant = storeGenJobs.filter((gj) => gj.source_id === sourceId);
+    if (!relevant.length) return;
+
+    // One-shot DB fetch for completed jobs: blob_path lives only in the DB, not in the JobStore.
+    const toFetch: string[] = [];
+    for (const gj of relevant) {
+      if (
+        gj.status === "completed" &&
+        !gj.blob_path &&
+        gj.artifact_id &&
+        !fetchedCompletedRef.current.has(gj.artifact_id)
+      ) {
+        fetchedCompletedRef.current.add(gj.artifact_id);
+        toFetch.push(gj.artifact_id);
+      }
+    }
+
+    // Update status of matching artifacts without clobbering expertise_level or blob_path.
+    setAllArtifacts((prev) => {
+      let changed = false;
+      const next = prev.map((a) => {
+        const gj = relevant.find((j) => j.artifact_id === a.id);
+        if (!gj || a.status === gj.status) return a;
+        changed = true;
+        return {
+          ...a,
+          status: gj.status as GeneratedArtifact["status"],
+          blob_path: gj.blob_path ?? a.blob_path,
+          content: gj.content ?? a.content,
+          error_message: gj.error_message,
+          completed_at: gj.completed_at,
+        };
+      });
+      return changed ? next : prev;
+    });
+
+    for (const artifactId of toFetch) {
+      api.get<GeneratedArtifact>(`/generate/artifact/${artifactId}`)
+        .then((art) => setAllArtifacts((prev) => {
+          const idx = prev.findIndex((a) => a.id === art.id);
+          if (idx === -1) return [...prev, art];
+          const next = [...prev]; next[idx] = art; return next;
+        }))
+        .catch(() => {});
+    }
+  }, [storeGenJobs, sourceId]);
+
+  async function trigger(genType: GenerationType, forceRegenerate = false) {
+    setLoading((prev) => ({ ...prev, [genType]: true }));
+    const params = new URLSearchParams();
+    if (forceRegenerate) params.set("force_regenerate", "true");
+    // No expertise_level param — backend reads it from the user's profile settings.
+    // Media generation is independent of study depth.
+    try {
+      const resp = await api.post<{ artifact_id: string; job_id: string; status: string; source_title: string; message: string }>(
+        `/generate/${sourceType}/${sourceId}/${genType}?${params.toString()}`
+      );
+      const resolvedTitle = resp.source_title || sourceTitle;
+
+      if (resp.status === "completed") {
+        const art = await api.get<GeneratedArtifact>(`/generate/artifact/${resp.artifact_id}`);
+        setAllArtifacts((prev) => {
+          const idx = prev.findIndex((a) => a.id === art.id);
+          if (idx === -1) return [...prev, art];
+          const next = [...prev]; next[idx] = art; return next;
+        });
+      } else {
+        const optimistic: GeneratedArtifact = {
+          id: resp.artifact_id,
+          generation_type: genType,
+          source_type: sourceType,
+          source_id: sourceId,
+          source_title: resolvedTitle,
+          status: "queued",
+          blob_path: null, content: null,
+          expertise_level: null,  // not level-specific
+          orientation: null,
+          provider: null, model_used: null, input_tokens: 0, output_tokens: 0,
+          generation_duration_ms: 0, error_message: null,
+          created_at: new Date().toISOString(), completed_at: null,
+        };
+        setAllArtifacts((prev) => {
+          const idx = prev.findIndex((a) => a.id === resp.artifact_id);
+          if (idx === -1) return [...prev, optimistic];
+          const next = [...prev]; next[idx] = optimistic; return next;
+        });
+        addGenerationJob({
+          artifact_id: resp.artifact_id, job_id: resp.job_id,
+          source_type: sourceType, source_id: sourceId,
+          generation_type: genType,
+          title: resolvedTitle,
+          status: "queued", error_message: null, blob_path: null, content: null,
+          created_at: new Date().toISOString(), completed_at: null,
+        });
+      }
+    } catch (err) {
+      console.error("generation trigger failed:", err);
+    } finally {
+      setLoading((prev) => ({ ...prev, [genType]: false }));
+    }
+  }
+
+  return (
+    <>
+      <div className="flex items-center gap-2 flex-wrap mt-2 mb-1">
+        {GEN_BUTTONS.map(({ type, icon: Icon, label, color }) => {
+          const art = artifacts[type];
+          const isLoading = loading[type];
+          const status = art?.status;
+          const colors = GEN_COLOR_MAP[color];
+          const isDone = status === "completed";
+          const isRunning = status === "queued" || status === "running";
+          const isFailed = status === "failed";
+
+          return (
+            <div key={type} className="relative">
+              <button
+                onClick={() => {
+                  if (isRunning || isLoading) return;
+                  if (isDone) { setViewer(type); return; }
+                  trigger(type);
+                }}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-all ${
+                  isDone ? colors.active : colors.btn
+                }`}
+                title={
+                  isDone ? `View ${label} (regenerate from inside the viewer)` :
+                  isRunning ? `Generating ${label}…` :
+                  isFailed ? `${label} previously failed — click to retry` :
+                  `Generate ${label}`
+                }
+              >
+                {(isLoading || isRunning) ? (
+                  <Loader2Icon size={10} className="animate-spin" />
+                ) : (
+                  <Icon size={10} />
+                )}
+                {label}
+                {isDone && <span className="ml-0.5 w-1.5 h-1.5 rounded-full bg-emerald-400" />}
+                {isFailed && <span className="ml-0.5 w-1.5 h-1.5 rounded-full bg-red-400" />}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Viewer modals */}
+      <AnimatePresence>
+        {viewer && artifacts[viewer]?.status === "completed" && (
+          <GenerationViewer
+            type={viewer}
+            artifact={artifacts[viewer]!}
+            onClose={() => setViewer(null)}
+            onRegenerate={() => trigger(viewer!, true)}
+          />
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
+// ── Generation Viewer Modal ────────────────────────────────────────────────────
+
+function GenerationViewer({
+  type,
+  artifact,
+  onClose,
+  onRegenerate,
+}: {
+  type: GenerationType;
+  artifact: GeneratedArtifact;
+  onClose: () => void;
+  onRegenerate: () => void;
+}) {
+  const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  const blobUrl = artifact.blob_path ? `${API}/blobs/${artifact.blob_path}` : null;
+  const content = artifact.content;
+  const [regenerating, setRegenerating] = React.useState(false);
+
+  const LABELS: Record<GenerationType, string> = {
+    podcast: "🎙 Audio Podcast",
+    slides: "📊 Slide Deck",
+  };
+
+  async function handleRegenerate() {
+    setRegenerating(true);
+    try {
+      await onRegenerate();
+    } finally {
+      setRegenerating(false);
+      onClose();
+    }
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.95, opacity: 0 }}
+        onClick={(e) => e.stopPropagation()}
+        className="bg-gray-950 border border-gray-800 rounded-2xl w-full shadow-2xl overflow-hidden flex flex-col max-w-3xl max-h-[85vh]"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800/60">
+          <div>
+            <h2 className="text-sm font-bold text-white">{LABELS[type]}</h2>
+            <p className="text-[11px] text-gray-500 mt-0.5">
+              {artifact.model_used} · {artifact.expertise_level} · {artifact.orientation}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {/* Regenerate button — queues a new background job and closes modal */}
+            <button
+              onClick={handleRegenerate}
+              disabled={regenerating}
+              title="Regenerate (background job — overwrites current)"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold border border-gray-700/50 text-gray-400 hover:text-indigo-300 hover:border-indigo-500/50 hover:bg-indigo-950/20 transition-all disabled:opacity-40"
+            >
+              {regenerating ? (
+                <Loader2Icon size={11} className="animate-spin" />
+              ) : (
+                <RefreshCwIcon size={11} />
+              )}
+              Regenerate
+            </button>
+            <button
+              onClick={onClose}
+              className="text-gray-500 hover:text-white p-1.5 rounded-lg hover:bg-gray-800 transition-colors"
+            >
+              <XIcon size={16} />
+            </button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {type === "podcast" && (
+            <PodcastViewer blobUrl={blobUrl} content={content} />
+          )}
+          {type === "slides" && (
+            <SlidesViewer blobUrl={blobUrl} content={content} />
+          )}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+// ── Individual viewers ─────────────────────────────────────────────────────────
+
+function PodcastViewer({ blobUrl, content }: { blobUrl: string | null; content: Record<string, unknown> | null }) {
+  const title = content?.episode_title as string | undefined;
+  const tagline = content?.tagline as string | undefined;
+  const script = content?.script as string | undefined;
+
+  return (
+    <div className="space-y-4">
+      {title && <h3 className="text-lg font-bold text-white">{title}</h3>}
+      {tagline && <p className="text-sm text-gray-400 italic">{tagline}</p>}
+
+      {blobUrl ? (
+        <div>
+          <audio controls className="w-full rounded-xl" src={blobUrl}>
+            Your browser does not support the audio element.
+          </audio>
+          <a
+            href={blobUrl}
+            download
+            className="mt-2 inline-flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300"
+          >
+            <DownloadIcon size={11} /> Download MP3
+          </a>
+        </div>
+      ) : (
+        <div className="bg-gray-900 rounded-xl p-3 text-xs text-gray-400">
+          Audio file not available. Script preview below.
+        </div>
+      )}
+
+      {script && (
+        <details className="mt-3">
+          <summary className="text-xs font-semibold text-gray-400 cursor-pointer hover:text-gray-200">
+            View Script
+          </summary>
+          <pre className="mt-2 text-[11px] text-gray-400 whitespace-pre-wrap leading-relaxed max-h-80 overflow-y-auto bg-gray-900/60 rounded-xl p-3">
+            {script}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function SlidesViewer({ blobUrl, content }: { blobUrl: string | null; content: Record<string, unknown> | null }) {
+  const title = content?.deck_title as string | undefined;
+  const markdown = content?.marp_markdown as string | undefined;
+  // rendered_format may be absent when content is null (store doesn't cache
+  // the full content blob). Infer HTML from blob_path extension as a fallback.
+  const isHtmlBlob = blobUrl
+    ? blobUrl.endsWith(".html") || (content?.rendered_format as string | undefined) === "html"
+    : false;
+
+  return (
+    <div className="space-y-4">
+      {title && <h3 className="text-lg font-bold text-white">{title}</h3>}
+
+      {blobUrl ? (
+        <div>
+          <iframe
+            src={blobUrl}
+            className="w-full rounded-xl border border-gray-800"
+            style={{ height: "500px" }}
+            title="Slide Deck"
+          />
+          <a
+            href={blobUrl}
+            download
+            className="mt-2 inline-flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300"
+          >
+            <DownloadIcon size={11} /> {isHtmlBlob ? "Download HTML" : "Download"}
+          </a>
+        </div>
+      ) : markdown ? (
+        <div>
+          <p className="text-xs text-gray-400 mb-2">
+            Marp slides (marp-cli not installed — showing source):
+          </p>
+          <pre className="text-[11px] text-gray-300 whitespace-pre-wrap leading-relaxed max-h-[500px] overflow-y-auto bg-gray-900/60 rounded-xl p-4">
+            {markdown}
+          </pre>
+        </div>
+      ) : (
+        <p className="text-sm text-gray-400">Slides content unavailable.</p>
+      )}
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 function StudyContent() {
   const { id } = useParams<{ id: string }>();
   const searchParams = useSearchParams();
+  const router = useRouter();
   const { token, user } = useAuthStore();
   // Default to the user's configured expertise level; fall back to "practitioner"
   const defaultLevel = (user?.expertise_level as "newcomer" | "practitioner" | "expert") || "practitioner";
   const level = (searchParams.get("level") as "newcomer" | "practitioner" | "expert") || defaultLevel;
+
+  // Per-level section cache. Switching levels uses the cached sections
+  // immediately (no SSE restart) if we already loaded that level before.
+  const [levelCache, setLevelCache] = useState<
+    Partial<Record<string, { sections: StudySection[]; status: "done" | "error" }>>
+  >({});
   const [paper, setPaper] = useState<Paper | null>(null);
   const [sections, setSections] = useState<StudySection[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
@@ -1307,37 +1731,83 @@ function StudyContent() {
 
   useEffect(() => {
     if (!id || !token) return;
+
+    // If we already loaded this level in this session, restore from cache
+    // immediately without re-opening an SSE connection.
+    const cached = levelCache[level];
+    if (cached) {
+      setSections(cached.sections);
+      setStatus(cached.status);
+      return;
+    }
+
     setSections([]);
     setStatus("loading");
     setShowChat(false);
 
+    const incoming: StudySection[] = [];
     const es = openSSE(`/study/${id}?expertise_level=${level}`);
+
+    // Hard timeout: if the backend hangs and never sends "done", close the
+    // connection after 8 minutes and surface an error so the user isn't left
+    // with a permanent spinner.
+    const timeout = setTimeout(() => {
+      es.close();
+      setStatus("error");
+    }, 8 * 60 * 1000);
+
     es.onmessage = (e) => {
       try {
         const data: StudySection = JSON.parse(e.data);
         if (data.type === "done") {
+          clearTimeout(timeout);
+          setLevelCache((prev) => ({
+            ...prev,
+            [level]: { sections: incoming.slice(), status: "done" },
+          }));
           setStatus("done");
           es.close();
         } else if (data.type === "error") {
+          clearTimeout(timeout);
           setStatus("error");
           es.close();
         } else if (data.type !== "start" && data.type !== "related") {
+          incoming.push(data);
           setSections((prev) => [...prev, data]);
           bottomRef.current?.scrollIntoView({ behavior: "smooth" });
         }
       } catch {}
     };
     es.onerror = () => {
+      clearTimeout(timeout);
       setStatus("error");
       es.close();
     };
-    return () => es.close();
+    return () => {
+      clearTimeout(timeout);
+      es.close();
+    };
   }, [id, level, token]);
 
   const sectionCount = sections.filter((s) => s.type === "section").length;
 
+  const navItems = useMemo(() => {
+    return sections
+      .map((s, i) => ({ s, i }))
+      .filter(({ s }) => s.type === "section" && s.label)
+      .map(({ s, i }) => {
+        const meta = getSectionMeta(s.label!);
+        return { id: `section-${i}`, label: meta.label, icon: meta.icon };
+      });
+  }, [sections]);
+
   return (
     <div className="flex h-full" style={{ background: "var(--rf-bg)" }}>
+      {/* Section navigation panel — shown once generation is complete */}
+      {status === "done" && navItems.length > 0 && (
+        <SectionNavPanel items={navItems} scrollRef={scrollRef} accent="indigo" />
+      )}
+
       <div
         ref={scrollRef}
         onScroll={onScroll}
@@ -1362,12 +1832,17 @@ function StudyContent() {
           {/* Header bar */}
           <div className="sticky top-0.5 z-10 mb-8">
             <div className="flex items-center gap-3 bg-gray-900/80 backdrop-blur-md border border-gray-800/60 rounded-2xl px-4 py-2.5 shadow-lg shadow-black/20">
-              {/* Level tabs */}
+              {/* Level tabs — use router.replace so the URL updates without a
+                  full page reload. The MediaGenerationBar stays mounted; each
+                  level has independent cached artifacts so switching is instant. */}
               <div className="flex bg-gray-800/60 rounded-xl p-0.5 gap-0.5">
                 {(["newcomer", "practitioner", "expert"] as const).map((l) => (
-                  <a
+                  <button
                     key={l}
-                    href={`/study/${id}?level=${l}`}
+                    onClick={() => {
+                      if (l === level) return;
+                      router.replace(`/study/${id}?level=${l}`, { scroll: false });
+                    }}
                     className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                       level === l
                         ? "bg-indigo-600 text-white shadow-sm shadow-indigo-500/30"
@@ -1375,7 +1850,7 @@ function StudyContent() {
                     }`}
                   >
                     {l.charAt(0).toUpperCase() + l.slice(1)}
-                  </a>
+                  </button>
                 ))}
               </div>
 
@@ -1394,6 +1869,13 @@ function StudyContent() {
                 <div className="flex items-center gap-1.5 text-xs text-emerald-400">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                   Complete
+                </div>
+              )}
+
+              {/* Generate media buttons */}
+              {status === "done" && id && (
+                <div className="flex items-center">
+                  <MediaGenerationBar sourceId={id} sourceTitle={paper?.title ?? ""} sourceType="paper" />
                 </div>
               )}
 

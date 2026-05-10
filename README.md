@@ -19,7 +19,7 @@ ResearchFlow is the missing piece:
 - **Comprehension** — Study Mode generates a deep walkthrough of any paper at your expertise level (newcomer / practitioner / expert)
 - **Retrieval** — hybrid search (PostgreSQL FTS + pgvector cosine, fused with RRF) and a grounded RAG chat with inline citations
 - **Synthesis** — Genie takes 2–10 papers/concepts/methods (manual) or auto-discovers groups of 2–5 and produces a testable hypothesis with mechanism, experimental design, predicted outcomes, anti-finding, diagrams, and PoC code
-- **Depth** — Deep Dive turns any synthesized hypothesis into an 11-section research synthesis article via a two-phase pipeline (quality model drafts → reasoning model fact-checks against source text)
+- **Depth** — Deep Dive turns any synthesized hypothesis into an 11-section research synthesis article via single-pass generation with the reasoning model, grounded in the full text of all source papers
 
 It runs entirely on your own infrastructure — local Docker for development, four env-var flips for Azure deployment. No third-party telemetry, no rate-limited SaaS, no opaque algorithms. The full architecture, every workflow, every algorithm is documented in [`docs/architecture.html`](docs/architecture.html).
 
@@ -82,37 +82,132 @@ It runs entirely on your own infrastructure — local Docker for development, fo
 | **Genie Auto Discovery** | Operates on the **full feed** (all papers in subscribed namespaces, up to 200 per run). 5-signal pair scoring; O(N²) capped at N=200 for sub-second pairing. Namespace-isolated via user subscriptions. |
 | **Genie Query Mode** | Natural-language query → LLM validation + rewrite → semantic paper discovery → compatibility scoring → best synthesis group. Best-group papers are auto-selected; users can toggle any paper (bookmarked or feed) in/out. Hover shows TL;DR. Caps at 2–5 papers. |
 | **Deep Dive** | Full research synthesis article for any Idea Capsule — multi-phase generation with LLM-as-judge refinement. Runs inline (streaming) or in the background. |
+| **Audio Podcast** | One-click podcast generation from any paper or Genie capsule. Multi-speaker HOST/EXPERT teaching conversation, expertise-adapted depth, orientation-shaped emphasis, OpenAI TTS voices. Runs in background; embeds in-page audio player when complete. |
+| **Slide Deck** | Marp-based slide deck generation. LLM plans and writes a presentation-grade deck (12–18 slides) with equations, results tables, diagrams, and methodology breakdown. Density guards prevent overflow. Rendered to standalone HTML via marp-cli (falls back to raw Markdown). |
 | **Annotations** | Highlight text in any paper and attach personal notes, accessible from the Paper Detail panel. |
 | **Token Usage** | Per-call accounting of every LLM completion (input/output tokens, model, cost estimate, latency). Settings → **Token Usage** tab shows totals, daily bar chart, per-workflow and per-model breakdowns. Defaults to today; supports custom date ranges with quick presets (7 days, 30 days, year). |
 | **Settings** | Provider config, topic subscriptions, notifications, manual RSS refresh. |
 
 ---
 
+## Media Generation (Audio · Slides)
+
+Any paper or Genie idea capsule can be transformed into a podcast or slide
+deck. Generation runs in the background, survives page navigation, refresh,
+and worker restarts (DB-backed authoritative state + idempotent cache).
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Source: paper | capsule                                                 │
+└────────────────────────────────┬─────────────────────────────────────────┘
+                                 │
+                  ContentLoaderService (deep PDF grounding)
+                                 │
+                                 ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  LangGraph workflow per type                           │
+        │   • podcast — load → plan → script → TTS → save (5)    │
+        │   • slides  — load → plan → markdown → render → save (4)│
+        └────────────────┬──────────────────────────────────────┘
+                         │
+   ┌─────────────────────┼─────────────────────┐
+   │                     │                     │
+   ▼                     ▼                     ▼
+JobStore         GeneratedArtifact         BlobStorage
+(Redis or       (Postgres — auth         (Local /blobs or
+ in-memory)      state + cache key)       Azure Blob / S3)
+```
+
+**Cache key:** `(user, source, type, expertise, orientation, provider, model, parser)`.
+A re-trigger hits the cache when *all* fields match; otherwise it generates fresh.
+
+**Deep PDF grounding:** if a paper has not been parsed yet, the loader
+parses on demand via the configured parser chain (Marker by default,
+Docling if `PDF_PARSER=docling`, Gemini Vision as last-resort fallback)
+and persists section chunks. Generations always use the full PDF body —
+never just the abstract.
+
+**Adaptive generation:** prompts detect the paper's domain and shape
+(theory / systems / empirical / methods) and adapt segment depth,
+analogies, and slide structure accordingly. Output completeness is
+guarded by a truncation detector that retries the tail when the model
+is cut off.
+
+**Background execution:**
+- Jobs run via `asyncio.create_task` and update a `GeneratedArtifact` DB row
+  through `queued → running → completed | failed`.
+- The `JobStore` (in-memory or Redis) provides a fast notification cache.
+- On worker restart the lifespan sweeps any orphaned `running` rows to
+  `failed` so the UI never shows an indefinite spinner.
+- `GET /api/v1/generate/jobs` returns the user's in-flight jobs for the
+  notification panel.
+
+### UI placement
+
+- **Study Mode** — sticky-header pill row: Audio · Slides.
+  Audio embeds an inline player; Slides open in a fullscreen iframe.
+- **Genie Idea Capsule page** — same two pills below the hero scores.
+- **Notification bell** — every generation job appears in the JobsPanel
+  alongside Study/Genie/Graph jobs. Click a completed job to redirect to
+  the source viewer.
+
+---
+
 ## Architecture overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Frontend  — Next.js App Router (TypeScript, React Flow)     │
-├──────────────────────────────────────────────────────────────┤
-│  API Layer — FastAPI async routers  (JWT auth, SSE, DI)      │
-├──────────────────────────────────────────────────────────────┤
-│  Workflows — LangGraph StateGraph                            │
-│              Ingestion · Study · RAG · Genie · Deep Dive     │
-├──────────────────────────────────────────────────────────────┤
-│  Services / Adapters — Scoring · GraphService                │
-│    LLM (OpenAI/Anthropic/Google) · Embedding (Gemini/OpenAI) │
-│    PDF (Marker/Gemini Vision) · Blob · Cache · Email         │
-│    Sources (arXiv RSS / MCP)                                 │
-├──────────────────────────────────────────────────────────────┤
-│  Repositories — Paper · Vector · Search · Graph · Workflow   │
-│                 (only layer that issues SQL)                  │
-├──────────────────────────────────────────────────────────────┤
-│  Database — PostgreSQL + pgvector (single DB, no Neo4j)      │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Frontend  — Next.js App Router (TypeScript, React, Framer)      │
+├──────────────────────────────────────────────────────────────────┤
+│  API Layer — FastAPI async routers  (JWT auth, SSE, DI)          │
+│              /feed · /study · /rag · /genie · /generate          │
+├──────────────────────────────────────────────────────────────────┤
+│  Workflows — LangGraph StateGraph                                │
+│    Ingestion · Study · RAG · Genie · Deep Dive                   │
+│    Podcast · Slides                                              │
+├──────────────────────────────────────────────────────────────────┤
+│  Services / Adapters — Scoring · GraphService                    │
+│    LLM (OpenAI/Anthropic/Google)                                 │
+│    Embedding (Gemini/OpenAI) · TTS (OpenAI)                      │
+│    PDF (Docling/Marker/Gemini Vision) · Slides (Marp)            │
+│    Blob · Cache · Email                                          │
+│    Sources (arXiv RSS / MCP)                                     │
+├──────────────────────────────────────────────────────────────────┤
+│  Repositories — Paper · Vector · Search · Graph · Workflow       │
+│                 Artifact  (only layer that issues SQL)            │
+├──────────────────────────────────────────────────────────────────┤
+│  Database — PostgreSQL + pgvector  +  generated_artifacts table  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 Six layers, clean boundaries. Each layer only calls the one directly below it.  
 Local → Azure swap: change four env vars, zero code changes.
+
+### PDF Parser priority chain
+```
+PDF_PARSER=marker (default)        → Marker → Gemini Vision
+PDF_PARSER=docling (opt-in)        → Docling → Marker → Gemini Vision
+PDF_PARSER=gemini_vision (opt-in)  → Gemini Vision → Marker
+```
+Marker is the default because it is memory-friendly and stable on laptops,
+WSL, and small VMs. Docling provides richer structured parsing (section
+hierarchy, tables, equations) but pulls in PyTorch + EasyOCR models that
+can spike RAM by ~2 GB on first run, so it is opt-in.
+
+To enable Docling: `PDF_PARSER=docling` in `.env.local`. To additionally
+enable scanned-PDF OCR inside Docling (needs ≥8 GB free RAM): also set
+`DOCLING_OCR=1`.
+
+All parsers produce the same `ParsedPaper` schema — zero downstream
+changes when switching parsers, and per-tier failures fall through the
+chain transparently.
+
+### Generation API
+```
+POST /api/v1/generate/{paper|capsule|folder}/{id}/{podcast|slides}
+GET  /api/v1/generate/artifact/{artifact_id}
+GET  /api/v1/generate/{source_type}/{source_id}
+```
 
 ---
 
@@ -265,7 +360,7 @@ Wait for all three services to become healthy (watch `docker compose ps`), then 
 | File | Purpose |
 |---|---|
 | `Dockerfile.backend` | Multi-stage Python 3.11 production image — installs all deps, copies source, runs uvicorn with 2 workers |
-| `Dockerfile.frontend` | Multi-stage Next.js 20 production image — compiles to standalone bundle, no node_modules at runtime |
+| `Dockerfile.frontend` | Multi-stage Next.js 20 production image — builds with `npm run build`, runs with `next start` (node_modules kept in image) |
 | `docker-compose.yml` | Orchestrates PostgreSQL + pgvector, Redis, backend, and frontend with healthchecks and named volumes |
 | `.env.example` | Template for all environment variables — copy to `.env` and fill in |
 
@@ -327,18 +422,11 @@ To reset: `docker compose down -v && docker compose up db -d && python scripts/s
 The feed shows papers scored by novelty × orientation + relevance × (1 − orientation) with subtopic affinity boosts.
 
 - **Click a card** → opens a slide-in Paper Detail panel
-- **Like** → signals interest (shapes future recommendations)
-- **Dismiss** → removes from this session's feed
 - **Save** → adds to Bookmarks
 - **arXiv →** → opens the source paper
 
-Badges:
-- `⚡ Breakthrough` — novelty score > 0.88 (configurable via `BREAKTHROUGH_THRESHOLD`)
-- Why tags: `🔬 High novelty`, `🔧 Practical relevance`, `🧠 In your interests`
 
-<!-- SCREENSHOT: Feed view — add a screenshot of the main paper feed here showing paper cards with novelty badges, why-tags, and the sidebar. -->
-<!-- HOW TO ADD: Save your screenshot (e.g. `docs/screenshots/feed.png`), then replace this comment with: `![Feed](docs/screenshots/feed.png)` -->
-> **📸 Screenshot — Feed view** *(add screenshot here: capture the paper feed with cards, novelty badges, and why-tags visible)*
+![Feed](screenshots/feed.png)
 
 ### Hybrid Search / Deep Search
 
@@ -354,9 +442,8 @@ Each result shows a `hybrid`, `semantic`, or `keyword` match badge.
 GET /api/v1/search?q=attention+mechanism&namespace_key=cs.AI&mode=hybrid&limit=20
 ```
 
-<!-- SCREENSHOT: Search results — add a screenshot showing hybrid search results with match-type badges. -->
-<!-- HOW TO ADD: Save your screenshot to `docs/screenshots/search.png`, then replace the blockquote below with: `![Hybrid Search](docs/screenshots/search.png)` -->
-> **📸 Screenshot — Hybrid Search results** *(add screenshot here: show search results with hybrid/semantic/keyword badges and the Deep Search toggle)*
+![Hybrid Search](screenshots/hybrid.png)
+![Deep Search](screenshots/deep.png)
 
 ### Study Mode
 
@@ -364,18 +451,18 @@ Streams a deep paper walkthrough via SSE:
 
 ```
 🧩 The Problem → 🏛 Prior Work → 💡 Core Idea → 🔢 The Method
-→ 🖼 Diagrams → 📊 Results → 🤔 Open Questions → 💻 Code → 🔗 Connections
+→ 🖼 Diagrams → 📊 Results → 🤔 Open Questions → 💻 Code 
 ```
 
 Three expertise levels: **Newcomer**, **Practitioner**, **Expert**. Output cached per paper × level.
 
-<!-- SCREENSHOT: Study Mode — add a screenshot of a streamed study walkthrough (sections visible, Mermaid diagrams rendered). -->
-<!-- HOW TO ADD: Save to `docs/screenshots/study.png`, then replace the blockquote below with: `![Study Mode](docs/screenshots/study.png)` -->
-> **📸 Screenshot — Study Mode** *(add screenshot here: show the streamed study walkthrough with multiple sections rendered, expertise-level selector visible)*
+![Study Mode](screenshots/study.png)
 
 ### Bookmarks
 
 Save papers with notes, organize into named color-coded folders. Click a bookmark to open the paper detail panel.
+
+![Bookmarks](screenshots/bookmarks.png)
 
 ### Knowledge Graph
 
@@ -396,21 +483,17 @@ While a Build Deep job is active, the graph auto-reloads every 20 seconds to pic
 - When multiple topics are selected across a subject, use the **topic filter** dropdown in the toolbar to narrow the graph to a single topic at a time.
 - Clicking any node correctly collapses its entire subtree (including nested expanded nodes). Semantic dotted edges (related-to) are excluded from the collapse traversal so sibling branches are never accidentally hidden.
 
-<!-- SCREENSHOT: Knowledge Graph — add a screenshot of the force-directed graph with expanded nodes and colored node types. -->
-<!-- HOW TO ADD: Save to `docs/screenshots/graph.png`, then replace the blockquote below with: `![Knowledge Graph](docs/screenshots/graph.png)` -->
-> **📸 Screenshot — Knowledge Graph** *(add screenshot here: show the force-directed graph with Subject→Topic→Subtopic hierarchy expanded, colored node types visible, and ideally a dotted semantic edge)*
+![Knowledge Graph](screenshots/graph2.png)
+![Knowledge Graph](screenshots/graph1.png)
 
 ### RAG Chat
 
 Chat grounded in your indexed papers:
-- Select a namespace from the dropdown
+- Select a paper from the feed
 - Ask any question — the system searches, reranks, checks sufficiency, then synthesizes a cited answer
 - Inline citations `[1]`, `[2]` link back to source papers
 - If context is insufficient, the system says so and offers to broaden scope
 
-<!-- SCREENSHOT: RAG Chat — add a screenshot showing a grounded answer with inline [N] citations. -->
-<!-- HOW TO ADD: Save to `docs/screenshots/rag_chat.png`, then replace the blockquote below with: `![RAG Chat](docs/screenshots/rag_chat.png)` -->
-> **📸 Screenshot — RAG Chat** *(add screenshot here: show a grounded answer with inline [1], [2] citations and the namespace selector visible)*
 
 ### Genie — Idea Synthesizer
 
@@ -463,9 +546,7 @@ Each synthesized capsule contains:
 
 Save capsules to keep them; saved capsules become new elements you can recombine.
 
-<!-- SCREENSHOT: Idea Capsule — add a screenshot of a saved capsule showing hypothesis, scores, mechanism, and Mermaid diagram. -->
-<!-- HOW TO ADD: Save to `docs/screenshots/capsule.png`, then replace the blockquote below with: `![Idea Capsule](docs/screenshots/capsule.png)` -->
-> **📸 Screenshot — Idea Capsule** *(add screenshot here: show a fully rendered capsule card with novelty/feasibility/impact scores, Mermaid diagram, and source paper links)*
+![Idea Capsule](screenshots/genie.png)
 
 #### Deep Dive
 
@@ -473,11 +554,14 @@ Generate a full research synthesis article from any Idea Capsule.
 
 Click **Generate Deep Dive** — generation queues in the background automatically. A spinner shows while it runs; the article streams in when ready. Navigating away and back is safe — the result is persisted to the database and restored instantly on page load.
 
-**Two-phase pipeline:**
-1. **Draft** — quality model writes a structured first draft (buffered, not shown to user)
-2. **Refinement** — strong reasoning model acts as LLM judge: fact-checks every claim against the source paper text, strips hallucinations, rewrites for depth and authority, adds diagrams and tables
+**Single-pass generation via the reasoning model:**
+Deep Dive uses the reasoning model (`gpt-5.4` / `claude-opus` depending on provider) directly in one pass with a strong system prompt that acts as author and fact-checker simultaneously. The model is instructed to:
+- Ground every claim in the provided source paper text
+- Strip any hallucinations or unsupported citations
+- Write with technical authority and precision
+- End with a complete `## References` section with arXiv URLs
 
-The refined output is the only thing shown. The draft is internal scaffolding.
+The article streams live to the frontend and is persisted to `idea_capsules.deep_dive_content` on completion so it loads instantly on future visits.
 
 **Output structure (11 sections):**
 
@@ -498,38 +582,7 @@ The refined output is the only thing shown. The draft is internal scaffolding.
 
 All claims are grounded with `[N]` inline citations; a `## References` section with arXiv links is appended automatically.
 
-<!-- SCREENSHOT: Deep Dive — add a screenshot of a rendered Deep Dive article with sections visible. -->
-<!-- HOW TO ADD: Save to `docs/screenshots/deep_dive.png`, then replace the blockquote below with: `![Deep Dive](docs/screenshots/deep_dive.png)` -->
-> **📸 Screenshot — Deep Dive** *(add screenshot here: show a generated Deep Dive article with multiple sections rendered, inline [N] citations visible, and the two-phase pipeline reflected in the final output)*
-
----
-
-## How to Add Screenshots
-
-1. **Take a screenshot** of the relevant app page/feature while the app is running.
-2. **Create the screenshots directory** (first time only):
-   ```bash
-   mkdir -p docs/screenshots
-   ```
-3. **Save the file** into `docs/screenshots/` with the filename referenced in the placeholder comment above each screenshot location (e.g. `docs/screenshots/feed.png`).
-4. **Replace the placeholder blockquote** with a Markdown image tag:
-   ```markdown
-   ![Feed](docs/screenshots/feed.png)
-   ```
-   Remove the `<!-- SCREENSHOT: ... -->` comment and the `> **📸 Screenshot ...** ...` blockquote line above it.
-5. **Recommended resolution:** 1440×900 or higher. Use PNG for crisp UI screenshots.
-
-**Screenshot locations and filenames:**
-
-| File | Section | What to capture |
-|---|---|---|
-| `docs/screenshots/feed.png` | Feed | Paper feed with cards, novelty badges, why-tags, sidebar nav |
-| `docs/screenshots/search.png` | Hybrid Search | Search results with hybrid/semantic/keyword badges, Deep Search toggle |
-| `docs/screenshots/study.png` | Study Mode | Streaming walkthrough with sections rendered and expertise-level selector |
-| `docs/screenshots/graph.png` | Knowledge Graph | Force-directed graph with expanded nodes, colored node types, dotted semantic edges |
-| `docs/screenshots/rag_chat.png` | RAG Chat | Grounded answer with [N] citations and namespace selector |
-| `docs/screenshots/capsule.png` | Idea Capsule | Rendered capsule with novelty/feasibility/impact scores and Mermaid diagram |
-| `docs/screenshots/deep_dive.png` | Deep Dive | Generated Deep Dive article with multiple sections and inline citations |
+![Idea Capsule](screenshots/genie_deep.png)
 
 ---
 
@@ -555,12 +608,12 @@ Pipeline: arXiv RSS fetch → enrichment → embeddings → graph update → sco
 
 ## Nightly Ingestion Schedule
 
-| Job | Schedule | What it does |
+| Job | Default schedule | What it does |
 |---|---|---|
-| Ingestion | 23:59 daily | Fetches new papers, enriches, embeds, updates graph, scores PoTD |
-| Clustering | Sunday 02:00 | Subtopic discovery — job scaffold registered; full HDBSCAN implementation is post-MVP |
-| Cross-namespace links | Sunday 03:00 | Cross-namespace concept bridge edges — job scaffold registered; cosine-similarity pass is post-MVP |
-| Bookmark index rebuild | Sunday 03:00 | Re-embeds any bookmarked papers that are missing an abstract chunk |
+| Ingestion | `0 5 * * 2-5` — 05:00 UTC, Tue–Fri | Fetches new papers, enriches, embeds, updates graph, scores PoTD. Runs on the four days with fresh arXiv content (Mon–Thu announcements arrive by 01:00 UTC). |
+| Clustering | `0 5 * * 0` — Sun 05:00 UTC | Subtopic discovery — job scaffold registered; full HDBSCAN implementation is post-MVP |
+| Cross-namespace links | `30 5 * * 0` — Sun 05:30 UTC | Cross-namespace concept bridge edges — job scaffold registered; cosine-similarity pass is post-MVP |
+| Bookmark index rebuild | Sun 03:00 UTC (fixed) | Re-embeds any bookmarked papers that are missing an abstract chunk |
 
 Schedules are configurable via `INGESTION_CRON`, `CLUSTERING_CRON`, `CROSS_NAMESPACE_CRON`.
 
@@ -582,16 +635,17 @@ asyncio.run(run_ingestion("cs.AI"))
 | `GOOGLE_API_KEY` | — | ✓* | Google AI key (*required for Gemini embeddings) |
 | `ANTHROPIC_API_KEY` | — | ✗ | Anthropic key (fallback LLM) |
 | `DEFAULT_LLM_PROVIDER` | `openai` | ✗ | `openai` \| `anthropic` \| `google` |
-| `DEFAULT_CHEAP_MODEL` | `gpt-4o-mini` | ✗ | Fast model for lightweight enrichment tasks |
-| `DEFAULT_QUALITY_MODEL` | `gpt-5.4-mini` | ✗ | Mid-tier model for Deep Dive first-draft and non-critical generation |
-| `DEFAULT_REASONING_MODEL` | `gpt-5.4` | ✗ | Strong reasoning model for Genie synthesis and Deep Dive judge |
+| `DEFAULT_CHEAP_MODEL` | `gpt-4o-mini` | ✗ | Fast model for query rewrite, intent classify, rerank, enrichment batches |
+| `DEFAULT_QUALITY_MODEL` | `gpt-5.4-mini` | ✗ | Mid-tier model for RAG synthesis, Genie hypothesize/critique |
+| `DEFAULT_REASONING_MODEL` | `gpt-5.4` | ✗ | Strong reasoning model for Genie elaborate, PoC code, Deep Dive article |
 | `DEFAULT_EMBEDDING_PROVIDER` | `gemini` | ✗ | `gemini` \| `openai` \| `voyage` |
 | `VOYAGE_API_KEY` | — | ✗ | Required only when `DEFAULT_EMBEDDING_PROVIDER=voyage` |
 | `DEFAULT_EMBEDDING_DIM` | `768` | ✗ | Must match the provider's output dimension |
 | `INGESTION_MODE` | `rss` | ✗ | `rss` \| `mcp` |
 | `CACHE_BACKEND` | `local` | ✗ | `local` \| `redis` |
 | `BLOB_BACKEND` | `local` | ✗ | `local` \| `azure` |
-| `PDF_PARSER` | `marker` | ✗ | `marker` \| `gemini_vision` |
+| `PDF_PARSER` | `marker` | ✗ | `marker` \| `docling` \| `gemini_vision`. Docling is opt-in (RAM-heavy); Marker is the memory-safe default. |
+| `MARKER_API_KEY` | — | ✗ | Marker cloud API key (local `marker-pdf` package works without it) |
 | `RESEND_API_KEY` | — | ✗ | Email sending (emails disabled if blank) |
 | `LANGSMITH_API_KEY` | — | ✗ | LangSmith observability |
 | `WEB_SEARCH_PROVIDER` | `duckduckgo` | ✗ | Web search backend for LLM tool: `duckduckgo` (free) or `tavily` |
@@ -601,24 +655,42 @@ asyncio.run(run_ingestion("cs.AI"))
 | `DEBUG` | `false` | ✗ | Enables Swagger UI, SQL echo, `/debug/status`, request logs |
 | `LOG_LEVEL` | `INFO` | ✗ | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `JWT_SECRET` | — | ✓ | Change before any non-local deployment |
-| `CORS_ORIGINS` | `http://localhost:3000` | ✗ | Comma-separated allowed origins |
+| `CORS_ORIGINS` | `["http://localhost:3000"]` | ✗ | JSON array of allowed CORS origins |
+| `TTS_PROVIDER` | `openai` | ✗ | TTS provider for podcast generation (only `openai` currently) |
+| `TTS_MODEL` | `tts-1-hd` | ✗ | OpenAI TTS model: `tts-1` (fast) or `tts-1-hd` (higher quality) |
 
 ---
 
 ## Azure Deployment
 
-The switch from local to Azure is **env-var only** — zero code changes:
+The switch from local to Azure is **env-var only** — zero code changes.
 
 | Local | Azure |
 |---|---|
 | `DATABASE_URL=postgresql+asyncpg://localhost/...` | `DATABASE_URL=postgresql+asyncpg://<azure-flexible-server>` |
 | `CACHE_BACKEND=local` | `CACHE_BACKEND=redis` + `REDIS_URL=rediss://<azure-cache>` |
 | `BLOB_BACKEND=local` | `BLOB_BACKEND=azure` + `AZURE_STORAGE_CONNECTION_STRING=...` |
-| uvicorn locally | Azure Container Apps |
+| `JobStore` in-process | `JobStore` shared via Azure Cache for Redis |
+| uvicorn locally | Azure Container Apps (multi-replica) |
 | `npm run dev` | Azure Static Web Apps |
 | APScheduler in-process | Azure Container Apps Jobs |
 
-Vector index migration (local IVFFlat → Azure HNSW):
+### Recommended Azure topology
+
+| Component | Azure resource |
+|---|---|
+| Backend container | Azure Container Apps (HTTP ingress + scale rules) |
+| Frontend | Azure Static Web Apps |
+| Database | Azure Database for PostgreSQL Flexible Server (with `vector` extension) |
+| Cache + JobStore | Azure Cache for Redis |
+| Object storage | Azure Blob Storage (private container; `BLOB_BACKEND=azure`) |
+| Secrets | Azure Key Vault (mount as env vars in Container Apps) |
+| Observability | Azure Monitor + Application Insights (auto-instrumented via OpenTelemetry) |
+| Scheduled jobs | Azure Container Apps Jobs running `python -c "from app.workflows.ingestion import run_all_ingestion; ..."` |
+| Queue (future) | Azure Service Bus — see `services/job_store.py` ABC for swap point |
+
+### Vector index migration (local IVFFlat → Azure HNSW)
+
 ```sql
 DROP INDEX paper_chunks_emb_768;
 CREATE INDEX paper_chunks_emb_768_hnsw ON paper_chunks
@@ -627,6 +699,47 @@ WITH (m = 16, ef_construction = 64)
 WHERE embedding_dim = 768;
 ```
 
+### Generation-specific Azure notes
+
+The backend Docker image (`build/Dockerfile.backend`) ships with:
+- `marp-cli` (Node 20) — slide rendering
+- `ffmpeg` — audio merging
+- All Python deps including `marker-pdf`
+
+For Azure Container Apps, expose:
+- Port 8000 (HTTP)
+- Optional `PDF_PARSER=docling` to switch to IBM Docling (richer structure
+  but ~2 GB extra RAM on first parse — requires ≥8 GB free).
+
+---
+
+## AWS Deployment
+
+Same env-var-only swap, AWS edition.
+
+| Local | AWS |
+|---|---|
+| `DATABASE_URL=postgresql+asyncpg://localhost/...` | `DATABASE_URL=postgresql+asyncpg://<rds-endpoint>` |
+| `CACHE_BACKEND=local` | `CACHE_BACKEND=redis` + `REDIS_URL=rediss://<elasticache-endpoint>` |
+| `BLOB_BACKEND=local` | S3 — extend `BlobStorageBackend` ABC with an `S3BlobStorage` adapter; the same `blob.upload/download/exists/delete` contract applies. |
+| Backend container | ECS Fargate or EKS (with Application Load Balancer ingress) |
+| Frontend | CloudFront + S3 static site OR Amplify Hosting |
+| Secrets | AWS Secrets Manager → injected as env vars |
+| Observability | CloudWatch logs + AWS X-Ray |
+| Scheduled jobs | EventBridge Scheduler → ECS Run Task |
+| Queue (future) | AWS SQS — implement an `SQSJobStore` against the same `JobStore` ABC |
+
+### Stateless container guarantees (Azure + AWS)
+
+ResearchFlow's containers are stateless by design:
+- **Generated artifacts** — persisted in PostgreSQL + BlobStorage (never local disk).
+- **Job state** — authoritative in PostgreSQL, optional fast-path in Redis.
+- **Auth tokens** — stateless JWTs (no session store).
+- **PDF cache** — `BLOB_BACKEND` controls whether parsed PDFs go to local disk
+  or Azure Blob/S3.
+
+That means horizontal autoscaling works out of the box on both clouds.
+
 ---
 
 ## Project Structure
@@ -634,7 +747,7 @@ WHERE embedding_dim = 768;
 ```
 research_flow/
 ├── backend/
-│   ├── main.py                  # FastAPI app, lifespan, CORS
+│   ├── main.py                  # FastAPI app, lifespan, CORS, startup recovery
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   ├── alembic/                 # DB migrations
@@ -644,7 +757,8 @@ research_flow/
 │       ├── core/
 │       │   ├── config.py        # Pydantic settings (all env vars)
 │       │   ├── security.py      # JWT, password hashing
-│       │   └── deps.py          # FastAPI DI: DB session, current user
+│       │   ├── deps.py          # FastAPI DI: DB session, current user
+│       │   └── tracking.py      # ContextVars for token-usage attribution
 │       ├── db/
 │       │   ├── base.py          # SQLAlchemy DeclarativeBase
 │       │   └── session.py       # Async engine + session factory
@@ -653,13 +767,16 @@ research_flow/
 │       │   ├── paper.py         # Paper, PaperChunk, Summary, Bookmark, PoTD, QueryLog, FeedFeedback
 │       │   ├── graph.py         # KnowledgeNode, KnowledgeEdge, NamespaceSubscription, SourceMapping
 │       │   ├── workflow.py      # WorkflowRun, TokenUsage
-│       │   └── genie.py         # GenieElement, IdeaCapsule, GenieSession
+│       │   ├── genie.py         # GenieElement, IdeaCapsule, GenieSession
+│       │   └── artifact.py      # GeneratedArtifact (podcast/slides)
 │       ├── schemas/             # Pydantic v2 request/response schemas
 │       ├── adapters/
-│       │   ├── llm/             # OpenAI, Anthropic, Google adapters
+│       │   ├── llm/             # OpenAI, Anthropic, Google adapters + TrackingLLMAdapter
 │       │   ├── embedding/       # Gemini 2, OpenAI embedding adapters
 │       │   ├── image_gen/       # Image generation adapter
-│       │   ├── pdf/             # Marker (primary), Gemini Vision (fallback)
+│       │   ├── pdf/             # Docling, Marker, Gemini Vision — fallback chain
+│       │   ├── tts/             # OpenAITTSAdapter (TTS ABC + factory)
+│       │   ├── slides/          # MarpSlidesAdapter (Slides ABC + factory)
 │       │   ├── cache/           # LocalFile + Redis backends
 │       │   ├── blob/            # Local + Azure Blob backends
 │       │   ├── email/           # Resend adapter
@@ -672,21 +789,28 @@ research_flow/
 │       │   ├── graph.py
 │       │   ├── vector.py        # pgvector similarity search
 │       │   ├── search.py        # Hybrid search: keyword + semantic + RRF fusion
-│       │   └── workflow.py
+│       │   ├── workflow.py
+│       │   └── artifact.py      # GeneratedArtifact CRUD + cache lookup
 │       ├── services/
 │       │   ├── scoring.py       # Feed scoring (pure SQL, no LLM)
 │       │   ├── graph.py         # GraphService
 │       │   ├── namespace.py     # Namespace ↔ arXiv category mapping
 │       │   ├── token_usage.py   # Per-call accounting
-│       │   └── email_service.py # PoTD, digest, breakthrough emails
+│       │   ├── email_service.py # PoTD, digest, breakthrough emails
+│       │   ├── content_loader.py # Source content loader (paper/capsule/folder, deep PDF grounding)
+│       │   └── job_store.py     # JobStore ABC + InMemory/Redis adapters
 │       ├── workflows/           # LangGraph agentic workflows
 │       │   ├── ingestion.py     # Nightly: fetch→enrich→embed→graph→score
 │       │   ├── study.py         # On-demand: parse→structure→explain→stream
 │       │   ├── rag.py           # On-demand: rewrite→retrieve→rerank→synthesize
-│       │   └── genie.py         # Synthesis + Auto-batch + Deep Dive (two-phase)
+│       │   ├── genie.py         # Synthesis + Auto-batch + Deep Dive (single-pass reasoning model)
+│       │   ├── _generation_runtime.py # Shared queue/recovery helpers for media gen
+│       │   ├── podcast.py       # load_content→plan_episode→write_script→tts→save
+│       │   └── slides.py        # load_content→plan_slides→write_markdown→render→save
 │       ├── api/v1/              # FastAPI routers
-│       │   └── genie.py         # /synthesize · /synthesize-bg · /auto-batch
-│       │                        # /capsules · /deep-dive · /deep-dive-bg · /chat
+│       │   ├── auth.py · feed.py · papers.py · study.py · search.py
+│       │   ├── chat.py · bookmarks.py · graph.py · genie.py · settings.py
+│       │   └── generate.py      # POST/GET /generate — media generation control plane
 │       └── scheduler/
 │           └── jobs.py          # APScheduler: nightly + weekly jobs
 │

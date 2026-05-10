@@ -525,12 +525,12 @@ async def cleanup_graph(
 
     svc = GraphService(db)
 
-    # Known valid namespace keys
-    known_ns = {
-        "cs.AI", "cs.LG", "cs.NE", "stat.ML", "cs.CL", "cs.CV", "cs.GR",
-        "cs.RO", "cs.SY", "eess.SP", "eess.AS", "cs.IR", "cs.DB", "cs.SE",
-        "cs.PL", "cs.HC", "cs.CR", "cs.DC", "cs.GT", "math.OC", "q-bio",
-    }
+    # All valid namespace keys — derived from the curated _NS_LABEL mapping which
+    # covers every arXiv namespace the service supports.  The old hardcoded 21-key
+    # set was a subset and incorrectly removed valid subtopics like quant-ph, math.AG,
+    # astro-ph.CO, hep-th, etc. when a user subscribed to those namespaces.
+    from app.services.graph import _NS_LABEL
+    known_ns = set(_NS_LABEL.keys())
 
     # Find SUBTOPIC nodes with unknown namespace_keys
     result = await db.execute(

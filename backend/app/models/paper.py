@@ -55,6 +55,13 @@ class Paper(Base):
     pdf_parsed: Mapped[bool] = mapped_column(Boolean, default=False)
     pdf_blob_path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Parser metadata — populated by ingestion / study workflows so downstream
+    # generation can include parser provenance in cache keys and audit trails.
+    parser_used: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    parser_fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    parse_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    parser_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Breakthrough flag
     is_breakthrough: Mapped[bool] = mapped_column(Boolean, default=False)
 

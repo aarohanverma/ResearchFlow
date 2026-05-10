@@ -188,9 +188,9 @@ launch_servers() {
         warn "Backend may still be starting — check http://localhost:8000/health"
     fi
 
-    info "Starting frontend on :3000 …"
+    info "Building and starting frontend in production mode on :3000 …"
     cd "$SCRIPT_DIR/frontend"
-    npm run dev &
+    npm run build && npm run start &
     FRONTEND_PID=$!
     cd "$SCRIPT_DIR"
 
@@ -299,6 +299,29 @@ require_cmd() {
     fi
 }
 
+# ── System packages (Ubuntu/Debian) ───────────────────────────────────────────
+# Install essential non-Python dependencies in one shot to minimise sudo prompts.
+_APT_PKGS=()
+command -v ffmpeg          &>/dev/null || _APT_PKGS+=("ffmpeg")
+command -v chromium-browser &>/dev/null || command -v chromium &>/dev/null || _APT_PKGS+=("chromium-browser")
+
+if [[ ${#_APT_PKGS[@]} -gt 0 ]]; then
+    info "Installing system packages: ${_APT_PKGS[*]}"
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y "${_APT_PKGS[@]}" 2>/dev/null && \
+            success "System packages installed: ${_APT_PKGS[*]}" || \
+            warn "apt-get failed — install manually: sudo apt-get install -y ${_APT_PKGS[*]}"
+    elif command -v brew &>/dev/null; then
+        # macOS
+        for pkg in "${_APT_PKGS[@]}"; do
+            [[ "$pkg" == "chromium-browser" ]] && pkg="chromium"
+            brew install "$pkg" 2>/dev/null || warn "brew install $pkg failed"
+        done
+    else
+        warn "Package manager not found. Please install manually: ${_APT_PKGS[*]}"
+    fi
+fi
+
 require_cmd docker  "Docker " "https://docs.docker.com/get-docker/"
 require_cmd python3 "Python3" "https://python.org  (need 3.10+)"
 require_cmd node    "Node.js" "https://nodejs.org  (need 20+)"
@@ -353,6 +376,19 @@ if ! docker info &>/dev/null 2>&1; then
     die "Docker daemon not running. Start Docker Desktop or: sudo systemctl start docker"
 fi
 success "Docker daemon — running"
+
+# ── Optional CLIs for media generation (slides + podcast) ─────────────────────
+# Slide rendering uses @marp-team/marp-cli; absence falls back to raw markdown.
+# Podcast TTS does not strictly need ffmpeg (OpenAI MP3 segments concat as bytes),
+# but ffmpeg is recommended for any future audio post-processing.
+if command -v marp &>/dev/null; then
+    success "marp-cli — available (slide rendering enabled)"
+elif command -v npx &>/dev/null; then
+    success "npx available — marp-cli will be downloaded on first slide render"
+else
+    warn "marp-cli not found — slide generation will return raw Markdown."
+    echo -e "       ${DIM}Install: npm install -g @marp-team/marp-cli${RESET}"
+fi
 
 # ── [2/7] API keys ────────────────────────────────────────────────────────────
 step "[2/7] API key configuration"
@@ -422,8 +458,8 @@ ANTHROPIC_API_KEY=${ANTHROPIC_KEY:-}
 GOOGLE_API_KEY=${GOOGLE_KEY:-}
 
 DEFAULT_CHEAP_MODEL=gpt-4o-mini
-DEFAULT_QUALITY_MODEL=gpt-4o
-DEFAULT_REASONING_MODEL=o3-mini
+DEFAULT_QUALITY_MODEL=gpt-5.4-mini
+DEFAULT_REASONING_MODEL=gpt-5.4
 DEFAULT_LLM_PROVIDER=openai
 
 DEFAULT_EMBEDDING_PROVIDER=${EMB_PROVIDER}
@@ -444,9 +480,12 @@ LANGCHAIN_TRACING_V2=false
 
 BREAKTHROUGH_THRESHOLD=0.88
 
-INGESTION_CRON=59 23 * * *
-CLUSTERING_CRON=0 2 * * 0
-CROSS_NAMESPACE_CRON=0 3 * * 0
+# arXiv RSS updates at midnight ET; new papers land Tue–Fri (after Mon–Thu announcements).
+# Run ingestion at 05:00 UTC (01:00 ET) on Tue–Fri only (days 2–5).
+# Weekly maintenance jobs run on Sunday 05:00/05:30 UTC (no arXiv activity that day).
+INGESTION_CRON=0 5 * * 2-5
+CLUSTERING_CRON=0 5 * * 0
+CROSS_NAMESPACE_CRON=30 5 * * 0
 
 CORS_ORIGINS=["http://localhost:3000"]
 ENVIRONMENT=local

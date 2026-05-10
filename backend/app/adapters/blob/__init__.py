@@ -1,5 +1,6 @@
 """Blob storage — local filesystem (dev) or Azure Blob Storage (cloud)."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -29,6 +30,15 @@ class BlobStorageBackend(ABC):
     @abstractmethod
     def public_url(self, path: str) -> str:
         """Return a URL usable by the frontend (may be a signed URL)."""
+
+    async def delete(self, path: str) -> None:
+        """Delete a blob by canonical path. Silently no-ops if not found.
+
+        Default implementation is a no-op; backends should override.
+
+        Args:
+            path: Relative (local) or container (Azure) blob path.
+        """
 
 
 class LocalBlobStorage(BlobStorageBackend):
@@ -90,7 +100,8 @@ class LocalBlobStorage(BlobStorageBackend):
         Returns:
             ``True`` if the file exists, ``False`` otherwise.
         """
-        return (self._base / path).exists()
+        full = self._base / path
+        return await asyncio.to_thread(full.exists)
 
     def public_url(self, path: str) -> str:
         """Return the URL path served by the FastAPI ``/blobs`` static mount.
@@ -101,8 +112,16 @@ class LocalBlobStorage(BlobStorageBackend):
         Returns:
             A URL string of the form ``/blobs/<path>``.
         """
-        # Served by FastAPI /static mount in local dev
         return f"/blobs/{path}"
+
+    async def delete(self, path: str) -> None:
+        """Delete a local blob file. Silently no-ops if not found."""
+        import aiofiles.os
+        full = self._base / path
+        try:
+            await aiofiles.os.remove(full)
+        except FileNotFoundError:
+            pass
 
 
 def get_blob_storage() -> BlobStorageBackend:

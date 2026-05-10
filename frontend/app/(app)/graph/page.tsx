@@ -213,24 +213,27 @@ interface SimNode extends d3.SimulationNodeDatum {
   id: string; type: string; r: number;
   isSubject: boolean; // level 0: TOPIC with no TOPIC parent (e.g. "Computer Science")
   isArea: boolean;    // level 3: CONCEPT with SUBTOPIC parent
-  isCluster: boolean; // level 4: CONCEPT with area CONCEPT parent
+  isSubArea: boolean; // level 4: CONCEPT with area CONCEPT parent (middle tier)
+  isCluster: boolean; // level 5: CONCEPT with sub-area CONCEPT parent (leaf cluster)
 }
 
-// Y-anchor per hierarchy level — 8 tiers
+// Y-anchor per hierarchy level — 9 tiers (added SUBAREA between AREA and CLUSTER)
 const LEVEL_Y: Record<string, number> = {
   SUBJECT:  -1400,  // subject root (e.g. "Computer Science")
   TOPIC:    -1050,  // domain topic (e.g. "Artificial Intelligence")
   SUBTOPIC:  -650,  // arXiv namespace (e.g. "cs.AI")
-  AREA:      -250,  // LLM research area
-  CLUSTER:    150,  // LLM thematic cluster
-  PAPER:      580,
-  CONCEPT:   1020,
-  METHOD:    1020,
+  AREA:      -280,  // LLM research area
+  SUBAREA:   -50,   // LLM sub-area (middle tier when 3-level hierarchy exists)
+  CLUSTER:    180,  // LLM thematic cluster
+  PAPER:      620,
+  CONCEPT:   1060,
+  METHOD:    1060,
 };
 
 function _nodeTierY(d: SimNode): number {
   if (d.isSubject) return LEVEL_Y.SUBJECT;
   if (d.isArea)    return LEVEL_Y.AREA;
+  if (d.isSubArea) return LEVEL_Y.SUBAREA;
   if (d.isCluster) return LEVEL_Y.CLUSTER;
   return LEVEL_Y[d.type] ?? 0;
 }
@@ -239,8 +242,9 @@ function runForce(
   gNodes: GraphNode[], gEdges: GraphEdge[],
   visibleIds: Set<string>,
   areaConceptIds: Set<string>,
-  clusterConceptIds: Set<string>,
+  clusterConceptIds: Set<string>,  // = belowAreaConcepts (sub-areas + true clusters combined)
   subjectTopicIds: Set<string>,
+  subAreaConceptIds: Set<string> = new Set(),  // just the sub-area tier, for Y separation
 ): Map<string, {x:number;y:number}> {
   const vis = gNodes.filter(n => visibleIds.has(n.id));
   if (!vis.length) return new Map();
@@ -248,13 +252,17 @@ function runForce(
   const simNodes: SimNode[] = vis.map(n => {
     const isSubject = subjectTopicIds.has(n.id);
     const isArea    = areaConceptIds.has(n.id);
-    const isCluster = clusterConceptIds.has(n.id);
+    const isSubArea = subAreaConceptIds.has(n.id);
+    // True cluster = in clusterConceptIds but NOT a sub-area (sub-areas also appear in
+    // belowAreaConcepts which is passed as clusterConceptIds for internal gating logic)
+    const isCluster = clusterConceptIds.has(n.id) && !isSubArea;
     const r = n.type === "PAPER" ? 65
       : isSubject ? 72
       : isArea    ? 54
+      : isSubArea ? 48
       : isCluster ? 44
       : (RADIUS[n.type] ?? 38);
-    const node: SimNode = { id: n.id, type: n.type, r, isSubject, isArea, isCluster };
+    const node: SimNode = { id: n.id, type: n.type, r, isSubject, isArea, isSubArea, isCluster };
     // Pin TOPIC/SUBTOPIC Y so they never drift into the cluster zone
     if (n.type === "TOPIC" || n.type === "SUBTOPIC") {
       node.fy = _nodeTierY(node);
@@ -269,8 +277,8 @@ function runForce(
   // many siblings the result can leave some children far from the parent,
   // making them look "stray" even though they're properly connected.
   const tierKey = (n: SimNode) =>
-    n.isSubject ? "SUBJECT" : n.isArea ? "AREA" : n.isCluster ? "CLUSTER" : n.type;
-  const tierOrder = ["SUBJECT", "TOPIC", "SUBTOPIC", "AREA", "CLUSTER", "PAPER", "CONCEPT", "METHOD"];
+    n.isSubject ? "SUBJECT" : n.isArea ? "AREA" : n.isSubArea ? "SUBAREA" : n.isCluster ? "CLUSTER" : n.type;
+  const tierOrder = ["SUBJECT", "TOPIC", "SUBTOPIC", "AREA", "SUBAREA", "CLUSTER", "PAPER", "CONCEPT", "METHOD"];
   const tierGroups = new Map<string, SimNode[]>();
   for (const n of simNodes) {
     const k = tierKey(n);
@@ -343,6 +351,7 @@ function runForce(
     if (d.type === "TOPIC")    return -2600;
     if (d.type === "SUBTOPIC") return -2400;
     if (d.isArea)              return -1100;
+    if (d.isSubArea)           return -900;
     if (d.isCluster)           return -800;
     if (d.type === "PAPER")    return -600;
     return -350;
@@ -353,6 +362,7 @@ function runForce(
     if (s.type === "TOPIC")    return 420;
     if (s.type === "SUBTOPIC") return 320;
     if (s.isArea)              return 240;
+    if (s.isSubArea)           return 215;
     if (s.isCluster)           return 190;
     if (s.type === "PAPER")    return 160;
     return 130;
@@ -452,11 +462,12 @@ function buildGraph(
   allNodes: GraphNode[], allEdges: GraphEdge[],
   expandedIds: Set<string>, bookmarkedIds: Set<string>, matchedIds: Set<string>,
   areaConceptIds: Set<string> = new Set(),
-  clusterConceptIds: Set<string> = new Set(),
+  clusterConceptIds: Set<string> = new Set(),  // = belowAreaConcepts (sub-areas + clusters)
   paperFolderMap: Map<string, Set<string>> | null = null,
   subjectTopicIds: Set<string> = new Set(),
   domainTopicIds: Set<string>  = new Set(),
   buildRunning: boolean = false,  // when true, skip paper-descendant pruning so partial areas show
+  subAreaConceptIds: Set<string> = new Set(),  // middle tier for Y-layout separation
 ): { rfNodes: Node[]; rfEdges: Edge[] } {
   const nodeMap = new Map(allNodes.map(n => [n.id, n]));
   const parents: Record<string, string[]>  = {};
@@ -609,7 +620,7 @@ function buildGraph(
     }
   }
 
-  // ── DAG enforcement: remove back-edges to prevent visual cycles.
+  // ── DAG enforcement: remove back-edges AND skip-level bypass edges.
   // Hierarchical edges must flow strictly from higher levels to lower levels.
   // related_to edges (dotted) are excluded — they're semantic, not structural.
   const levelOf = (n: typeof allNodes[0]): number => {
@@ -617,19 +628,36 @@ function buildGraph(
     if (n.type === "TOPIC")               return 1;
     if (n.type === "SUBTOPIC")            return 2;
     if (areaConceptIds.has(n.id))         return 3;
-    if (clusterConceptIds.has(n.id))      return 4;
-    if (n.type === "PAPER")               return 5;
-    return 6; // leaf CONCEPT / METHOD
+    if (subAreaConceptIds.has(n.id))      return 4;
+    if (clusterConceptIds.has(n.id))      return 5;
+    if (n.type === "PAPER")               return 6;
+    return 7; // leaf CONCEPT / METHOD
   };
   const nodeLevel = new Map(allNodes.map(n => [n.id, levelOf(n)]));
   const dagEdges = allEdges.filter(e => {
     if (e.type === "related_to") return true; // keep semantic edges as-is
     const sl = nodeLevel.get(e.source) ?? -1;
     const tl = nodeLevel.get(e.target) ?? -1;
-    return sl < tl; // only allow edges that go strictly downward in the hierarchy
+    if (sl >= tl) return false; // back-edge or same-level: remove (DAG enforcement)
+
+    // Remove stale skip-level bypass edges to PAPER nodes.
+    // add_paper_node creates SUBTOPIC→PAPER during ingestion; build_deep_graph later
+    // creates CLUSTER→PAPER. The old direct edges are redundant and render as stray
+    // lines. Remove any SUBTOPIC/AREA/SUBAREA→PAPER edge when the paper already has
+    // a proper cluster-level parent in this graph.
+    if (tl === 6 /* PAPER */) {
+      const srcLevel = sl;
+      if (srcLevel < 5 /* below cluster tier */) {
+        const paperParents = (parents[e.target] || []);
+        // If any cluster-tier node is a parent of this paper, the bypass edge is stale
+        if (paperParents.some(p => clusterConceptIds.has(p))) return false;
+      }
+    }
+
+    return true;
   });
 
-  const pos = runForce(allNodes, dagEdges, visible, areaConceptIds, clusterConceptIds, subjectTopicIds);
+  const pos = runForce(allNodes, dagEdges, visible, areaConceptIds, clusterConceptIds, subjectTopicIds, subAreaConceptIds);
 
   // Child count: type-aware to match what's actually shown at each level
   const effectiveChildCount = (nodeId: string, type: string): number => {
@@ -756,8 +784,11 @@ export default function GraphPage() {
   const [expandedIds,   setExpandedIds]   = useState<Set<string>>(new Set());
   const [selectedNode,  setSelectedNode]  = useState<GraphNode | null>(null);
   const [bookmarksOnly, setBookmarksOnly] = useState(false); // Full Feed by default — bookmarks subset is opt-in
-  // Graph build state — uses the global jobs store so it persists across navigation
-  const { graphBuildJobs, addGraphBuildJob, dismissGraphBuildJob } = useJobsStore();
+  // Graph build state — narrow selectors so this page doesn't re-render
+  // on every JobsPanel poll (e.g. while a podcast generates in the background).
+  const graphBuildJobs = useJobsStore((s) => s.graphBuildJobs);
+  const addGraphBuildJob = useJobsStore((s) => s.addGraphBuildJob);
+  const dismissGraphBuildJob = useJobsStore((s) => s.dismissGraphBuildJob);
   const activeBuildJob = graphBuildJobs.find(g => g.status === "running");
   const buildingDeep = !!activeBuildJob;
 
@@ -1046,6 +1077,7 @@ export default function GraphPage() {
       selectedFolderIds.size > 0 ? paperFolderMap : null,
       subjectTopicIds, domainTopicIds,
       !!activeBuildJob,
+      subAreaConceptIds,  // middle tier for Y-layout separation
     );
     setNodes(rfNodes);
     setEdges(rfEdges);

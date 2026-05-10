@@ -33,6 +33,11 @@ import re
 import uuid as _uuid_mod
 from typing import Any
 
+# Module-level set keeps strong references to background tasks so they are
+# never garbage-collected before completion (Python 3.12+ emits a
+# RuntimeWarning and may cancel orphaned tasks).
+_background_tasks: set[asyncio.Task] = set()
+
 from fastapi import APIRouter, Query
 
 from app.adapters.cache import get_cache
@@ -291,8 +296,10 @@ async def deep_search_background(
         ttl_seconds=_DS_CACHE_TTL,
     )
 
-    # Fire-and-forget — consistent with Genie's synthesize-bg pattern
-    asyncio.create_task(
+    # Fire-and-forget with explicit reference tracking so the event loop
+    # cannot garbage-collect the task before it completes (Python 3.12+
+    # emits RuntimeWarning for unrooted tasks and may cancel them).
+    task = asyncio.create_task(
         _run_deep_search_background(
             job_id=job_id,
             query=body.query,
@@ -300,6 +307,8 @@ async def deep_search_background(
             limit=body.limit,
         )
     )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return DeepSearchJobResponse(
         job_id=job_id,
@@ -549,7 +558,7 @@ Return ONLY valid JSON."""
     sem_results: list[dict] = []
     if query_vec is not None:
         try:
-            sem_results = await search_repo._semantic_search(
+            sem_results = await search_repo.semantic_search(
                 query_vec,
                 namespace_keys=namespace_keys,
                 embedding_dim=embed.dimensions,
@@ -806,23 +815,23 @@ async def _graph_concept_expansion(
     if not keywords:
         return []
 
-    # Find matching CONCEPT/METHOD nodes (ILIKE for case-insensitivity)
-    matched_node_ids: list = []
-    for kw in keywords:
-        q = select(KnowledgeNode.id).where(
-            KnowledgeNode.node_type.in_([NodeType.concept, NodeType.method]),
-            KnowledgeNode.label.ilike(f"%{kw}%"),
-        )
-        if namespace_keys:
-            from sqlalchemy import or_
-            q = q.where(
-                or_(
-                    KnowledgeNode.namespace_key.in_(namespace_keys),
-                    KnowledgeNode.namespace_key.is_(None),
-                )
+    # Find matching CONCEPT/METHOD nodes — single OR query instead of one
+    # ILIKE query per keyword to reduce round-trips (up to 8 previously).
+    from sqlalchemy import or_
+    kw_filters = [KnowledgeNode.label.ilike(f"%{kw}%") for kw in keywords]
+    node_q = select(KnowledgeNode.id).where(
+        KnowledgeNode.node_type.in_([NodeType.concept, NodeType.method]),
+        or_(*kw_filters),
+    )
+    if namespace_keys:
+        node_q = node_q.where(
+            or_(
+                KnowledgeNode.namespace_key.in_(namespace_keys),
+                KnowledgeNode.namespace_key.is_(None),
             )
-        res = await db.execute(q)
-        matched_node_ids.extend([r[0] for r in res.fetchall()])
+        )
+    res = await db.execute(node_q)
+    matched_node_ids: list = [r[0] for r in res.fetchall()]
 
     if not matched_node_ids:
         return []

@@ -3,10 +3,11 @@
 import os
 import sys
 
-# Make the backend package importable without installing it
-# backend/ must be on sys.path so `import app` resolves
+# Make the backend package importable without installing it.
+# conf.py lives at docs/sphinx/source/conf.py — 3 levels up is the project root.
+# Adding backend/ to sys.path lets Sphinx resolve `import app.*` without installation.
 _backend = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "backend")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "backend")
 )
 sys.path.insert(0, _backend)
 
@@ -66,7 +67,6 @@ intersphinx_mapping = {
 html_theme = "sphinx_rtd_theme"
 html_theme_options = {
     "logo_only": False,
-    "display_version": True,
     "prev_next_buttons_location": "bottom",
     "style_external_links": True,
     "collapse_navigation": False,
@@ -82,26 +82,47 @@ html_short_title = "ResearchFlow"
 # ── Mock unavailable heavy imports ───────────────────────────────────────────
 # These packages may not be installed in the Sphinx build environment
 autodoc_mock_imports = [
-    "openai", "anthropic", "google", "google.generativeai",
+    # LLM / AI providers
+    "openai", "anthropic",
+    "google", "google.generativeai",
+    # Database / ORM
+    "sqlalchemy", "alembic", "asyncpg",
     "pgvector", "pgvector.sqlalchemy",
-    "sqlalchemy", "alembic",
+    # Web framework / validation
     "fastapi", "pydantic", "pydantic_settings",
-    "langchain", "langgraph",
-    "bcrypt", "jose",
+    "python_multipart",
+    # LangChain / LangGraph
+    "langchain", "langchain_core", "langchain_mcp_adapters",
+    "langgraph", "langgraph.graph", "langgraph.checkpoint",
+    "langgraph.checkpoint.base",
+    "langsmith",
+    # Auth / crypto
+    "bcrypt", "jose", "cryptography",
+    # HTTP / async I/O
     "aiohttp", "httpx", "aiofiles",
-    "redis", "celery",
-    "marker", "marker_pdf",
-    "azure", "azure.storage",
-    "resend",
+    # Caching / queuing
+    "redis",
+    # PDF parsing
+    "marker", "marker_pdf", "docling", "fitz", "pymupdf", "easyocr",
+    # ML / numerics
+    "numpy", "hdbscan", "sklearn", "scikit_learn", "numexpr",
+    # Cloud
+    "azure", "azure.storage", "azure.identity", "azure.keyvault",
+    # Utilities
+    "resend", "feedparser",
+    "duckduckgo_search", "tavily",
+    "tenacity", "pybreaker",
+    "orjson", "ujson",
+    # Scheduling
     "apscheduler",
     "apscheduler.schedulers",
     "apscheduler.schedulers.asyncio",
-    "numpy",
 ]
 
 # Suppress known false-positive warnings
 suppress_warnings = [
     "autodoc.import_object",  # scheduler/jobs.py APScheduler mock type issue
+    "config.cache",           # suppress stale config cache warnings on fresh builds
 ]
 
 # ── Misc ──────────────────────────────────────────────────────────────────────

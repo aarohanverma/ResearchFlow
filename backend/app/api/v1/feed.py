@@ -24,37 +24,58 @@ async def get_suggested(
 ):
     """Recommend papers based on the user's liked + bookmarked paper concepts."""
     from collections import Counter
+    from uuid import UUID
+    from sqlalchemy import select
+    from app.models.paper import Paper
 
     paper_repo = PaperRepository(db)
     bookmarks = await paper_repo.get_bookmarks(user_id)
     liked_ids = await paper_repo.get_liked_paper_ids(user_id)
 
+    # Collect all unique paper IDs upfront — one batch SELECT replaces the previous
+    # per-paper get_by_id loop that issued up to 40 individual queries.
+    bm_paper_ids = [bm.paper_id for bm in bookmarks[:20]]
+    liked_uuids: list[UUID] = []
+    for pid_str in liked_ids[:20]:
+        try:
+            liked_uuids.append(UUID(pid_str))
+        except (ValueError, AttributeError):
+            pass
+
+    all_paper_ids = list(dict.fromkeys(bm_paper_ids + liked_uuids))  # dedup, preserve order
+    paper_map: dict[str, "Paper"] = {}
+    if all_paper_ids:
+        rows = await db.execute(
+            select(Paper).where(Paper.id.in_(all_paper_ids))
+        )
+        for p in rows.scalars():
+            paper_map[str(p.id)] = p
+
     sourced_ids: set[str] = set()
     all_concepts: list[str] = []
 
     for bm in bookmarks[:20]:
-        sourced_ids.add(str(bm.paper_id))
-        paper = await paper_repo.get_by_id(bm.paper_id)
+        pid_str = str(bm.paper_id)
+        sourced_ids.add(pid_str)
+        paper = paper_map.get(pid_str)
         if paper:
             all_concepts.extend(paper.key_concepts or [])
 
-    for pid_str in liked_ids[:20]:
-        from uuid import UUID
+    for uid in liked_uuids:
+        pid_str = str(uid)
         sourced_ids.add(pid_str)
-        try:
-            paper = await paper_repo.get_by_id(UUID(pid_str))
-            if paper:
-                all_concepts.extend(paper.key_concepts or [])
-        except Exception:
-            pass
+        paper = paper_map.get(pid_str)
+        if paper:
+            all_concepts.extend(paper.key_concepts or [])
 
     _STOP = {"a", "an", "the", "of", "in", "on", "for", "and", "or", "with", "to", "from", "by", "is", "are", "using", "based", "via"}
 
     if not all_concepts:
-        # Enrichment hasn't run yet — extract meaningful keywords from bookmarked titles
+        # Enrichment hasn't run yet — extract meaningful keywords from bookmarked titles.
+        # Papers are already in paper_map so no additional DB queries needed.
         title_terms: list[str] = []
         for bm in bookmarks[:10]:
-            paper = await paper_repo.get_by_id(bm.paper_id)
+            paper = paper_map.get(str(bm.paper_id))
             if paper:
                 words = [w.strip(":.,-()") for w in paper.title.split()
                          if len(w) > 3 and w.lower().strip(":.,-()") not in _STOP]
@@ -257,7 +278,7 @@ async def get_related_papers(
 
     if chunk and chunk.embedding is not None:
         provider = chunk.embedding_provider.value if hasattr(chunk.embedding_provider, "value") else str(chunk.embedding_provider)
-        sem_results = await search_repo._semantic_search(
+        sem_results = await search_repo.semantic_search(
             list(chunk.embedding),
             embedding_dim=chunk.embedding_dim,
             embedding_provider=provider,

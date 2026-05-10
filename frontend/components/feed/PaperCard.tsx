@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { BookmarkIcon, ExternalLinkIcon } from "lucide-react";
 import type { FeedItem } from "@/types";
-import { api } from "@/lib/api";
 import { cleanAbstract } from "@/lib/utils";
 import { useBookmarksStore } from "@/store/bookmarks";
 import { BookmarkFolderPicker } from "@/components/bookmarks/BookmarkFolderPicker";
