@@ -162,9 +162,10 @@ is cut off.
 │  API Layer — FastAPI async routers  (JWT auth, SSE, DI)          │
 │              /feed · /study · /rag · /genie · /generate          │
 ├──────────────────────────────────────────────────────────────────┤
-│  Workflows — LangGraph StateGraph                                │
-│    Ingestion · Study · RAG · Genie · Deep Dive                   │
-│    Podcast · Slides                                              │
+│  Workflows — LangGraph StateGraph (6) + async generators         │
+│    Ingestion · Study · RAG · Podcast · Slides                    │
+│    FolderConsolidation (coherence + cross-paper synthesis)       │
+│    Genie · Deep Dive (custom async streaming generators)         │
 ├──────────────────────────────────────────────────────────────────┤
 │  Services / Adapters — Scoring · GraphService                    │
 │    LLM (OpenAI/Anthropic/Google)                                 │
@@ -761,7 +762,8 @@ research_flow/
 │       │   └── tracking.py      # ContextVars for token-usage attribution
 │       ├── db/
 │       │   ├── base.py          # SQLAlchemy DeclarativeBase
-│       │   └── session.py       # Async engine + session factory
+│       │   ├── session.py       # Async engine + session factory
+│       │   └── checkpointer.py  # AsyncPostgresCheckpointer — LangGraph crash-resume for media gen
 │       ├── models/              # SQLAlchemy ORM models
 │       │   ├── user.py          # User, UserProviderSettings, Annotation
 │       │   ├── paper.py         # Paper, PaperChunk, Summary, Bookmark, PoTD, QueryLog, FeedFeedback
@@ -803,10 +805,12 @@ research_flow/
 │       │   ├── ingestion.py     # Nightly: fetch→enrich→embed→graph→score
 │       │   ├── study.py         # On-demand: parse→structure→explain→stream
 │       │   ├── rag.py           # On-demand: rewrite→retrieve→rerank→synthesize
-│       │   ├── genie.py         # Synthesis + Auto-batch + Deep Dive (single-pass reasoning model)
-│       │   ├── _generation_runtime.py # Shared queue/recovery helpers for media gen
-│       │   ├── podcast.py       # load_content→plan_episode→write_script→tts→save
-│       │   └── slides.py        # load_content→plan_slides→write_markdown→render→save
+│       │   ├── genie.py         # Synthesis + Auto-batch + Deep Dive (custom async generators)
+│       │   ├── _generation_prompts.py # Shared prompts/heuristics for media gen
+│       │   ├── _generation_runtime.py # Queue/recovery helpers + orphan re-dispatch
+│       │   ├── podcast.py       # 5-node StateGraph + multi-turn segmented script + TTS
+│       │   ├── slides.py        # 4-node StateGraph + multi-turn batched Marp generation
+│       │   └── folder_consolidation.py # 3-node StateGraph: load → coherence → synthesize
 │       ├── api/v1/              # FastAPI routers
 │       │   ├── auth.py · feed.py · papers.py · study.py · search.py
 │       │   ├── chat.py · bookmarks.py · graph.py · genie.py · settings.py

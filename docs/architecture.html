@@ -391,8 +391,8 @@ details[open] summary::before{transform:rotate(90deg)}
       <div class="arch-layer-num">3</div>
       <div>
         <div class="arch-layer-name" style="color:var(--purple)">Workflows (LangGraph)</div>
-        <div class="arch-layer-desc">5 LangGraph StateGraph workflows: Ingestion · Study · RAG · Podcast · Slides. Each is a compiled graph of typed async node functions. Genie synthesis and Deep Dive are custom async streaming generators in <code>workflows/genie.py</code>, not StateGraphs.</div>
-        <div class="arch-layer-files">backend/app/workflows/ingestion.py · rag.py · study.py · podcast.py · slides.py · genie.py</div>
+        <div class="arch-layer-desc">6 LangGraph StateGraph workflows: Ingestion · Study · RAG · Podcast · Slides · FolderConsolidation. Each is a compiled graph of typed async node functions, with the podcast/slides graphs persisted through an async PostgreSQL <code>BaseCheckpointSaver</code> so a crashed worker resumes from the last completed node. Genie synthesis and Deep Dive are custom async streaming generators in <code>workflows/genie.py</code>, not StateGraphs.</div>
+        <div class="arch-layer-files">backend/app/workflows/ingestion.py · rag.py · study.py · podcast.py · slides.py · folder_consolidation.py · genie.py</div>
       </div>
     </div>
     <div class="arch-layer layer-4">
@@ -1205,7 +1205,7 @@ graph TD
   <div class="section-tag">Section 6</div>
   <h2>LangGraph Fundamentals</h2>
   <p>
-    Before diving into the seven workflow modules, here's a short primer on what LangGraph is and
+    Before diving into the eight workflow modules, here's a short primer on what LangGraph is and
     why it's used everywhere in this codebase. If you already know LangGraph, skim and skip.
   </p>
 
@@ -1302,8 +1302,8 @@ rag_graph <span class="op">=</span> _build_rag_graph()</code></pre>
 <code>state[<span class="st">"rewritten_query"</span>] <span class="op">=</span> result.text.strip() <span class="kw">or</span> state[<span class="st">"raw_query"</span>]
 <span class="kw">return</span> state</code></pre>
 
-  <h3>The seven workflow modules in this codebase</h3>
-  <p>Five are compiled LangGraph <code>StateGraph</code> instances. Two (Genie synthesis, Deep Dive) are custom async streaming generators.</p>
+  <h3>The eight workflow modules in this codebase</h3>
+  <p>Six are compiled LangGraph <code>StateGraph</code> instances (Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation). Two (Genie synthesis, Deep Dive) are custom async streaming generators in <code>genie.py</code>. Generation graphs (podcast, slides) attach an async PostgreSQL checkpoint saver so each node's state is persisted — a crashed worker resumes from the last completed node rather than wasting tokens on already-paid work.</p>
   <div class="diagram-wrap">
     <div class="diagram-title">State types &amp; their workflow files</div>
     <div class="mermaid">
@@ -1314,13 +1314,15 @@ flowchart LR
     GS["<b>GenieState (async gen)</b><br/>user_id<br/>session_id<br/>seed_element_ids<br/>is_auto<br/>context_chunks<br/>bridge_concepts<br/>max_seed_similarity<br/>synthesis_viable<br/>candidate_hypotheses<br/>chosen_hypothesis<br/>elaboration<br/>diagrams<br/>poc_code<br/>novelty/feasibility/impact_score<br/>capsule_id"]
     PS["<b>PodcastState</b><br/>user_id<br/>source_type<br/>source_id<br/>expertise_level<br/>orientation<br/>artifact_id<br/>content_text<br/>episode_plan<br/>script_segments<br/>audio_bytes<br/>blob_path"]
     SLS["<b>SlidesState</b><br/>user_id<br/>source_type<br/>source_id<br/>expertise_level<br/>orientation<br/>artifact_id<br/>content_text<br/>deck_plan<br/>marp_markdown<br/>rendered_html<br/>blob_path"]
+    FCS["<b>FolderAnalysisState</b><br/>folder_id<br/>user_id<br/>paper_ids_override<br/>papers<br/>coherence_report<br/>consolidated_content<br/>error"]
 
-    IW["<b>ingestion.py</b><br/>StateGraph · 6 nodes<br/>run_ingestion(ns)"]
-    RW["<b>rag.py</b><br/>StateGraph · 9 nodes<br/>run_rag / run_rag_stream"]
-    SW["<b>study.py</b><br/>StateGraph · 8+ nodes<br/>run_study (SSE)"]
+    IW["<b>ingestion.py</b><br/>StateGraph · 7 nodes + error<br/>run_ingestion(ns)"]
+    RW["<b>rag.py</b><br/>StateGraph · 9 nodes + topic gate<br/>run_rag / run_rag_stream"]
+    SW["<b>study.py</b><br/>StateGraph · 7 nodes<br/>run_study (SSE)"]
     GW["<b>genie.py (generators)</b><br/>run_genie (SSE)<br/>run_genie_background<br/>run_deep_dive (SSE)"]
-    PW["<b>podcast.py</b><br/>StateGraph · 5 nodes<br/>run_podcast_workflow"]
-    SLW["<b>slides.py</b><br/>StateGraph · 4 nodes<br/>run_slides_workflow"]
+    PW["<b>podcast.py</b><br/>StateGraph · 5 nodes<br/>+ async pg checkpointer<br/>queue_podcast"]
+    SLW["<b>slides.py</b><br/>StateGraph · 4 nodes<br/>+ async pg checkpointer<br/>queue_slides"]
+    FCW["<b>folder_consolidation.py</b><br/>StateGraph · 3 nodes<br/>run_folder_analysis"]
 
     IW ==>|"threads"| IS
     RW ==>|"threads"| RS
@@ -1328,6 +1330,7 @@ flowchart LR
     GW ==>|"dict state"| GS
     PW ==>|"threads"| PS
     SLW ==>|"threads"| SLS
+    FCW ==>|"threads"| FCS
 
     style IS fill:#0d2137,stroke:#58a6ff,color:#e6edf3
     style RS fill:#0d2e1a,stroke:#3fb950,color:#e6edf3
@@ -1341,6 +1344,8 @@ flowchart LR
     style GW fill:#21262d,stroke:#bc8cff,color:#e6edf3
     style PW fill:#21262d,stroke:#f0a83e,color:#e6edf3
     style SLW fill:#21262d,stroke:#3fd9d9,color:#e6edf3
+    style FCS fill:#0d211a,stroke:#56d364,color:#e6edf3
+    style FCW fill:#21262d,stroke:#56d364,color:#e6edf3
     </div>
   </div>
 
@@ -4894,12 +4899,15 @@ sequenceDiagram
   <div class="section-tag">End</div>
   <h2>Bringing it together</h2>
   <p>
-    You now have the full picture: six layers, seven workflow modules (five LangGraph
-    StateGraphs + Genie synthesis + Deep Dive generators), ten adapter families, seven
-    repositories, one PostgreSQL 16 database with pgvector HNSW index and a knowledge graph,
-    three deterministic algorithms (RRF, scoring, auto-batch temperature), and a four-tier
-    resilience layer wrapping every external call. Everything is configured by ~40 settings
-    in one Pydantic class, with a four-env-var swap from local Docker to Azure.
+    You now have the full picture: six layers, eight workflow modules (six LangGraph
+    StateGraphs — Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation — plus the
+    Genie synthesis and Deep Dive async generators), ten adapter families, seven
+    repositories, one PostgreSQL 16 database with pgvector HNSW index, a knowledge graph,
+    and an async PostgreSQL checkpoint saver that lets generation workflows resume from
+    the last completed node after a crash. Three deterministic algorithms (RRF, scoring,
+    auto-batch temperature) and a four-tier resilience layer wrap every external call.
+    Everything is configured by ~40 settings in one Pydantic class, with a four-env-var
+    swap from local Docker to Azure.
   </p>
   <p style="color:var(--text3);font-size:.85rem;margin-top:24px">
     Source: <code>backend/app/</code> · interactive technical reference auto-rendered with Mermaid 10.9.
@@ -5150,6 +5158,53 @@ ContentLoaderService.load(source_type, source_id, user_id) → LoadedContent
   <p>Expertise and orientation settings are baked into the artifact at generation time
   and stored on the <code>GeneratedArtifact</code> row. If the user changes settings, a
   new artifact is generated rather than returning the cached one.</p>
+
+  <h3>Multi-turn segmented generation</h3>
+  <p>Both the podcast and slides workflows treat <code>plan_*</code> and
+  <code>write_*</code> as a <em>multi-turn conversation</em> rather than a single
+  long completion. The plan (episode plan / deck plan) and full source content
+  are established once in turn 0; subsequent turns generate one segment of the
+  podcast script (or a small batch of <code>SLIDES_PER_BATCH = 4</code> slides)
+  with focused instructions. Each batch is validated for format, hard prompt
+  leakage, and continuity before it is committed to the running transcript; a
+  single correction turn is issued on validation failure. This keeps the model
+  fully on-task per segment, prevents quality degradation on long decks /
+  scripts, and avoids raw-slicing the source content. The accumulated output is
+  reassembled at the end and stripped of any residual prompt artifacts.</p>
+
+  <h3>Checkpoint-backed crash resume</h3>
+  <p>Both compiled graphs attach an <code>AsyncPostgresCheckpointer</code>
+  (<code>backend/app/db/checkpointer.py</code>) whose <code>thread_id</code> is
+  the <code>artifact_id</code>. LangGraph persists each completed node's
+  channel values to three idempotent tables
+  (<code>langgraph_checkpoints</code>, <code>_blobs</code>, <code>_writes</code>).
+  On worker restart the lifespan calls
+  <code>recover_orphaned_artifacts()</code>: artifacts left in
+  <code>running</code>/<code>queued</code> are checked for a checkpoint —
+  those with one are re-dispatched (skipping already-completed,
+  already-paid-for nodes); those without are transitioned to <code>failed</code>
+  with a retryable error so the UI never shows a permanent spinner.</p>
+
+  <h3>Folder-corpus consolidation (3 nodes)</h3>
+  <p>When a generation is requested over a bookmark folder, the
+  <code>folder_consolidation.py</code> StateGraph runs first:</p>
+  <div class="node-flow">
+    <div class="node-box blue">load_papers</div>
+    <div class="node-arrow">→</div>
+    <div class="node-box purple">analyze_coherence</div>
+    <div class="node-arrow">→</div>
+    <div class="node-box green">synthesize_content</div>
+  </div>
+  <p>The <code>analyze_coherence</code> node returns a per-paper relevance
+  assessment (related vs outlier, score, plain-English reason, key
+  contribution) plus an overall coherence score and a short synthesis summary.
+  The frontend shows this report to the user via
+  <code>POST /generate/folder/{folder_id}/analyze</code> so outliers can be
+  deselected before media generation. The downstream
+  <code>synthesize_content</code> node then assembles a single cross-paper
+  thematic context (complementary methodologies, combined results landscape,
+  shared open questions) — this becomes the source content passed into the
+  podcast or slides graph, which would otherwise see only an isolated paper.</p>
 </div>
 
 <div class="section" id="artifact-storage">
