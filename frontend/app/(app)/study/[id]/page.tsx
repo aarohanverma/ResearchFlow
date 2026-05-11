@@ -781,9 +781,61 @@ function sanitizeMermaidSpec(raw: string): string {
   s = s.replace(/^graph\s+(TD|TB|LR|RL|BT)\b/im, "flowchart $1");
   // Remove stray HTML comment blocks that break the parser
   s = s.replace(/<!--[\s\S]*?-->/g, "");
+  // Citation markers [5] / [1-3] / [1, 2] inside node labels collide with mermaid's
+  // label terminator. Convert to parens — same visual, no parser ambiguity.
+  s = s.replace(/\[(\d+(?:\s*[-,]\s*\d+)*)\]/g, "($1)");
   // Collapse multiple blank lines
   s = s.replace(/\n{3,}/g, "\n\n");
   return s.trim();
+}
+
+/**
+ * Aggressive fallback: wrap every node label in double quotes so any remaining
+ * problematic chars (parens, slashes, ampersands, stray brackets) become literal.
+ * Used only after the normal sanitizer + retry both fail.
+ */
+function quoteAllLabels(raw: string): string {
+  function pass(input: string, open: string, close: string): string {
+    const out: string[] = [];
+    let i = 0;
+    while (i < input.length) {
+      const ch = input[i];
+      if (/[A-Za-z0-9_]/.test(ch)) {
+        let j = i;
+        while (j < input.length && /[A-Za-z0-9_]/.test(input[j])) j++;
+        if (input[j] === open) {
+          let depth = 1;
+          let k = j + 1;
+          while (k < input.length && depth > 0) {
+            if (input[k] === open) depth++;
+            else if (input[k] === close) depth--;
+            if (depth === 0) break;
+            k++;
+          }
+          if (k < input.length && depth === 0) {
+            const id = input.slice(i, j);
+            const content = input.slice(j + 1, k);
+            const trimmed = content.trim();
+            const alreadyQuoted = trimmed.startsWith('"') && trimmed.endsWith('"');
+            const safe = alreadyQuoted ? content : `"${content.replace(/"/g, "&quot;")}"`;
+            out.push(id + open + safe + close);
+            i = k + 1;
+            continue;
+          }
+        }
+        out.push(input.slice(i, j));
+        i = j;
+        continue;
+      }
+      out.push(ch);
+      i++;
+    }
+    return out.join("");
+  }
+  let s = pass(raw, "[", "]");
+  s = pass(s, "(", ")");
+  s = pass(s, "{", "}");
+  return s;
 }
 
 function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number }) {
@@ -810,17 +862,32 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
         const mermaid = await getMermaid();
         ({ svg } = await mermaid.render(id, clean));
       } catch (firstErr) {
-        // Retry once: try stripping everything before the first diagram keyword
-        // (handles cases where the LLM prepends prose before the spec)
+        // Retry 1: strip everything before the first diagram keyword
+        // (handles LLM-prepended prose before the spec).
+        let recovered = false;
         try {
           const mermaid = await getMermaid();
           const match = clean.match(/(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph|mindmap|timeline)[\s\S]*/i);
-          if (!match) throw firstErr;
-          ({ svg } = await mermaid.render(`${id}r`, match[0].trim()));
-        } catch {
+          if (match) {
+            ({ svg } = await mermaid.render(`${id}r`, match[0].trim()));
+            recovered = true;
+          }
+        } catch { /* fall through to aggressive */ }
+
+        // Retry 2: quote every node label so stray brackets/parens become literals.
+        if (!recovered) {
+          try {
+            const mermaid = await getMermaid();
+            ({ svg } = await mermaid.render(`${id}q`, quoteAllLabels(clean)));
+            recovered = true;
+          } catch { /* give up */ }
+        }
+
+        if (!recovered) {
           if (!cancelRef.current) setError(true);
           return;
         }
+        void firstErr;
       }
 
       // Guard: component may have unmounted during the await

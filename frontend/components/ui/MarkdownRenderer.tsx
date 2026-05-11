@@ -5,12 +5,95 @@ import { CopyIcon, CheckIcon } from "lucide-react";
 
 // ── Mermaid diagram ───────────────────────────────────────────────────────────
 
+/**
+ * LLM-generated mermaid often has small syntax mistakes that mermaid's
+ * tokenizer can't recover from. We do a best-effort cleanup pass so a single
+ * bad node doesn't kill the whole diagram. All transforms are conservative
+ * (no semantic edits) and idempotent.
+ */
+export function sanitizeMermaidSpec(raw: string): string {
+  let s = raw;
+
+  // Strip ```mermaid fences if the LLM included them inside the block.
+  s = s.replace(/^\s*```(?:mermaid)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+
+  // Citation markers like [5], [1-3], [1, 2, 3] inside node labels collide
+  // with mermaid's label terminator. Convert them to parens — same visual,
+  // no parser ambiguity. Standalone `[N]` never has a legal meaning in
+  // mermaid source so this is safe everywhere.
+  s = s.replace(/\[(\d+(?:\s*[-,]\s*\d+)*)\]/g, "($1)");
+
+  // Trailing-semicolon edges sometimes break older parsers; leave as-is —
+  // mermaid 10+ tolerates them.
+
+  return s;
+}
+
+/**
+ * Aggressive fallback: wrap every node label in double quotes so any
+ * remaining problematic chars (parens, slashes, ampersands, stray brackets)
+ * are treated as literal text. Used only after the first render fails.
+ */
+export function sanitizeMermaidAggressive(raw: string): string {
+  const s = sanitizeMermaidSpec(raw);
+
+  // Match node-label patterns: <id><open-bracket>...<close-bracket>
+  // and quote the label content if not already quoted. We bracket-balance
+  // the content so nested () or [] inside the label are absorbed correctly.
+  function quoteLabels(input: string, open: string, close: string): string {
+    const out: string[] = [];
+    let i = 0;
+    while (i < input.length) {
+      const ch = input[i];
+      if (/[A-Za-z0-9_]/.test(ch)) {
+        let j = i;
+        while (j < input.length && /[A-Za-z0-9_]/.test(input[j])) j++;
+        if (input[j] === open) {
+          let depth = 1;
+          let k = j + 1;
+          while (k < input.length && depth > 0) {
+            if (input[k] === open) depth++;
+            else if (input[k] === close) depth--;
+            if (depth === 0) break;
+            k++;
+          }
+          if (k < input.length && depth === 0) {
+            const id = input.slice(i, j);
+            const content = input.slice(j + 1, k);
+            const trimmed = content.trim();
+            const alreadyQuoted = trimmed.startsWith('"') && trimmed.endsWith('"');
+            const safe = alreadyQuoted
+              ? content
+              : `"${content.replace(/"/g, "&quot;")}"`;
+            out.push(id + open + safe + close);
+            i = k + 1;
+            continue;
+          }
+        }
+        // Identifier but no balanced label — emit the identifier whole and skip past it.
+        out.push(input.slice(i, j));
+        i = j;
+        continue;
+      }
+      out.push(ch);
+      i++;
+    }
+    return out.join("");
+  }
+
+  let result = quoteLabels(s, "[", "]");
+  result = quoteLabels(result, "(", ")");
+  result = quoteLabels(result, "{", "}");
+  return result;
+}
+
 function MermaidBlock({ spec }: { spec: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState(false);
 
   useEffect(() => {
     setError(false);
+    let cancelled = false;
     (async () => {
       if (!ref.current) return;
       try {
@@ -30,14 +113,37 @@ function MermaidBlock({ spec }: { spec: string }) {
           flowchart: { htmlLabels: true, curve: "basis" },
           securityLevel: "loose",
         });
-        const id = `mermaid-${Math.random().toString(36).slice(2)}`;
-        const { svg } = await mermaid.render(id, spec);
-        if (ref.current) ref.current.innerHTML = svg;
+
+        const tryRender = async (source: string) => {
+          const id = `mermaid-${Math.random().toString(36).slice(2)}`;
+          return mermaid.render(id, source);
+        };
+
+        let svg: string | null = null;
+        try {
+          ({ svg } = await tryRender(sanitizeMermaidSpec(spec)));
+        } catch {
+          // Fallback: quote every label, then retry once.
+          try {
+            ({ svg } = await tryRender(sanitizeMermaidAggressive(spec)));
+          } catch {
+            svg = null;
+          }
+        }
+        if (cancelled) return;
+        if (svg && ref.current) {
+          ref.current.innerHTML = svg;
+        } else {
+          setError(true);
+          if (ref.current) ref.current.innerHTML = "";
+        }
       } catch {
+        if (cancelled) return;
         setError(true);
         if (ref.current) ref.current.innerHTML = "";
       }
     })();
+    return () => { cancelled = true; };
   }, [spec]);
 
   if (error) {

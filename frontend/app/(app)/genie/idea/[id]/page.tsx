@@ -27,7 +27,7 @@ import {
   FileTextIcon,
 } from "lucide-react";
 import type { IdeaCapsule, DiagramSpec, GeneratedArtifact, GenerationType } from "@/types";
-import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import MarkdownRenderer, { sanitizeMermaidSpec, sanitizeMermaidAggressive } from "@/components/ui/MarkdownRenderer";
 import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useAuthStore } from "@/store/auth";
 import { api } from "@/lib/api";
@@ -126,6 +126,7 @@ function MermaidDiagram({ spec }: { spec: string }) {
 
   useEffect(() => {
     setError(false);
+    let cancelled = false;
     (async () => {
       if (!ref.current) return;
       try {
@@ -149,8 +150,26 @@ function MermaidDiagram({ spec }: { spec: string }) {
           flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
           securityLevel: "loose",
         });
-        const id = `mermaid-${Math.random().toString(36).slice(2)}`;
-        const { svg } = await mermaid.render(id, spec);
+        const tryRender = async (source: string) => {
+          const id = `mermaid-${Math.random().toString(36).slice(2)}`;
+          return mermaid.render(id, source);
+        };
+        let svg: string | null = null;
+        try {
+          ({ svg } = await tryRender(sanitizeMermaidSpec(spec)));
+        } catch {
+          try {
+            ({ svg } = await tryRender(sanitizeMermaidAggressive(spec)));
+          } catch {
+            svg = null;
+          }
+        }
+        if (cancelled) return;
+        if (!svg) {
+          setError(true);
+          if (ref.current) ref.current.innerHTML = "";
+          return;
+        }
         if (!ref.current) return;
         ref.current.innerHTML = svg;
         const svgEl = ref.current.querySelector("svg");
@@ -172,10 +191,12 @@ function MermaidDiagram({ spec }: { spec: string }) {
         svgEl.style.cssText = `width:100%;height:${nh}px;display:block;`;
         setHeight(nh);
       } catch {
+        if (cancelled) return;
         setError(true);
         if (ref.current) ref.current.innerHTML = "";
       }
     })();
+    return () => { cancelled = true; };
   }, [spec]);
 
   if (error) {
