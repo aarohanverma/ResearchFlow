@@ -112,9 +112,19 @@ function MermaidBlock({ spec }: { spec: string }) {
           },
           flowchart: { htmlLabels: true, curve: "basis" },
           securityLevel: "loose",
+          // Suppress mermaid's auto-injected "Syntax error in text" bomb SVG.
+          // We handle errors ourselves with a graceful fallback.
+          suppressErrorRendering: true,
         });
+        // Belt-and-suspenders: even with suppressErrorRendering, older paths can
+        // still call parseError. Override to no-op so nothing surfaces.
+        try { (mermaid as unknown as { parseError?: (...a: unknown[]) => void }).parseError = () => {}; } catch {}
 
         const tryRender = async (source: string) => {
+          // Pre-validate. parse() with suppressErrors returns false on bad input
+          // instead of throwing AND injecting the bomb SVG.
+          const ok = await mermaid.parse(source, { suppressErrors: true });
+          if (ok === false) throw new Error("mermaid parse failed");
           const id = `mermaid-${Math.random().toString(36).slice(2)}`;
           return mermaid.render(id, source);
         };
@@ -130,6 +140,11 @@ function MermaidBlock({ spec }: { spec: string }) {
             svg = null;
           }
         }
+        // Defensive sweep: remove any stray bomb SVGs mermaid may have left in
+        // the document body from older or concurrent renders.
+        try {
+          document.querySelectorAll('svg[aria-roledescription="error"], #mermaid-error-icon').forEach(n => n.remove());
+        } catch {}
         if (cancelled) return;
         if (svg && ref.current) {
           ref.current.innerHTML = svg;

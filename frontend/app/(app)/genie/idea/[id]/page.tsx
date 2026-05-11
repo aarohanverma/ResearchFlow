@@ -149,8 +149,12 @@ function MermaidDiagram({ spec }: { spec: string }) {
           },
           flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
           securityLevel: "loose",
+          suppressErrorRendering: true,
         });
+        try { (mermaid as unknown as { parseError?: (...a: unknown[]) => void }).parseError = () => {}; } catch {}
         const tryRender = async (source: string) => {
+          const ok = await mermaid.parse(source, { suppressErrors: true });
+          if (ok === false) throw new Error("mermaid parse failed");
           const id = `mermaid-${Math.random().toString(36).slice(2)}`;
           return mermaid.render(id, source);
         };
@@ -164,6 +168,9 @@ function MermaidDiagram({ spec }: { spec: string }) {
             svg = null;
           }
         }
+        try {
+          document.querySelectorAll('svg[aria-roledescription="error"], #mermaid-error-icon').forEach(n => n.remove());
+        } catch {}
         if (cancelled) return;
         if (!svg) {
           setError(true);

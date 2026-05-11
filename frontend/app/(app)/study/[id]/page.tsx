@@ -761,10 +761,22 @@ async function getMermaid() {
       },
       flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
       securityLevel: "loose",
+      // Suppress mermaid's auto-injected "Syntax error in text" bomb SVG.
+      // We handle errors via our own fallback UI.
+      suppressErrorRendering: true,
     });
+    try { (_mermaidInstance as unknown as { parseError?: (...a: unknown[]) => void }).parseError = () => {}; } catch {}
     _mermaidReady = true;
   }
   return _mermaidInstance;
+}
+
+/** Pre-validate a spec without throwing or injecting the bomb SVG. */
+async function safeMermaidParse(m: typeof import("mermaid").default, source: string): Promise<boolean> {
+  try {
+    const ok = await m.parse(source, { suppressErrors: true });
+    return ok !== false;
+  } catch { return false; }
 }
 
 function stripMermaidFences(raw: string): string {
@@ -858,36 +870,35 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
       const id = `mermaid-${++_mermaidCounter}`;
 
       let svg = "";
-      try {
-        const mermaid = await getMermaid();
-        ({ svg } = await mermaid.render(id, clean));
-      } catch (firstErr) {
-        // Retry 1: strip everything before the first diagram keyword
-        // (handles LLM-prepended prose before the spec).
-        let recovered = false;
+      const mermaid = await getMermaid();
+      const tryRender = async (source: string, suffix: string): Promise<string | null> => {
+        if (!(await safeMermaidParse(mermaid, source))) return null;
         try {
-          const mermaid = await getMermaid();
-          const match = clean.match(/(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph|mindmap|timeline)[\s\S]*/i);
-          if (match) {
-            ({ svg } = await mermaid.render(`${id}r`, match[0].trim()));
-            recovered = true;
-          }
-        } catch { /* fall through to aggressive */ }
+          const r = await mermaid.render(`${id}${suffix}`, source);
+          return r.svg;
+        } catch { return null; }
+      };
 
-        // Retry 2: quote every node label so stray brackets/parens become literals.
-        if (!recovered) {
-          try {
-            const mermaid = await getMermaid();
-            ({ svg } = await mermaid.render(`${id}q`, quoteAllLabels(clean)));
-            recovered = true;
-          } catch { /* give up */ }
-        }
+      svg = (await tryRender(clean, "")) ?? "";
 
-        if (!recovered) {
-          if (!cancelRef.current) setError(true);
-          return;
-        }
-        void firstErr;
+      // Retry 1: strip leading prose before the first diagram keyword.
+      if (!svg) {
+        const match = clean.match(/(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph|mindmap|timeline)[\s\S]*/i);
+        if (match) svg = (await tryRender(match[0].trim(), "r")) ?? "";
+      }
+
+      // Retry 2: quote every node label so stray brackets/parens become literals.
+      if (!svg) {
+        svg = (await tryRender(quoteAllLabels(clean), "q")) ?? "";
+      }
+
+      if (!svg) {
+        if (!cancelRef.current) setError(true);
+        // Defensive sweep for any bomb SVGs other code paths might have left behind.
+        try {
+          document.querySelectorAll('svg[aria-roledescription="error"], #mermaid-error-icon').forEach(n => n.remove());
+        } catch {}
+        return;
       }
 
       // Guard: component may have unmounted during the await
