@@ -468,6 +468,10 @@ export const useJobsStore = create<JobsStore>()(
         genieJobs: state.genieJobs,
         graphBuildJobs: state.graphBuildJobs,
         pinnedJobKeys: state.pinnedJobKeys,
+        // Persist dismissals — without these the backend re-serves dismissed
+        // rows on hard reload and the notification returns.
+        dismissedStudyJobIds: state.dismissedStudyJobIds,
+        dismissedArtifactIds: state.dismissedArtifactIds,
       }),
     }
   )
