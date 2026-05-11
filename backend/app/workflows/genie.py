@@ -1603,13 +1603,25 @@ async def run_deep_dive(capsule_id: str, user_id: str) -> AsyncIterator[str]:
         # Fetch full content of up to 8 papers — all chunks, no truncation.
         # 8 papers × ~6k tokens each fits comfortably in a 128k-context window.
         paper_meta: list[dict] = []  # bibliography entries
+        # Dedup by external_id: Paper is unique on (external_id, namespace_key), so a
+        # cross-listed arXiv paper produces multiple rows. Without this, the bibliography
+        # shows the same reference 2-3 times.
+        seen_external_ids: set[str] = set()
+        idx = 0
 
-        for idx, pid in enumerate(list(source_paper_ids)[:8], 1):
+        for pid in list(source_paper_ids):
+            if len(paper_meta) >= 8:
+                break
             try:
                 paper_result = await db.execute(select(Paper).where(Paper.id == pid))
                 paper = paper_result.scalar_one_or_none()
                 if not paper:
                     continue
+                ext_key = paper.external_id or str(paper.id)
+                if ext_key in seen_external_ids:
+                    continue
+                seen_external_ids.add(ext_key)
+                idx += 1
 
                 year = paper.published_at.year if paper.published_at else "n.d."
                 url = paper.source_url or f"https://arxiv.org/abs/{paper.external_id}"

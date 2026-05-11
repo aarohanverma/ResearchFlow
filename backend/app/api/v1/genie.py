@@ -1459,18 +1459,28 @@ async def _resolve_source_papers(capsule: IdeaCapsule, db) -> list[SourcePaperIn
         return []
 
     # Single batch query instead of one query per paper_id.
+    # Dedup by external_id — the same arXiv paper can exist as multiple Paper rows
+    # (uniqueness is (external_id, namespace_key)) when cross-listed across categories.
+    # Without this dedup the UI shows the same paper 2-3 times in Source Papers.
     source_papers: list[SourcePaperInfo] = []
-    pid_list = list(paper_ids)[:10]
+    pid_list = list(paper_ids)
     if pid_list:
         batch_rows = await db.execute(
-            select(Paper.id, Paper.title, Paper.authors, Paper.published_at, Paper.source_url)
+            select(Paper.id, Paper.external_id, Paper.title, Paper.authors, Paper.published_at, Paper.source_url)
             .where(Paper.id.in_(pid_list))
         )
+        seen_external: set[str] = set()
         for r in batch_rows.fetchall():
+            key = r.external_id or str(r.id)
+            if key in seen_external:
+                continue
+            seen_external.add(key)
             year = r.published_at.year if r.published_at else None
             source_papers.append(SourcePaperInfo(
                 id=str(r.id), title=r.title, authors=r.authors or [], year=year, url=r.source_url,
             ))
+            if len(source_papers) >= 10:
+                break
     return source_papers
 
 
