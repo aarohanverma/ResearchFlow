@@ -1,11 +1,13 @@
-RESEARCHFLOW LICENSE
+RESEARCHFLOW LICENCE
 Source-Available · Permission-Gated · Royalty-Bearing · Attribution-Required
 
 Copyright (c) 2026 Aarohan Verma. All Rights Reserved.
 
-THIS IS NOT AN OPEN-SOURCE LICENSE. IT DOES NOT GRANT THE FREEDOMS OF
-MIT, APACHE, BSD, GPL, OR ANY OSI-APPROVED LICENSE. BY ACCESSING THIS
-REPOSITORY YOU AGREE TO THE TERMS BELOW.
+THIS IS NOT AN OPEN-SOURCE LICENCE. IT DOES NOT GRANT THE FREEDOMS OF
+MIT, APACHE, BSD, GPL, OR ANY OSI-APPROVED LICENCE. BY ACCESSING,
+FORKING, CLONING, COPYING, OR USING THIS REPOSITORY YOU AGREE TO THE
+TERMS BELOW. THIS LICENCE IS GOVERNED BY THE LAWS OF THE REPUBLIC OF
+INDIA (SEE SECTION 12).
 
 ═══════════════════════════════════════════════════════════════════════
 SUMMARY (the three rules)
@@ -16,15 +18,17 @@ SUMMARY (the three rules)
            the Owner's sole discretion.
 
   RULE 2 — Any USE of the Software requires PAYMENT to the Owner —
-           a one-time license fee, recurring royalty, or full purchase
+           a one-time licence fee, recurring royalty, or full purchase
            of rights, as agreed in writing. This applies to ALL use,
            including personal, internal, non-profit, academic, and
            evaluation use. Permission to fork or clone (Rule 1) does
            NOT include the right to Use.
 
-  RULE 3 — Every grant under this license requires VISIBLE ATTRIBUTION
-           to "Aarohan Verma — ResearchFlow". Failure to attribute
-           voids all granted rights immediately.
+  RULE 3 — Every grant under this licence requires VISIBLE ATTRIBUTION
+           to "Aarohan Verma — ResearchFlow". This requirement is also
+           an exercise of the Owner's moral rights under Section 57 of
+           the Copyright Act, 1957. Failure to attribute voids all
+           granted rights immediately.
 
 The formal terms below govern. The summary is for clarity, not for
 legal interpretation.
@@ -33,18 +37,24 @@ legal interpretation.
 1. DEFINITIONS
 ═══════════════════════════════════════════════════════════════════════
 
-   "Software" means the source code, compiled artifacts, configuration,
+   "Software" means the source code, compiled artefacts, configuration,
    prompts, prompt templates, system designs, documentation,
    architecture diagrams, database schemas, and all other content in
    this repository, plus any future updates, modifications, or
-   derivative works thereof.
+   derivative works thereof. The Software is a "computer programme"
+   and a "literary work" within the meaning of Section 2(o) and
+   Section 2(ffc) of the Copyright Act, 1957.
 
-   "Owner" means Aarohan Verma, the sole copyright holder.
+   "Owner" means Aarohan Verma, an Indian national and the sole
+   author and first owner of the copyright in the Software within the
+   meaning of Section 17 of the Copyright Act, 1957.
 
    "Permission" means a written grant from the Owner — by email
-   from verma.aarohan@gmail.com or by a signed document — explicitly
-   authorising a named party to perform a specific act with respect
-   to the Software.
+   from verma.aarohan@gmail.com or by a signed document (including
+   an electronic record signed with a digital or electronic signature
+   under the Information Technology Act, 2000) — explicitly authorising
+   a named party to perform a specific act with respect to the
+   Software.
 
    "Use" means any of the following acts performed by any person or
    entity, in whole or in part, in any environment: executing;
@@ -53,9 +63,10 @@ legal interpretation.
    training, fine-tuning, or evaluating any machine-learning model
    on; or otherwise putting the Software into operational service.
 
-   "Derivative" means any fork, clone, modification, port,
+   "Derivative" means any fork, clone, modification, adaptation, port,
    translation, extension, plug-in, or other work based on the
-   Software in whole or in part.
+   Software in whole or in part, and includes any "adaptation" within
+   the meaning of Section 2(a) of the Copyright Act, 1957.
 
    "Attribution" means the visible credit specified in Section 5.
 
@@ -69,10 +80,12 @@ legal interpretation.
        for personal reading and reference;
 
    (b) Quote excerpts of the Software in reviews, criticism, academic
-       commentary, or technical writing, provided you include
-       Attribution as defined in Section 5.
+       commentary, or technical writing as fair dealing under
+       Section 52(1)(a) of the Copyright Act, 1957, provided you
+       include Attribution as defined in Section 5.
 
-   No other rights are granted by default.
+   No other rights are granted by default. Nothing in this Section 2
+   shall be construed to permit any Use as defined in Section 1.
 
 ═══════════════════════════════════════════════════════════════════════
 3. REQUIRES PERMISSION (Rule 1)
@@ -87,7 +100,8 @@ legal interpretation.
    (b) Cloning the repository for any purpose other than personal
        reading reference;
    (c) Mirroring or republishing the source code or any portion of it;
-   (d) Creating a Derivative.
+   (d) Creating a Derivative (an "adaptation" within the meaning of
+       Section 2(a) of the Copyright Act, 1957).
 
    Permission granted under this section is personal,
    non-transferable, and revocable. Permission to fork, clone, or
@@ -106,11 +120,18 @@ legal interpretation.
    (b) Payment to the Owner of one of the following, as agreed in
        writing between the Use Licensee and the Owner:
 
-           (i)   a one-time license fee for a defined scope of Use;
+           (i)   a one-time licence fee for a defined scope of Use;
            (ii)  a recurring royalty (per-user, per-seat,
                  per-deployment, per-revenue, or other agreed metric);
-           (iii) full purchase of the Software's IP rights at a
-                 negotiated price.
+           (iii) full assignment of the Software's copyright and
+                 related rights under Section 18 of the Copyright Act,
+                 1957, at a negotiated price.
+
+   All payments shall be made in Indian Rupees (INR) unless otherwise
+   agreed in writing, and shall be exclusive of all applicable Goods
+   and Services Tax (GST), Tax Deducted at Source (TDS), and other
+   statutory levies, which shall be borne by the Use Licensee in
+   addition to the licence fee or royalty.
 
    This requirement applies WITHOUT EXCEPTION to all categories of
    Use, including but not limited to:
@@ -123,7 +144,9 @@ legal interpretation.
          or non-paying third parties);
        - Non-profit, academic, research, and evaluation Use;
        - Educational Use (classroom, course, or institutional);
-       - Government Use (any governmental or quasi-governmental body).
+       - Government Use (any governmental or quasi-governmental body,
+         including Central Government, State Government, public-sector
+         undertakings, and statutory authorities).
 
    Permission previously granted under Section 3 (fork / clone /
    Derivative) does NOT grant any right under this Section 4. The
@@ -134,6 +157,16 @@ legal interpretation.
 ═══════════════════════════════════════════════════════════════════════
 5. ATTRIBUTION (Rule 3 — REQUIRED FOR EVERY GRANT)
 ═══════════════════════════════════════════════════════════════════════
+
+   The Owner asserts his special rights as the author of the Software
+   under Section 57 of the Copyright Act, 1957, including the right
+   to claim authorship (the right of paternity) and the right to
+   restrain or claim damages in respect of any distortion, mutilation,
+   modification, or other act in relation to the Software which would
+   be prejudicial to his honour or reputation (the right of
+   integrity). These moral rights subsist independently of, and in
+   addition to, the economic rights in the Software, and are not
+   waived by any assignment or licence.
 
    Every right granted under Sections 2, 3, or 4 is conditional on
    the following Attribution being maintained at all times:
@@ -170,8 +203,11 @@ legal interpretation.
 
    FAILURE TO MAINTAIN ATTRIBUTION at any of the above points
    automatically and immediately voids all rights granted under
-   this license without further notice. Continued Use after such
-   voiding constitutes copyright infringement.
+   this licence without further notice, and constitutes both
+   copyright infringement under Section 51 of the Copyright Act,
+   1957, and a violation of the Owner's moral rights under Section 57
+   thereof. Continued Use after such voiding constitutes a continuing
+   infringement.
 
 ═══════════════════════════════════════════════════════════════════════
 6. NO IMPLIED RIGHTS
@@ -186,35 +222,48 @@ legal interpretation.
 7. CONTACT FOR PERMISSION AND USE LICENSING
 ═══════════════════════════════════════════════════════════════════════
 
-   To request Permission (Section 3) or a Use License (Section 4):
+   To request Permission (Section 3) or a Use Licence (Section 4):
 
        Aarohan Verma
        verma.aarohan@gmail.com
 
    In your inquiry, please specify:
-       - Whether you are requesting Permission, a Use License, or both
+       - Whether you are requesting Permission, a Use Licence, or both
        - Intended scope (personal / internal / commercial / academic)
        - Deployment environment and expected user/seat count
        - Expected revenue scale, if commercial
-       - Preferred payment structure (one-time / royalty / purchase)
+       - Preferred payment structure (one-time / royalty / assignment)
+       - PAN / GSTIN, if you are an Indian entity or resident
 
 ═══════════════════════════════════════════════════════════════════════
 8. NO WARRANTY
 ═══════════════════════════════════════════════════════════════════════
 
    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   EXPRESS OR IMPLIED. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE
+   INDIAN LAW — INCLUDING THE SALE OF GOODS ACT, 1930, AND THE
+   CONSUMER PROTECTION ACT, 2019 — THE OWNER DISCLAIMS ALL IMPLIED
+   CONDITIONS AND WARRANTIES, INCLUDING THOSE OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, TITLE, QUIET ENJOYMENT, AND
    NON-INFRINGEMENT.
 
 ═══════════════════════════════════════════════════════════════════════
 9. LIMITATION OF LIABILITY
 ═══════════════════════════════════════════════════════════════════════
 
-   IN NO EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, LOST
-   PROFITS, LOST DATA, OR OTHER LIABILITY, WHETHER IN AN ACTION OF
-   CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
-   CONNECTION WITH ANY USE OR ATTEMPTED USE OF THE SOFTWARE.
+   TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE INDIAN LAW, IN NO
+   EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, LOST
+   PROFITS, LOST DATA, BUSINESS INTERRUPTION, OR ANY INDIRECT,
+   INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES,
+   WHETHER IN CONTRACT, TORT (INCLUDING NEGLIGENCE), OR UNDER ANY
+   OTHER LEGAL THEORY, ARISING FROM, OUT OF, OR IN CONNECTION WITH
+   ANY USE OR ATTEMPTED USE OF THE SOFTWARE.
+
+   THE OWNER'S AGGREGATE LIABILITY UNDER OR IN CONNECTION WITH THIS
+   LICENCE SHALL NOT, IN ANY EVENT, EXCEED THE TOTAL LICENCE FEES OR
+   ROYALTIES ACTUALLY PAID BY THE CLAIMANT TO THE OWNER UNDER THIS
+   LICENCE IN THE TWELVE (12) MONTHS PRECEDING THE EVENT GIVING RISE
+   TO THE CLAIM.
 
 ═══════════════════════════════════════════════════════════════════════
 10. ENFORCEMENT
@@ -222,27 +271,165 @@ legal interpretation.
 
    Unauthorised Use, unauthorised forking, unauthorised cloning,
    unauthorised creation of Derivatives, or failure to maintain
-   Attribution constitutes copyright infringement and may result in
-   civil and criminal penalties under applicable law, including but
-   not limited to 17 U.S.C. § 504 (United States), the Copyright,
-   Designs and Patents Act 1988 (United Kingdom), the Indian
-   Copyright Act 1957, and equivalent provisions in other
-   jurisdictions.
+   Attribution constitutes:
 
-   The Owner reserves the right to seek statutory damages, actual
-   damages, lost royalties, injunctive relief, and recovery of legal
-   fees from any party in violation of this license.
+   (a) infringement of copyright under Section 51 of the Copyright
+       Act, 1957, entitling the Owner to civil remedies under
+       Section 55 of the said Act, including injunction, damages,
+       and accounts of profits;
+
+   (b) a cognisable and non-bailable offence under Section 63 of the
+       Copyright Act, 1957, punishable with imprisonment for a term
+       not less than six (6) months and which may extend to three (3)
+       years, and with fine which shall not be less than fifty
+       thousand rupees and which may extend to two lakh rupees, with
+       enhanced penalties on second or subsequent conviction under
+       Section 63A;
+
+   (c) where the infringement involves the knowing use of an
+       infringing copy of a computer programme, an offence under
+       Section 63B of the Copyright Act, 1957;
+
+   (d) where applicable, an offence under Sections 65A (circumvention
+       of effective technological protection measures) and 65B
+       (removal or alteration of rights management information) of
+       the Copyright Act, 1957;
+
+   (e) where applicable, an offence under Section 65 (tampering with
+       computer source documents), Section 66 (computer-related
+       offences), and Section 66B (dishonestly receiving stolen
+       computer resource or communication device) of the Information
+       Technology Act, 2000, and an actionable wrong under Section 43
+       of the said Act; and
+
+   (f) where applicable, offences under the Bharatiya Nyaya Sanhita,
+       2023, including those relating to cheating and criminal breach
+       of trust.
+
+   The Owner reserves all rights and remedies available under Indian
+   law, including without limitation: permanent and interim injunctive
+   relief under Sections 36 to 42 of the Specific Relief Act, 1963,
+   and Order XXXIX of the Code of Civil Procedure, 1908; ex parte
+   Anton Piller and John Doe orders where appropriate; actual and
+   statutory damages; account of profits; delivery-up and destruction
+   of infringing copies under Section 58 of the Copyright Act, 1957;
+   recovery of legal costs on a full indemnity basis; and criminal
+   prosecution. Pursuit of one remedy shall not preclude the
+   simultaneous or subsequent pursuit of any other.
+
+   Nothing in this Section shall limit the Owner's right to enforce
+   this licence under the laws of any other jurisdiction in which an
+   infringement occurs or has effect.
 
 ═══════════════════════════════════════════════════════════════════════
-11. ENTIRE AGREEMENT
+11. ACCEPTANCE AND ELECTRONIC CONTRACT
 ═══════════════════════════════════════════════════════════════════════
 
-   This document constitutes the default license offered by the Owner
-   for the Software. A separately negotiated written license agreement
+   This licence constitutes a proposal by the Owner within the meaning
+   of Section 2(a) of the Indian Contract Act, 1872. By accessing,
+   forking, cloning, copying, modifying, or otherwise dealing with the
+   Software, you signify your acceptance of this proposal by conduct
+   under Section 8 of the Indian Contract Act, 1872, and a binding
+   contract is thereby formed between you and the Owner.
+
+   The parties acknowledge that this licence is a valid and
+   enforceable contract concluded by electronic means under
+   Section 10A of the Information Technology Act, 2000, and that no
+   contract shall be deemed unenforceable solely on the ground that
+   electronic records, electronic signatures, or digital signatures
+   were used for its formation.
+
+   If you do not agree to these terms, you must not access, fork,
+   clone, copy, modify, or otherwise deal with the Software in any
+   manner.
+
+═══════════════════════════════════════════════════════════════════════
+12. GOVERNING LAW
+═══════════════════════════════════════════════════════════════════════
+
+   This licence, and any dispute, claim, or controversy (whether
+   contractual or non-contractual) arising out of or in connection
+   with it, its subject matter, or its formation, shall be governed
+   by and construed in accordance with the laws of the Republic of
+   India, without regard to its conflict-of-laws principles.
+
+   The application of the United Nations Convention on Contracts for
+   the International Sale of Goods is expressly excluded.
+
+═══════════════════════════════════════════════════════════════════════
+13. DISPUTE RESOLUTION — ARBITRATION
+═══════════════════════════════════════════════════════════════════════
+
+   (a) Any dispute, controversy, difference, or claim arising out of
+       or in connection with this licence, including any question
+       regarding its existence, validity, breach, termination, or the
+       infringement of any intellectual property right relating to
+       the Software, shall be referred to and finally resolved by
+       arbitration under the Arbitration and Conciliation Act, 1996,
+       as amended from time to time.
+
+   (b) The arbitration shall be conducted by a sole arbitrator.
+       Failing agreement between the parties on the identity of the
+       sole arbitrator within thirty (30) days of a written request
+       to arbitrate, the arbitrator shall be appointed in accordance
+       with Section 11 of the Arbitration and Conciliation Act, 1996.
+
+   (c) The seat and venue of arbitration shall be Bengaluru,
+       Karnataka, India.
+
+   (d) The language of the arbitration shall be English.
+
+   (e) The arbitral award shall be final and binding on the parties
+       and shall be enforceable in any court of competent
+       jurisdiction.
+
+   (f) Notwithstanding the foregoing, the Owner shall be entitled at
+       any time, and without prejudice to the arbitration agreement,
+       to seek interim, urgent, or injunctive relief — including ex
+       parte and John Doe orders — from any court of competent
+       jurisdiction under Section 9 of the Arbitration and
+       Conciliation Act, 1996, or otherwise, to restrain or remedy
+       any actual or threatened infringement of the Owner's rights
+       in the Software.
+
+═══════════════════════════════════════════════════════════════════════
+14. JURISDICTION
+═══════════════════════════════════════════════════════════════════════
+
+   Subject to Section 13, the courts at Bengaluru, Karnataka, India,
+   shall have exclusive jurisdiction over any proceeding arising out
+   of or in connection with this licence, including any application
+   in aid of arbitration under the Arbitration and Conciliation Act,
+   1996, and any action for infringement of the Owner's intellectual
+   property rights in the Software. Each party irrevocably submits to
+   the exclusive jurisdiction of the said courts and waives any
+   objection on the grounds of venue, forum non conveniens, or any
+   similar ground.
+
+═══════════════════════════════════════════════════════════════════════
+15. SEVERABILITY
+═══════════════════════════════════════════════════════════════════════
+
+   If any provision of this licence is held by a court or arbitral
+   tribunal of competent jurisdiction to be invalid, illegal, or
+   unenforceable in whole or in part under any applicable law, such
+   provision (or the affected part thereof) shall be deemed modified
+   to the minimum extent necessary to render it valid, legal, and
+   enforceable, or, if no such modification is possible, shall be
+   severed from this licence. The remaining provisions shall continue
+   in full force and effect.
+
+═══════════════════════════════════════════════════════════════════════
+16. ENTIRE AGREEMENT
+═══════════════════════════════════════════════════════════════════════
+
+   This document constitutes the default licence offered by the Owner
+   for the Software. A separately negotiated written licence agreement
    between a named party and the Owner shall, for that named party,
    supersede this document to the extent of any conflict, but shall
-   not modify this document for any other party.
+   not modify this document for any other party. Headings are for
+   convenience only and shall not affect interpretation.
 
 ───────────────────────────────────────────────────────────────────────
 
-END OF LICENSE
+END OF LICENCE

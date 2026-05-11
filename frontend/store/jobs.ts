@@ -76,6 +76,9 @@ interface JobsStore {
   // polls never resurrect a row the user already dismissed.
   // Plain string[] so Zustand can serialize it (Set is not JSON-safe).
   dismissedArtifactIds: string[];
+  // Same idea for study jobs — /study/jobs returns the full list every poll,
+  // so dismissing locally without tracking the ID lets the next poll bring it back.
+  dismissedStudyJobIds: string[];
   // Per-job pin keys. Pinned jobs survive Clear All and cannot be dismissed.
   pinnedJobKeys: string[];
   unreadCount: number;
@@ -108,6 +111,7 @@ export const useJobsStore = create<JobsStore>()(
       generationJobs: [],
       deepDiveJobs: [],
       dismissedArtifactIds: [],
+      dismissedStudyJobIds: [],
       pinnedJobKeys: [],
       unreadCount: 0,
       lastSeenAt: null,
@@ -121,8 +125,10 @@ export const useJobsStore = create<JobsStore>()(
         if (w.__rf_fetchJobs_inflight) return;
         w.__rf_fetchJobs_inflight = true;
         try {
-          const jobs = await api.get<StudyJob[]>("/study/jobs");
-          const { lastSeenAt, genieJobs, graphBuildJobs, deepDiveJobs } = get();
+          const rawJobs = await api.get<StudyJob[]>("/study/jobs");
+          const { lastSeenAt, genieJobs, graphBuildJobs, deepDiveJobs, dismissedStudyJobIds } = get();
+          const dismissedStudySet = new Set(dismissedStudyJobIds);
+          const jobs = rawJobs.filter((j) => !dismissedStudySet.has(j.job_id));
 
           const updatedGenie = await Promise.all(
             genieJobs.map(async (gj) => {
@@ -267,8 +273,10 @@ export const useJobsStore = create<JobsStore>()(
             const finalGen = updatedGeneration.filter(
               (g) => !dropSet.has(g.artifact_id)
             );
+            const dropStudySet = new Set(s.dismissedStudyJobIds);
+            const finalJobs = jobs.filter((j) => !dropStudySet.has(j.job_id));
             return {
-              jobs,
+              jobs: finalJobs,
               genieJobs: updatedGenie,
               graphBuildJobs: updatedGraphBuilds,
               generationJobs: finalGen,
@@ -324,7 +332,12 @@ export const useJobsStore = create<JobsStore>()(
       dismissJob: (job_id) => {
         set((s) => {
           if (s.pinnedJobKeys.includes(job_id)) return s;
-          return { jobs: s.jobs.filter((j) => j.job_id !== job_id) };
+          return {
+            jobs: s.jobs.filter((j) => j.job_id !== job_id),
+            dismissedStudyJobIds: s.dismissedStudyJobIds.includes(job_id)
+              ? s.dismissedStudyJobIds
+              : [...s.dismissedStudyJobIds, job_id],
+          };
         });
       },
 
