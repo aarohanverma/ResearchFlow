@@ -19,6 +19,7 @@ export interface SearchResult {
   novelty_score: number;
   relevance_score: number;
   is_breakthrough: boolean;
+  is_manually_imported?: boolean;
   key_concepts: string[] | null;
   methods_used: string[] | null;
   implications: string | null;
@@ -79,6 +80,10 @@ export const MATCH_BADGE: Record<string, string> = {
 export function SearchBar({ namespace_keys, onResults, onClear }: Props) {
   const [query, setQuery]           = useState("");
   const [deepMode, setDeepMode]     = useState(false);
+  // arXiv MCP fetch is opt-in per-search: when on, the deep-search pipeline
+  // pulls fresh candidates from arXiv via MCP and imports non-duplicates into
+  // the user's feed. Off by default so heavy fetches are explicit.
+  const [arxivFetch, setArxivFetch] = useState(false);
   const [loading, setLoading]       = useState(false);
   const [deepStatus, setDeepStatus] = useState<"idle" | "validating" | "searching" | "reranking" | "done" | "failed">("idle");
   const [error, setError]           = useState<string | null>(null);
@@ -130,7 +135,12 @@ export function SearchBar({ namespace_keys, onResults, onClear }: Props) {
       latestQuery.current = q;
 
       try {
-        const body: Record<string, unknown> = { query: q, limit: 25 };
+        const body: Record<string, unknown> = {
+          query: q,
+          limit: 25,
+          include_arxiv_mcp: arxivFetch,
+          arxiv_max_results: arxivFetch ? 8 : 0,
+        };
         if (namespace_keys && namespace_keys.length > 0) {
           body.namespace_keys = namespace_keys;
         }
@@ -216,7 +226,7 @@ export function SearchBar({ namespace_keys, onResults, onClear }: Props) {
         onResults([], q);
       }
     },
-    [namespace_keys, onResults]
+    [namespace_keys, onResults, arxivFetch]
   );
 
   // ── Effect: debounce basic search, do nothing for deep mode ───────────────
@@ -302,6 +312,29 @@ export function SearchBar({ namespace_keys, onResults, onClear }: Props) {
               <span style={{ fontSize: "9px", color: "#a78bfa" }}>{deepLabel[deepStatus]}</span>
             </>
           )}
+          {/* Opt-in: also fetch fresh candidates from arXiv MCP and import
+              non-duplicates into the user's feed during this search. */}
+          <button
+            onClick={() => setArxivFetch(v => !v)}
+            disabled={loading}
+            title={arxivFetch
+              ? "arXiv MCP fetch enabled — non-duplicates will be imported into your feed."
+              : "Click to also pull fresh papers from arXiv into your feed during this search."}
+            style={{
+              marginLeft: "auto",
+              display: "flex", alignItems: "center", gap: 4,
+              padding: "2px 8px", borderRadius: 6, cursor: loading ? "not-allowed" : "pointer",
+              border: `1px solid ${arxivFetch ? "rgba(34,197,94,0.5)" : "rgba(55,65,81,0.6)"}`,
+              background: arxivFetch ? "rgba(34,197,94,0.12)" : "rgba(31,41,55,0.4)",
+              color: arxivFetch ? "#4ade80" : "#6b7280",
+              fontSize: "9px", fontWeight: 700, letterSpacing: "0.04em",
+              textTransform: "uppercase" as const,
+            }}
+            aria-pressed={arxivFetch}
+          >
+            <ZapIcon size={9} />
+            {arxivFetch ? "arXiv: on" : "arXiv: off"}
+          </button>
         </div>
       )}
 

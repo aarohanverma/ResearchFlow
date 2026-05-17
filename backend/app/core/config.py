@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     blob_backend: Literal["local", "azure"] = "local"
     blob_local_dir: str = str(Path.home() / ".cache" / "researchflow" / "blobs")
     azure_storage_connection_string: str = ""
+    # Container name for Azure Blob Storage. Operators must create this
+    # container in the target storage account before flipping
+    # BLOB_BACKEND=azure. Overridable per-deployment via AZURE_STORAGE_CONTAINER.
+    azure_storage_container: str = "researchflow"
 
     # ── JWT ───────────────────────────────────────────────────────────────────
     jwt_secret: str = "change-me-in-production"
@@ -66,9 +70,9 @@ class Settings(BaseSettings):
     default_llm_provider: Literal["openai", "anthropic", "google"] = "openai"
 
     # ── Embeddings ────────────────────────────────────────────────────────────
-    default_embedding_provider: Literal["gemini", "openai", "voyage"] = "gemini"
-    default_embedding_model: str = "gemini-embedding-2-preview"
-    default_embedding_dim: int = 768
+    default_embedding_provider: Literal["gemini", "openai", "voyage"] = "openai"
+    default_embedding_model: str = "text-embedding-3-large"
+    default_embedding_dim: int = 768  # OpenAI adapter requests 768-dim via Matryoshka truncation
     voyage_api_key: str = ""
 
     # ── Image Generation ──────────────────────────────────────────────────────
@@ -86,7 +90,7 @@ class Settings(BaseSettings):
     # ── Ingestion ─────────────────────────────────────────────────────────────
     ingestion_mode: Literal["rss", "mcp"] = "rss"
     arxiv_mcp_transport: Literal["stdio", "sse"] = "stdio"
-    arxiv_mcp_command: str = "uv run arxiv-mcp-server"
+    arxiv_mcp_command: str = "python -m arxiv_mcp_server --storage-path /data/papers"
     arxiv_mcp_url: str = "http://localhost:8765/sse"
 
     # ── Email ─────────────────────────────────────────────────────────────────
@@ -102,6 +106,11 @@ class Settings(BaseSettings):
     # ── Web Search (LLM tool) ─────────────────────────────────────────────────
     web_search_provider: Literal["duckduckgo", "tavily"] = "duckduckgo"
     tavily_api_key: str = ""
+
+    # ── Wolfram Alpha (RA computation tool) ───────────────────────────────────
+    # MCP: docker run -i --rm -e WOLFRAM_ALPHA_APP_ID=<key> mcp/wolfram-alpha
+    wolfram_mcp_command: str = ""
+    wolfram_alpha_app_id: str = ""  # fallback direct API key
 
     # ── Thresholds ────────────────────────────────────────────────────────────
     breakthrough_threshold: float = Field(default=0.88, ge=0.0, le=1.0)
@@ -120,6 +129,12 @@ class Settings(BaseSettings):
 
     # ── Slides (Marp) ─────────────────────────────────────────────────────────
     slides_provider: str = "marp"
+
+    # ── Namespace-specific research tool keys ─────────────────────────────────
+    fred_api_key: str = ""       # FRED macroeconomic data (econ/q-fin namespaces)
+    ads_api_token: str = ""      # NASA ADS astronomy search (astro-ph namespace)
+    nvd_api_key: str = ""        # NVD CVE database — improves rate limits; free without key
+    github_token: str = ""       # GitHub search — improves rate limits; free personal token works
 
 
 @lru_cache

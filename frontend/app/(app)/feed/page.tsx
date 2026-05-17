@@ -10,10 +10,12 @@ import type { SearchResult, DeepSearchMeta } from "@/components/feed/SearchBar";
 import {
   Loader2Icon, ExternalLinkIcon, SparklesIcon, BookmarkIcon,
   RefreshCwIcon, LinkIcon, ZapIcon, ChevronDownIcon, ChevronRightIcon,
+  PlusIcon, XIcon, CheckCircleIcon, EyeOffIcon,
 } from "lucide-react";
 import { cleanAbstract } from "@/lib/utils";
 import { useBookmarksStore } from "@/store/bookmarks";
 import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
+import { useJobsStore } from "@/store/jobs";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -312,6 +314,42 @@ function SuggestedPanel({ onSelectPaper }: { onSelectPaper: (p: Paper) => void }
   );
 }
 
+// ─── Ghost loading cards ──────────────────────────────────────────────────────
+
+function FeedGhostCards({ label }: { label?: string }) {
+  return (
+    <div className="rf-fade-in" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {label && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, color: "#4b5563", fontSize: "12px" }}>
+          <Loader2Icon className="animate-spin" size={13} style={{ color: "#818cf8" }} />
+          {label}
+        </div>
+      )}
+      {Array.from({ length: 5 }).map((_, i) => (
+        <div
+          key={i}
+          className="rf-ghost-card rf-slide-up"
+          style={{ animationDelay: `${i * 60}ms` }}
+        >
+          {/* Title */}
+          <div className="rf-ghost" style={{ height: 14, width: `${72 + (i % 3) * 8}%`, marginBottom: 10 }} />
+          {/* Abstract lines */}
+          <div className="rf-ghost" style={{ height: 10, width: "95%", marginBottom: 5 }} />
+          <div className="rf-ghost" style={{ height: 10, width: "80%", marginBottom: 10 }} />
+          {/* Footer row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div className="rf-ghost" style={{ height: 8, width: 80 }} />
+            <div className="rf-ghost" style={{ height: 8, width: 50 }} />
+            <div style={{ flex: 1 }} />
+            <div className="rf-ghost" style={{ height: 8, width: 40, borderRadius: 8 }} />
+            <div className="rf-ghost" style={{ height: 18, width: 18, borderRadius: 4 }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── Main Feed Page ───────────────────────────────────────────────────────────
 
 export default function FeedPage() {
@@ -332,13 +370,124 @@ export default function FeedPage() {
   const isSearching = searchResults !== null;
   const isDeepSearch = isSearching && deepMeta !== null;
 
+  // arXiv manual import
+  const [importOpen, setImportOpen] = useState(false);
+  const [importId, setImportId] = useState("");
+  const [importNs, setImportNs] = useState<string[]>([activeNs || "cs.AI"]);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importMsg, setImportMsg] = useState<string | null>(null);
+  // Synchronous ref guard — prevents double-submit from rapid Enter/click
+  const importingRef = useRef(false);
+  // Track job IDs spawned by this page instance so we refresh the feed exactly once on completion
+  const pendingImportJobIds = useRef<Set<string>>(new Set());
+
+  const { addArxivImportJob, arxivImportJobs } = useJobsStore();
+
+  async function handleImport() {
+    if (importingRef.current) return;
+    const trimmed = importId.trim();
+    if (!trimmed) return;
+    const namespaces = importNs.length > 0 ? importNs : [activeNs || "cs.AI"];
+    importingRef.current = true;
+    setImporting(true);
+    setImportError(null);
+    setImportMsg(null);
+    try {
+      const res = await api.post<{ jobs: Array<{ job_id: string; namespace_key: string }>; arxiv_id: string; title: string; message: string }>(
+        "/papers/import-arxiv",
+        { arxiv_id: trimmed, namespace_keys: namespaces },
+      );
+      setImportMsg(res.message);
+      setImportId("");
+      const now = new Date().toISOString();
+      for (const j of res.jobs) {
+        pendingImportJobIds.current.add(j.job_id);
+        addArxivImportJob({
+          job_id: j.job_id,
+          arxiv_id: res.arxiv_id,
+          title: res.title,
+          namespace_key: j.namespace_key,
+          status: "running",
+          summary: `Importing into ${j.namespace_key}`,
+          created_at: now,
+          completed_at: null,
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error
+        ? err.message
+        : (err as { detail?: string })?.detail || "Import failed — check the arXiv ID and try again.";
+      setImportError(msg);
+    } finally {
+      importingRef.current = false;
+      setImporting(false);
+    }
+  }
+
+  // Per-namespace hidden paper IDs
+  const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
+  const [showHiddenSection, setShowHiddenSection] = useState(false);
+
+  const loadHiddenIds = useCallback(async () => {
+    if (!selectedTopics.length) { setHiddenIds(new Set()); return; }
+    try {
+      const results = await Promise.allSettled(
+        selectedTopics.map(ns =>
+          api.get<string[]>(`/papers/hidden-ids?namespace_key=${encodeURIComponent(ns)}`)
+        )
+      );
+      const all = new Set<string>();
+      for (const r of results) {
+        if (r.status === "fulfilled") r.value.forEach(id => all.add(id));
+      }
+      setHiddenIds(all);
+    } catch {
+      setHiddenIds(new Set());
+    }
+  }, [selectedTopics]);
+
+  useEffect(() => { loadHiddenIds(); }, [loadHiddenIds]);
+
+  async function toggleHide(paperId: string, paperNs: string) {
+    const isCurrentlyHidden = hiddenIds.has(paperId);
+    // Optimistic update
+    setHiddenIds(prev => {
+      const next = new Set(prev);
+      if (isCurrentlyHidden) next.delete(paperId);
+      else next.add(paperId);
+      return next;
+    });
+    try {
+      const nsParam = `?namespace_key=${encodeURIComponent(paperNs)}`;
+      if (isCurrentlyHidden) {
+        await api.delete(`/papers/${paperId}/hide${nsParam}`);
+      } else {
+        await api.post(`/papers/${paperId}/hide${nsParam}`);
+      }
+    } catch {
+      // Revert on failure
+      setHiddenIds(prev => {
+        const next = new Set(prev);
+        if (isCurrentlyHidden) next.add(paperId);
+        else next.delete(paperId);
+        return next;
+      });
+    }
+  }
+
+  // Sequence counter — discard responses from stale concurrent loadFeed calls
+  const loadFeedSeqRef = useRef(0);
+
   const loadFeed = useCallback(async () => {
+    const seq = ++loadFeedSeqRef.current;
     setLoading(true);
     try {
-      // Fetch from all selected topics and merge
       const results = await Promise.allSettled(
         selectedTopics.map(ns => api.get<FeedResponse>(`/feed?namespace_key=${ns}&limit=20`))
       );
+      // Discard if a newer load has already started
+      if (seq !== loadFeedSeqRef.current) return;
       const allPapers: FeedItem[] = [];
       const seen = new Set<string>();
       for (const r of results) {
@@ -348,12 +497,26 @@ export default function FeedPage() {
           }
         }
       }
-      // Sort by score descending
       allPapers.sort((a, b) => b.score - a.score);
       setFeed(allPapers.slice(0, 60));
-    } catch (e) { console.error(e); }
-    setLoading(false);
+    } catch (e) {
+      if (seq === loadFeedSeqRef.current) console.error("loadFeed error:", e);
+    } finally {
+      if (seq === loadFeedSeqRef.current) setLoading(false);
+    }
   }, [selectedTopics]);
+
+  // When any tracked import job completes, refresh the feed once
+  useEffect(() => {
+    for (const job of arxivImportJobs) {
+      if (pendingImportJobIds.current.has(job.job_id) && (job.status === "completed" || job.status === "failed")) {
+        pendingImportJobIds.current.delete(job.job_id);
+        if (job.status === "completed") {
+          loadFeed().catch(() => {});
+        }
+      }
+    }
+  }, [arxivImportJobs, loadFeed]);
 
   // Ref to track the active refresh poll so it can be cancelled on unmount.
   const refreshPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -438,6 +601,10 @@ export default function FeedPage() {
 
   const filtered = isSearching ? searchResults! : feed;
 
+  // Split feed into visible and hidden papers (only when not searching)
+  const visibleFeed = !isSearching ? (filtered as FeedItem[]).filter(item => !hiddenIds.has(item.paper.id)) : [];
+  const hiddenFeed = !isSearching ? (filtered as FeedItem[]).filter(item => hiddenIds.has(item.paper.id)) : [];
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--rf-bg)" }}>
       {/* ── Header ── */}
@@ -460,7 +627,7 @@ export default function FeedPage() {
               </span>
             ))}
           </div>
-          {/* Refresh button */}
+          {/* Action buttons */}
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
             {refreshMsg && (
               <span style={{ fontSize: "10px", color: "#6b7280" }}>{refreshMsg}</span>
@@ -481,6 +648,21 @@ export default function FeedPage() {
             >
               <RefreshCwIcon size={12} className={refreshing ? "animate-spin" : ""} />
               {refreshing ? "Fetching…" : "Refresh"}
+            </button>
+            <button
+              onClick={() => { setImportOpen(true); setImportError(null); setImportMsg(null); setImportNs(activeNs ? [activeNs] : ["cs.AI"]); }}
+              title="Import paper by arXiv ID"
+              style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "5px 10px", borderRadius: 8, border: "1px solid rgba(16,185,129,0.3)",
+                background: "rgba(16,185,129,0.08)", color: "#34d399",
+                fontSize: "11px", fontWeight: 500, cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(16,185,129,0.16)"; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(16,185,129,0.08)"; }}
+            >
+              <PlusIcon size={12} />
+              Import
             </button>
           </div>
         </div>
@@ -525,45 +707,41 @@ export default function FeedPage() {
             )}
 
             {loading && !isSearching ? (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 200, color: "#4b5563", gap: 8 }}>
-                <Loader2Icon className="animate-spin" size={18} /> Loading feed…
-              </div>
+              <FeedGhostCards />
             ) : refreshing && !isSearching && filtered.length === 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 200, gap: 12, color: "#4b5563" }}>
-                <Loader2Icon className="animate-spin" size={22} style={{ color: "#818cf8" }} />
-                <p style={{ fontSize: "13px", color: "#6b7280", margin: 0 }}>Fetching papers from arXiv…</p>
-                {refreshMsg && refreshMsg !== "Fetching from arXiv…" && (
-                  <p style={{ fontSize: "11px", color: "#4b5563", margin: 0 }}>{refreshMsg}</p>
-                )}
-              </div>
+              <FeedGhostCards label="Fetching from arXiv…" />
             ) : isSearching ? (
               searchResults!.length === 0 ? (
-                <div style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
+                <div className="rf-fade-in" style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
                   <p style={{ fontSize: "15px", marginBottom: 6 }}>No results found</p>
                   <p style={{ fontSize: "12px" }}>Try different keywords or switch namespace.</p>
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {searchResults!.map(r => (
-                    <SearchResultCard
-                      key={r.paper_id} result={r}
-                      isSelected={selectedPaper?.id === r.paper_id}
-                      onClick={() => setSelectedPaper(selectedPaper?.id === r.paper_id ? null : searchResultToPaper(r))}
-                    />
+                  {searchResults!.filter(r => !hiddenIds.has(r.paper_id)).map((r, i) => (
+                    <div key={r.paper_id} className="rf-slide-up" style={{ animationDelay: `${i * 30}ms` }}>
+                      <SearchResultCard
+                        result={r}
+                        isSelected={selectedPaper?.id === r.paper_id}
+                        onClick={() => setSelectedPaper(selectedPaper?.id === r.paper_id ? null : searchResultToPaper(r))}
+                      />
+                    </div>
                   ))}
                 </div>
               )
             ) : filtered.length === 0 ? (
-              <div style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
+              <div className="rf-fade-in" style={{ textAlign: "center", padding: "60px 20px", color: "#4b5563" }}>
                 <p style={{ fontSize: "15px", marginBottom: 6 }}>No papers yet</p>
                 <p style={{ fontSize: "12px", marginBottom: 16 }}>Hit the Refresh button above to fetch the latest from arXiv.</p>
                 <button
                   onClick={handleRefresh}
                   disabled={refreshing}
+                  className="rf-btn"
                   style={{
                     padding: "8px 18px", borderRadius: 10, border: "1px solid rgba(99,102,241,0.4)",
                     background: "rgba(99,102,241,0.12)", color: "#818cf8",
                     fontSize: "12px", fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+                    transition: "all 0.15s",
                   }}
                 >
                   <RefreshCwIcon size={13} className={refreshing ? "animate-spin" : ""} />
@@ -572,14 +750,62 @@ export default function FeedPage() {
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {(filtered as FeedItem[]).map(item => (
+                {/* Visible papers */}
+                {visibleFeed.map(item => (
                   <PaperCard
-                    key={item.paper.id} item={item}
+                    key={item.paper.id}
+                    item={item}
                     isSelected={selectedPaper?.id === item.paper.id}
                     onClick={() => setSelectedPaper(selectedPaper?.id === item.paper.id ? null : item.paper)}
                     onFeedback={handleFeedback}
+                    isHidden={false}
+                    onHide={item.paper.is_manually_imported
+                      ? () => toggleHide(item.paper.id, item.paper.namespace_key)
+                      : undefined}
                   />
                 ))}
+
+                {/* Hidden papers section */}
+                {hiddenFeed.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    <button
+                      onClick={() => setShowHiddenSection(v => !v)}
+                      style={{
+                        width: "100%", display: "flex", alignItems: "center", gap: 8,
+                        padding: "8px 12px", borderRadius: 8,
+                        border: "1px solid var(--rf-border)", background: "transparent",
+                        color: "var(--rf-text5)", fontSize: "11px", fontWeight: 500,
+                        cursor: "pointer", transition: "all 0.15s",
+                      }}
+                    >
+                      <EyeOffIcon size={12} />
+                      {showHiddenSection ? "Hide" : "Show"} hidden papers ({hiddenFeed.length})
+                      <ChevronDownIcon
+                        size={12}
+                        style={{
+                          marginLeft: "auto",
+                          transform: showHiddenSection ? "rotate(180deg)" : "none",
+                          transition: "transform 0.2s ease",
+                        }}
+                      />
+                    </button>
+                    {showHiddenSection && (
+                      <div className="rf-slide-down" style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 10 }}>
+                        {hiddenFeed.map(item => (
+                          <PaperCard
+                            key={item.paper.id}
+                            item={item}
+                            isSelected={selectedPaper?.id === item.paper.id}
+                            onClick={() => setSelectedPaper(selectedPaper?.id === item.paper.id ? null : item.paper)}
+                            onFeedback={handleFeedback}
+                            isHidden={true}
+                            onHide={() => toggleHide(item.paper.id, item.paper.namespace_key)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -587,7 +813,7 @@ export default function FeedPage() {
 
         {/* Right panel */}
         {selectedPaper && (
-          <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+          <div className="rf-slide-in-right" style={{ display: "flex", height: "100%", overflow: "hidden" }}>
             <PaperPanel paper={selectedPaper} onClose={() => setSelectedPaper(null)} />
             {isBookmarked(selectedPaper.id) && (
               <RelatedPapersPanel paper={selectedPaper} onSelectPaper={p => setSelectedPaper(p)} />
@@ -595,6 +821,167 @@ export default function FeedPage() {
           </div>
         )}
       </div>
+
+      {/* ── Import arXiv Modal ── */}
+      {importOpen && (
+        <div
+          className="rf-overlay-enter"
+          onClick={() => { if (!importing) setImportOpen(false); }}
+          style={{
+            position: "fixed", inset: 0, zIndex: 100,
+            background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <div
+            className="rf-modal-enter"
+            onClick={e => e.stopPropagation()}
+            style={{
+              width: 420, borderRadius: 16,
+              border: "1px solid rgba(16,185,129,0.25)",
+              background: "rgba(6,12,22,0.97)",
+              boxShadow: "0 24px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04)",
+              padding: "24px 28px",
+            }}
+          >
+            {/* Header */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 8, background: "rgba(16,185,129,0.12)", border: "1px solid rgba(16,185,129,0.2)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <PlusIcon size={16} color="#34d399" />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: "14px", fontWeight: 700, color: "#f9fafb", margin: 0 }}>Import arXiv Paper</h3>
+                  <p style={{ fontSize: "10px", color: "#6b7280", margin: 0 }}>Full ingestion — enriched, embedded, indexed</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setImportOpen(false)}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "#4b5563", padding: 4, borderRadius: 6, display: "flex" }}
+              >
+                <XIcon size={16} />
+              </button>
+            </div>
+
+            {/* arXiv ID input */}
+            <div style={{ marginBottom: 14 }}>
+              <label style={{ display: "block", fontSize: "11px", fontWeight: 600, color: "#9ca3af", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                arXiv ID
+              </label>
+              <input
+                type="text"
+                value={importId}
+                onChange={e => { setImportId(e.target.value); setImportError(null); setImportMsg(null); }}
+                onKeyDown={e => { if (e.key === "Enter" && !importing) handleImport(); }}
+                placeholder="e.g. 1706.03762"
+                autoFocus
+                style={{
+                  width: "100%", padding: "9px 12px", borderRadius: 8,
+                  border: "1px solid rgba(55,65,81,0.6)", background: "rgba(17,24,39,0.8)",
+                  color: "#f9fafb", fontSize: "13px", fontFamily: "monospace",
+                  outline: "none", boxSizing: "border-box",
+                }}
+                onFocus={e => { (e.target as HTMLInputElement).style.borderColor = "rgba(16,185,129,0.5)"; }}
+                onBlur={e => { (e.target as HTMLInputElement).style.borderColor = "rgba(55,65,81,0.6)"; }}
+              />
+              <p style={{ fontSize: "10px", color: "#4b5563", marginTop: 5 }}>
+                Paste the number from arxiv.org/abs/<strong style={{ color: "#6b7280" }}>2305.12345</strong> — version suffix optional
+              </p>
+            </div>
+
+            {/* Namespace multi-select */}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <label style={{ fontSize: "11px", fontWeight: 600, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  Import into namespaces
+                </label>
+                <span style={{ fontSize: "10px", color: "#4b5563" }}>
+                  {importNs.length === 0 ? "none selected" : `${importNs.length} selected`}
+                </span>
+              </div>
+              <div style={{
+                maxHeight: 140, overflowY: "auto", borderRadius: 8,
+                border: "1px solid rgba(55,65,81,0.6)", background: "rgba(17,24,39,0.8)",
+                padding: "4px 0",
+              }}>
+                {NAMESPACE_TREE.flatMap(s => s.topics).map(t => {
+                  const checked = importNs.includes(t.key);
+                  return (
+                    <label
+                      key={t.key}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 8,
+                        padding: "5px 10px", cursor: "pointer",
+                        background: checked ? "rgba(16,185,129,0.08)" : "transparent",
+                        transition: "background 0.1s",
+                      }}
+                      onMouseEnter={e => { if (!checked) (e.currentTarget as HTMLLabelElement).style.background = "rgba(255,255,255,0.03)"; }}
+                      onMouseLeave={e => { (e.currentTarget as HTMLLabelElement).style.background = checked ? "rgba(16,185,129,0.08)" : "transparent"; }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => setImportNs(prev =>
+                          checked ? prev.filter(k => k !== t.key) : [...prev, t.key]
+                        )}
+                        style={{ accentColor: "#34d399", cursor: "pointer", flexShrink: 0 }}
+                      />
+                      <span style={{ fontSize: "11px", color: checked ? "#34d399" : "#9ca3af", fontFamily: "monospace" }}>{t.key}</span>
+                      <span style={{ fontSize: "10px", color: "#4b5563", flex: 1 }}>{t.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Status messages */}
+            {importError && (
+              <div style={{ padding: "8px 12px", borderRadius: 8, background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.25)", marginBottom: 14 }}>
+                <p style={{ fontSize: "11px", color: "#f87171", margin: 0 }}>{importError}</p>
+              </div>
+            )}
+            {importMsg && (
+              <div style={{ padding: "8px 12px", borderRadius: 8, background: "rgba(16,185,129,0.1)", border: "1px solid rgba(16,185,129,0.25)", marginBottom: 14, display: "flex", alignItems: "center", gap: 8 }}>
+                <CheckCircleIcon size={14} color="#34d399" />
+                <p style={{ fontSize: "11px", color: "#34d399", margin: 0 }}>{importMsg}</p>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={handleImport}
+                disabled={importing || !importId.trim() || importNs.length === 0}
+                style={{
+                  flex: 1, padding: "10px 0", borderRadius: 9,
+                  border: "1px solid rgba(16,185,129,0.35)",
+                  background: importing || !importId.trim() || importNs.length === 0 ? "rgba(16,185,129,0.05)" : "rgba(16,185,129,0.12)",
+                  color: importing || !importId.trim() || importNs.length === 0 ? "#4b5563" : "#34d399",
+                  fontSize: "12px", fontWeight: 600, cursor: importing || !importId.trim() || importNs.length === 0 ? "not-allowed" : "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+                  transition: "all 0.15s",
+                }}
+              >
+                {importing ? (
+                  <><Loader2Icon size={13} className="animate-spin" /> Importing…</>
+                ) : (
+                  <><PlusIcon size={13} /> Import &amp; Enrich</>
+                )}
+              </button>
+              <button
+                onClick={() => setImportOpen(false)}
+                style={{
+                  padding: "10px 18px", borderRadius: 9,
+                  border: "1px solid rgba(55,65,81,0.5)", background: "rgba(55,65,81,0.08)",
+                  color: "#6b7280", fontSize: "12px", cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -635,6 +1022,22 @@ function SearchResultCard({ result, isSelected, onClick }: { result: SearchResul
         <h3 style={{ fontSize: "12.5px", fontWeight: 600, color: "var(--rf-text1)", lineHeight: 1.4, flex: 1 }}>{result.title}</h3>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
           {isDeepResult && <RelevanceBar score={result.search_score} />}
+          {result.is_manually_imported && (
+            <span
+              title="You imported this paper manually"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 3,
+                padding: "1px 6px", borderRadius: 4,
+                border: "1px solid rgba(34,197,94,0.35)",
+                background: "rgba(34,197,94,0.08)",
+                color: "#4ade80", fontSize: "9px", fontWeight: 600,
+                letterSpacing: "0.04em", textTransform: "uppercase" as const,
+              }}
+            >
+              <PlusIcon size={8} />
+              Imported
+            </span>
+          )}
           <MatchTypeBadge type={result.match_type} />
         </div>
       </div>

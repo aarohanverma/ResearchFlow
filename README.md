@@ -85,6 +85,7 @@ It runs entirely on your own infrastructure — local Docker for development, fo
 | **Audio Podcast** | One-click podcast generation from any paper or Genie capsule. Multi-speaker HOST/EXPERT teaching conversation, expertise-adapted depth, orientation-shaped emphasis, OpenAI TTS voices. Runs in background; embeds in-page audio player when complete. |
 | **Slide Deck** | Marp-based slide deck generation. LLM plans and writes a presentation-grade deck (12–18 slides) with equations, results tables, diagrams, and methodology breakdown. Density guards prevent overflow. Rendered to standalone HTML via marp-cli (falls back to raw Markdown). |
 | **Annotations** | Highlight text in any paper and attach personal notes, accessible from the Paper Detail panel. |
+| **Research Assistant** | Persistent AI-native research workspace. Each session is a long-running investigation: messages, branching, background tool execution, retrieved papers, and synthesized artifacts all attached to one durable session. The assistant uses an LLM planner (with heuristic fallback) that selects from 30+ registered tools per turn — deep search, arXiv import, frontier scan, Genie synthesis, concept explanation, paper comparison, web search, domain-specific tools (PubMed, NASA ADS, INSPIRE HEP, FRED, NVD CVE, ClinicalTrials, GitHub, HuggingFace, Wolfram Alpha), and more. Each tool call writes a checkpointed `AssistantStep` row; a crashed worker resumes from the last completed step on restart. Sessions can be branched (up to 3 levels deep) from any message. Rolling conversation history is lazily compressed via LLM summarization. File uploads (PDF, image, DOCX, plain text, code) are parsed and attached as session-scoped context. Every assistant turn streams typed `AssistantEvent` objects over SSE. |
 | **Token Usage** | Per-call accounting of every LLM completion (input/output tokens, model, cost estimate, latency). Settings → **Token Usage** tab shows totals, daily bar chart, per-workflow and per-model breakdowns. Defaults to today; supports custom date ranges with quick presets (7 days, 30 days, year). |
 | **Settings** | Provider config, topic subscriptions, notifications, manual RSS refresh. |
 
@@ -639,8 +640,8 @@ asyncio.run(run_ingestion("cs.AI"))
 | `DEFAULT_CHEAP_MODEL` | `gpt-4o-mini` | ✗ | Fast model for query rewrite, intent classify, rerank, enrichment batches |
 | `DEFAULT_QUALITY_MODEL` | `gpt-5.4-mini` | ✗ | Mid-tier model for RAG synthesis, Genie hypothesize/critique |
 | `DEFAULT_REASONING_MODEL` | `gpt-5.4` | ✗ | Strong reasoning model for Genie elaborate, PoC code, Deep Dive article |
-| `DEFAULT_EMBEDDING_PROVIDER` | `gemini` | ✗ | `gemini` \| `openai` \| `voyage` |
-| `VOYAGE_API_KEY` | — | ✗ | Required only when `DEFAULT_EMBEDDING_PROVIDER=voyage` |
+| `DEFAULT_EMBEDDING_PROVIDER` | `openai` (code default — `gemini` when using the shipped `.env.example`) | ✗ | `gemini` \| `openai`. The `voyage` literal is reserved but the adapter is not shipped — selecting it falls back to OpenAI with a warning. |
+| `VOYAGE_API_KEY` | — | ✗ | Reserved for a future Voyage embedding adapter — has no runtime effect in this build. |
 | `DEFAULT_EMBEDDING_DIM` | `768` | ✗ | Must match the provider's output dimension |
 | `INGESTION_MODE` | `rss` | ✗ | `rss` \| `mcp` |
 | `CACHE_BACKEND` | `local` | ✗ | `local` \| `redis` |
@@ -653,12 +654,21 @@ asyncio.run(run_ingestion("cs.AI"))
 | `TAVILY_API_KEY` | — | ✗ | Required when `WEB_SEARCH_PROVIDER=tavily` |
 | `BREAKTHROUGH_THRESHOLD` | `0.88` | ✗ | Novelty score cutoff for breakthrough classification |
 | `ENVIRONMENT` | `local` | ✗ | `local` \| `azure` |
+| `AZURE_STORAGE_CONNECTION_STRING` | — | ✗* | *Required when `BLOB_BACKEND=azure` |
+| `AZURE_STORAGE_CONTAINER` | `researchflow` | ✗ | Container name when `BLOB_BACKEND=azure` — create it in the storage account first |
 | `DEBUG` | `false` | ✗ | Enables Swagger UI, SQL echo, `/debug/status`, request logs |
 | `LOG_LEVEL` | `INFO` | ✗ | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `JWT_SECRET` | — | ✓ | Change before any non-local deployment |
 | `CORS_ORIGINS` | `["http://localhost:3000"]` | ✗ | JSON array of allowed CORS origins |
 | `TTS_PROVIDER` | `openai` | ✗ | TTS provider for podcast generation (only `openai` currently) |
 | `TTS_MODEL` | `tts-1-hd` | ✗ | OpenAI TTS model: `tts-1` (fast) or `tts-1-hd` (higher quality) |
+| `SLIDES_PROVIDER` | `marp` | ✗ | Slides renderer (only `marp` currently); requires `marp-cli` on PATH |
+| `WOLFRAM_ALPHA_APP_ID` | — | ✗ | Wolfram Alpha API key — enables the RA `wolfram_alpha` tool |
+| `WOLFRAM_MCP_COMMAND` | — | ✗ | MCP server command for Wolfram Alpha (alternative to the direct key) |
+| `FRED_API_KEY` | — | ✗ | FRED macroeconomic data API key (econ / q-fin namespace tools) |
+| `ADS_API_TOKEN` | — | ✗ | NASA ADS astronomy search token (astro-ph namespace tools) |
+| `NVD_API_KEY` | — | ✗ | NVD CVE database key (cs namespace) — free without key; key raises rate limits |
+| `GITHUB_TOKEN` | — | ✗ | GitHub PAT for `github_search` tool — raises rate limit from 10 to 30 req/min |
 
 ---
 
@@ -743,6 +753,17 @@ That means horizontal autoscaling works out of the box on both clouds.
 
 ---
 
+## Vercel Deployment
+
+A `vercel.json` at the repo root wires the monorepo for Vercel's experimental services mode:
+
+- **Frontend** — Next.js at `/`
+- **Backend** — FastAPI Python serverless at `/_/backend`
+
+Set `NEXT_PUBLIC_API_URL=/_/backend` (no trailing slash) in the Vercel project's environment variables so the browser routes API calls through the same origin. All other env vars (LLM keys, `JWT_SECRET`, `DATABASE_URL`, etc.) are added in Vercel's dashboard under Settings → Environment Variables. The same stateless container guarantees apply — no local disk state, so a managed PostgreSQL + Redis is required.
+
+---
+
 ## Project Structure
 
 ```
@@ -811,9 +832,31 @@ research_flow/
 │       │   ├── podcast.py       # 5-node StateGraph + multi-turn segmented script + TTS
 │       │   ├── slides.py        # 4-node StateGraph + multi-turn batched Marp generation
 │       │   └── folder_consolidation.py # 3-node StateGraph: load → coherence → synthesize
+│       ├── assistant/           # Research Assistant — planner, orchestrator, tool registry
+│       │   ├── orchestrator.py  # Executes plans: step rows, parallel waves, guardrails, recovery
+│       │   ├── planner.py       # HeuristicPlanner (keyword-based fallback)
+│       │   ├── planner_llm.py   # LLMPlanner with structured JSON output + heuristic fallback
+│       │   ├── synthesizer.py   # Composes step results into block-rendered final message
+│       │   ├── events.py        # In-process SSE event bus (AssistantEvent)
+│       │   ├── scheduler.py     # submit(job_id) / cancel(job_id) — in-process task runner
+│       │   ├── recovery.py      # Startup reconciliation of orphaned running/pending tasks
+│       │   ├── step_cache.py    # Per-tool result cache (TTL-keyed, Redis or local)
+│       │   ├── session_metadata.py # Fire-and-forget session title + summary refresh
+│       │   ├── interest_updater.py # Updates UserInterestProfile from turn results
+│       │   └── tools/           # 30+ registered AssistantTool implementations
+│       │       ├── registry.py  # register_tool / get_tool / describe_for_planner
+│       │       ├── base.py      # AssistantTool protocol, ToolContext, ToolResult
+│       │       └── *.py         # deep_search, arxiv_import, arxiv_search, frontier_scan,
+│       │                        # concept_explain, compare_papers, genie_synthesize, genie_deep_dive,
+│       │                        # paper_qa, bookmarks_query, graph_build, graph_query, web_search,
+│       │                        # pubmed, inspire_hep, nasa_ads, fred, nvd_cve, clinicaltrials,
+│       │                        # github_search, huggingface_search, wolfram_alpha, wikipedia,
+│       │                        # semantic_scholar, crossref, unpaywall, papers_with_code, oeis,
+│       │                        # latex_parse, draft_section, research_trends, memory, media_generate
 │       ├── api/v1/              # FastAPI routers
 │       │   ├── auth.py · feed.py · papers.py · study.py · search.py
 │       │   ├── chat.py · bookmarks.py · graph.py · genie.py · settings.py
+│       │   ├── assistant.py     # /assistant — sessions, messages, steps, artifacts, attachments, SSE
 │       │   └── generate.py      # POST/GET /generate — media generation control plane
 │       └── scheduler/
 │           └── jobs.py          # APScheduler: nightly + weekly jobs
@@ -831,6 +874,7 @@ research_flow/
 │   │       ├── paper/           # Paper detail (slide-in panel)
 │   │       ├── genie/           # Idea Synthesizer + Ideas tab (Cauldron + auto-discovery)
 │   │       │   └── idea/[id]/   # Idea Capsule detail + Deep Dive
+│   │       ├── assistant/       # Research Assistant workspace (three-pane: sessions · chat · context)
 │   │       └── settings/        # Provider config, subscriptions, refresh
 │   ├── components/
 │   │   ├── feed/                # PaperCard, SearchBar, FeedFilters

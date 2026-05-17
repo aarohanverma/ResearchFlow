@@ -122,6 +122,7 @@ class UserProviderSettings(Base):
     encrypted_openai_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     encrypted_anthropic_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     encrypted_google_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    encrypted_wolfram_key: Mapped[str | None] = mapped_column(Text, nullable=True)  # Wolfram Alpha App ID
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

@@ -10,14 +10,16 @@ import {
   ClockIcon,
   FlaskConicalIcon,
   BookOpenIcon,
+  BotIcon,
   XIcon,
   SquareIcon,
   NetworkIcon,
   SparklesIcon,
   PinIcon,
   Trash2Icon,
+  DownloadIcon,
 } from "lucide-react";
-import { useJobsStore, type StudyJob, type GenieJob, type GraphBuildJob, type GenerationJob, type DeepDiveJob } from "@/store/jobs";
+import { useJobsStore, type StudyJob, type GenieJob, type GraphBuildJob, type GenerationJob, type DeepDiveJob, type AssistantJob, type ArxivImportJob } from "@/store/jobs";
 
 export function JobsNotification() {
   const router = useRouter();
@@ -25,10 +27,11 @@ export function JobsNotification() {
   const bellRef = useRef<HTMLDivElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const {
-    jobs, genieJobs, graphBuildJobs, generationJobs, deepDiveJobs,
+    jobs, genieJobs, graphBuildJobs, generationJobs, deepDiveJobs, assistantJobs, arxivImportJobs,
     unreadCount, lastSeenAt, pinnedJobKeys,
     fetchJobs, markRead, dismissGenieJob, dismissJob, cancelGenieJob,
-    dismissGraphBuildJob, dismissGenerationJob, cancelGenerationJob, dismissDeepDiveJob,
+    dismissGraphBuildJob, cancelGraphBuildJob, dismissGenerationJob, cancelGenerationJob, dismissDeepDiveJob,
+    cancelAssistantJob, dismissAssistantJob, dismissArxivImportJob,
     pinJob, unpinJob,
   } = useJobsStore();
 
@@ -38,17 +41,21 @@ export function JobsNotification() {
     // Pinned jobs are immune — dismiss only unpinned terminal-state jobs
     jobs.filter(j => !pinned.has(j.job_id) && (j.status === "done" || j.status === "error")).forEach(j => dismissJob(j.job_id));
     genieJobs.filter(g => !pinned.has(g.session_id) && (g.status === "done" || g.status === "done_empty" || g.status === "failed" || g.status === "cancelled")).forEach(g => dismissGenieJob(g.session_id));
-    graphBuildJobs.filter(g => !pinned.has(g.job_id) && (g.status === "done" || g.status === "failed")).forEach(g => dismissGraphBuildJob(g.job_id));
+    graphBuildJobs.filter(g => !pinned.has(g.job_id) && (g.status === "done" || g.status === "failed" || g.status === "cancelled")).forEach(g => dismissGraphBuildJob(g.job_id));
     generationJobs.filter(g => !pinned.has(g.artifact_id) && (g.status === "completed" || g.status === "failed")).forEach(g => dismissGenerationJob(g.artifact_id));
     deepDiveJobs.filter(d => !pinned.has(d.capsule_id) && (d.status === "done" || d.status === "failed")).forEach(d => dismissDeepDiveJob(d.capsule_id));
+    assistantJobs.filter(a => !pinned.has(a.job_id) && (a.status === "completed" || a.status === "failed" || a.status === "cancelled")).forEach(a => dismissAssistantJob(a.job_id));
+    arxivImportJobs.filter(a => !pinned.has(a.job_id) && (a.status === "completed" || a.status === "failed")).forEach(a => dismissArxivImportJob(a.job_id));
   }
 
   const hasAnyCompleted =
     jobs.some(j => !pinned.has(j.job_id) && (j.status === "done" || j.status === "error")) ||
     genieJobs.some(g => !pinned.has(g.session_id) && (g.status === "done" || g.status === "done_empty" || g.status === "failed" || g.status === "cancelled")) ||
-    graphBuildJobs.some(g => !pinned.has(g.job_id) && (g.status === "done" || g.status === "failed")) ||
+    graphBuildJobs.some(g => !pinned.has(g.job_id) && (g.status === "done" || g.status === "failed" || g.status === "cancelled")) ||
     generationJobs.some(g => !pinned.has(g.artifact_id) && (g.status === "completed" || g.status === "failed")) ||
-    deepDiveJobs.some(d => !pinned.has(d.capsule_id) && (d.status === "done" || d.status === "failed"));
+    deepDiveJobs.some(d => !pinned.has(d.capsule_id) && (d.status === "done" || d.status === "failed")) ||
+    assistantJobs.some(a => !pinned.has(a.job_id) && (a.status === "completed" || a.status === "failed" || a.status === "cancelled")) ||
+    arxivImportJobs.some(a => !pinned.has(a.job_id) && (a.status === "completed" || a.status === "failed"));
 
   // Adaptive poll cadence refs — updated without recreating the interval so
   // every status change doesn't tear down and rebuild the timer (interval thrash).
@@ -58,12 +65,14 @@ export function JobsNotification() {
     const hasShortPending =
       jobs.some((j) => j.status === "pending" || j.status === "running") ||
       genieJobs.some((g) => g.status === "pending" || g.status === "running") ||
-      graphBuildJobs.some((g) => g.status === "running");
+      graphBuildJobs.some((g) => g.status === "running") ||
+      arxivImportJobs.some((a) => a.status === "running");
     const hasMediaPending =
       generationJobs.some((g) => g.status === "queued" || g.status === "running") ||
-      deepDiveJobs.some((d) => d.status === "generating");
+      deepDiveJobs.some((d) => d.status === "generating") ||
+      assistantJobs.some((a) => a.status === "pending" || a.status === "running");
     cadenceRef.current = hasShortPending ? 4000 : hasMediaPending ? 12000 : 15000;
-  }, [jobs, genieJobs, graphBuildJobs, generationJobs, deepDiveJobs]);
+  }, [jobs, genieJobs, graphBuildJobs, generationJobs, deepDiveJobs, assistantJobs, arxivImportJobs]);
 
   useEffect(() => {
     fetchJobs();
@@ -110,13 +119,15 @@ export function JobsNotification() {
     });
   }
 
-  const totalJobs = jobs.length + genieJobs.length + graphBuildJobs.length + generationJobs.length + deepDiveJobs.length;
+  const totalJobs = jobs.length + genieJobs.length + graphBuildJobs.length + generationJobs.length + deepDiveJobs.length + assistantJobs.length + arxivImportJobs.length;
   const hasActive =
     jobs.some((j) => j.status === "running" || j.status === "pending") ||
     genieJobs.some((g) => g.status === "running" || g.status === "pending") ||
     graphBuildJobs.some((g) => g.status === "running") ||
     generationJobs.some((g) => g.status === "queued" || g.status === "running") ||
-    deepDiveJobs.some((d) => d.status === "generating");
+    deepDiveJobs.some((d) => d.status === "generating") ||
+    assistantJobs.some((a) => a.status === "pending" || a.status === "running") ||
+    arxivImportJobs.some((a) => a.status === "running");
 
   return (
     <div ref={bellRef} className="relative">
@@ -170,6 +181,56 @@ export function JobsNotification() {
               <p className="text-sm text-gray-600 text-center py-6">No jobs yet</p>
             )}
 
+            {/* Feed Import jobs */}
+            {arxivImportJobs.length > 0 && (
+              <>
+                <div className="px-4 py-2 border-b border-gray-800/60">
+                  <p className="text-[10px] text-gray-700 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                    <DownloadIcon size={10} className="text-emerald-600" />
+                    Feed Import
+                  </p>
+                </div>
+                <div className="divide-y divide-gray-800/40">
+                  {arxivImportJobs.map((job) => (
+                    <ArxivImportJobRow
+                      key={job.job_id}
+                      job={job}
+                      isPinned={pinned.has(job.job_id)}
+                      onDismiss={() => dismissArxivImportJob(job.job_id)}
+                      onPin={() => pinJob(job.job_id)}
+                      onUnpin={() => unpinJob(job.job_id)}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+
+            {/* Research Assistant jobs */}
+            {assistantJobs.length > 0 && (
+              <>
+                <div className="px-4 py-2 border-b border-gray-800/60">
+                  <p className="text-[10px] text-gray-700 font-semibold uppercase tracking-wider flex items-center gap-1.5">
+                    <BotIcon size={10} className="text-sky-600" />
+                    Research Assistant
+                  </p>
+                </div>
+                <div className="divide-y divide-gray-800/40">
+                  {assistantJobs.map((aj) => (
+                    <AssistantJobRow
+                      key={aj.job_id}
+                      job={aj}
+                      isPinned={pinned.has(aj.job_id)}
+                      onClick={() => { router.push(aj.href || `/assistant?session=${aj.session_id}`); setOpen(false); }}
+                      onCancel={() => cancelAssistantJob(aj.job_id)}
+                      onDismiss={() => dismissAssistantJob(aj.job_id)}
+                      onPin={() => pinJob(aj.job_id)}
+                      onUnpin={() => unpinJob(aj.job_id)}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+
             {/* Deep Dive generation jobs */}
             {deepDiveJobs.length > 0 && (
               <>
@@ -221,6 +282,7 @@ export function JobsNotification() {
                         isPinned={pinned.has(gid)}
                         onClick={() => { router.push("/graph"); setOpen(false); }}
                         onDismiss={() => jobs.forEach(j => dismissGraphBuildJob(j.job_id))}
+                        onCancel={() => jobs.forEach(j => cancelGraphBuildJob(j.job_id))}
                         onPin={() => pinJob(gid)}
                         onUnpin={() => unpinJob(gid)}
                       />
@@ -320,7 +382,7 @@ export function JobsNotification() {
 }
 
 function StatusIcon({ status }: { status: string }) {
-  if (status === "done") return <CheckCircleIcon size={13} className="text-emerald-400" />;
+  if (status === "done" || status === "completed") return <CheckCircleIcon size={13} className="text-emerald-400" />;
   if (status === "done_empty") return <CheckCircleIcon size={13} className="text-gray-600" />;
   if (status === "error" || status === "failed") return <XCircleIcon size={13} className="text-red-400" />;
   if (status === "cancelled") return <XCircleIcon size={13} className="text-gray-500" />;
@@ -329,7 +391,7 @@ function StatusIcon({ status }: { status: string }) {
 }
 
 function StatusLabel({ status }: { status: string }) {
-  if (status === "done") return <span className="text-emerald-400">Done — click to view</span>;
+  if (status === "done" || status === "completed") return <span className="text-emerald-400">Done — click to view</span>;
   if (status === "done_empty") return <span className="text-gray-500">Complete — no synthesis produced</span>;
   if (status === "error" || status === "failed") return <span className="text-red-400">Failed</span>;
   if (status === "cancelled") return <span className="text-gray-500">Cancelled</span>;
@@ -580,12 +642,109 @@ function DeepDiveJobRow({ job, isNew, isPinned, onClick, onDismiss, onPin, onUnp
   );
 }
 
+function AssistantJobRow({
+  job, isPinned, onClick, onCancel, onDismiss, onPin, onUnpin,
+}: {
+  job: AssistantJob;
+  isPinned?: boolean;
+  onClick: () => void;
+  onCancel: () => void;
+  onDismiss: () => void;
+  onPin: () => void;
+  onUnpin: () => void;
+}) {
+  const isActive = job.status === "pending" || job.status === "running";
+  const isClickable = !isActive;
+  return (
+    <div
+      onClick={isClickable ? onClick : undefined}
+      className={`px-4 py-3 flex items-start gap-3 transition-colors group ${isClickable ? "cursor-pointer hover:bg-gray-800/50" : "cursor-default"}`}
+    >
+      <div className="mt-0.5 shrink-0">
+        <StatusIcon status={job.status} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-gray-200 truncate">{job.title || "Research Assistant"}</p>
+        <p className="text-[10px] text-gray-500 mt-0.5 truncate">
+          {job.namespace_key ? `${job.namespace_key} · ` : ""}
+          <StatusLabel status={job.status} />
+        </p>
+        {job.summary && <p className="text-[10px] text-gray-600 mt-0.5 truncate">{job.summary}</p>}
+      </div>
+      <div className="mt-0.5 shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+        <button
+          onClick={(e) => { e.stopPropagation(); isPinned ? onUnpin() : onPin(); }}
+          className={`transition-colors ${isPinned ? "opacity-100 text-indigo-400 hover:text-indigo-300" : "text-gray-600 hover:text-indigo-400"}`}
+          title={isPinned ? "Unpin" : "Pin"}
+        >
+          <PinIcon size={11} className={isPinned ? "rotate-45" : ""} />
+        </button>
+        {isActive && (
+          <button onClick={(e) => { e.stopPropagation(); onCancel(); }}
+            className="text-red-500/70 hover:text-red-400 transition-colors" title="Stop assistant task">
+            <SquareIcon size={11} />
+          </button>
+        )}
+        {!isActive && !isPinned && (
+          <button onClick={(e) => { e.stopPropagation(); onDismiss(); }}
+            className="text-gray-600 hover:text-gray-400 transition-colors" title="Dismiss">
+            <XIcon size={12} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ArxivImportJobRow({ job, isPinned, onDismiss, onPin, onUnpin }: {
+  job: ArxivImportJob;
+  isPinned?: boolean;
+  onDismiss: () => void;
+  onPin: () => void;
+  onUnpin: () => void;
+}) {
+  const isActive = job.status === "running";
+  const uiStatus = job.status === "completed" ? "done" : job.status === "failed" ? "failed" : "running";
+  return (
+    <div className="px-4 py-3 flex items-start gap-3 transition-colors group cursor-default">
+      <div className="mt-0.5 shrink-0">
+        <StatusIcon status={uiStatus} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-gray-200 truncate">{job.title || job.arxiv_id}</p>
+        <p className="text-[10px] text-gray-500 mt-0.5 truncate font-mono">{job.namespace_key}</p>
+        <p className="text-[10px] text-gray-600 mt-0.5">
+          {uiStatus === "done"
+            ? <span className="text-emerald-400">Imported — check your feed</span>
+            : uiStatus === "failed"
+            ? <span className="text-red-400">{job.summary ?? "Failed"}</span>
+            : <span className="text-emerald-400 animate-pulse">Importing…</span>}
+        </p>
+      </div>
+      <div className="mt-0.5 shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+        <button onClick={(e) => { e.stopPropagation(); isPinned ? onUnpin() : onPin(); }}
+          className={`transition-colors ${isPinned ? "opacity-100 text-indigo-400 hover:text-indigo-300" : "text-gray-600 hover:text-indigo-400"}`}
+          title={isPinned ? "Unpin" : "Pin"}>
+          <PinIcon size={11} className={isPinned ? "rotate-45" : ""} />
+        </button>
+        {!isActive && !isPinned && (
+          <button onClick={(e) => { e.stopPropagation(); onDismiss(); }}
+            className="text-gray-600 hover:text-gray-400 transition-colors" title="Dismiss">
+            <XIcon size={12} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** Renders a single row for a *group* of namespace build jobs from the same click. */
-function GraphBuildGroupRow({ jobs, isPinned, onClick, onDismiss, onPin, onUnpin }: { jobs: GraphBuildJob[]; isPinned?: boolean; onClick: () => void; onDismiss: () => void; onPin: () => void; onUnpin: () => void }) {
+function GraphBuildGroupRow({ jobs, isPinned, onClick, onCancel, onDismiss, onPin, onUnpin }: { jobs: GraphBuildJob[]; isPinned?: boolean; onClick: () => void; onCancel: () => void; onDismiss: () => void; onPin: () => void; onUnpin: () => void }) {
   // Derive aggregate status: running > failed > done
   const anyRunning = jobs.some(j => j.status === "running");
   const anyFailed  = jobs.some(j => j.status === "failed");
-  const groupStatus = anyRunning ? "running" : anyFailed ? "failed" : "done";
+  const anyCancelled = jobs.some(j => j.status === "cancelled");
+  const groupStatus = anyRunning ? "running" : anyFailed ? "failed" : anyCancelled ? "cancelled" : "done";
   const isClickable = groupStatus === "done";
   const n = jobs.length;
   const doneCount = jobs.filter(j => j.status === "done").length;
@@ -616,6 +775,12 @@ function GraphBuildGroupRow({ jobs, isPinned, onClick, onDismiss, onPin, onUnpin
           title={isPinned ? "Unpin" : "Pin"}>
           <PinIcon size={11} className={isPinned ? "rotate-45" : ""} />
         </button>
+        {groupStatus === "running" && (
+          <button onClick={(e) => { e.stopPropagation(); onCancel(); }}
+            className="text-red-500/70 hover:text-red-400 transition-colors" title="Stop graph build">
+            <SquareIcon size={11} />
+          </button>
+        )}
         {groupStatus !== "running" && !isPinned && (
           <button onClick={(e) => { e.stopPropagation(); onDismiss(); }}
             className="text-gray-600 hover:text-gray-400 transition-colors" title="Dismiss">

@@ -10,8 +10,9 @@ Architecture Layers
 1. **Frontend** — Next.js 14, App Router, SSE stream consumer. Dev: ``next dev --turbo`` (Turbopack). Prod: ``next build && next start`` (pre-compiled, zero on-demand compilation).
 2. **API** — FastAPI async routers with Pydantic v2 validation
 3. **Workflows** — LangGraph ``StateGraph`` pipelines (Ingestion, Study, RAG, Genie, Deep Dive)
-4. **Adapters / Repositories** — Provider-agnostic interfaces; only layer touching the DB
-5. **Storage** — PostgreSQL 16 + pgvector (IVFFlat index, 768-dim Gemini embeddings)
+4. **Research Assistant** — Persistent agentic workspace: LLM planner → orchestrator → 30+ tool registry → synthesizer. Per-step checkpointing, SSE streaming, rolling history compression.
+5. **Adapters / Repositories** — Provider-agnostic interfaces; only layer touching the DB
+6. **Storage** — PostgreSQL 16 + pgvector (IVFFlat index, 768-dim embeddings)
 
 Key Design Principles
 ---------------------
@@ -95,6 +96,47 @@ node per group (proper-case preferred), redirects all edges from aliases to the
 canonical, and drops self-loops and duplicate edges.  This is a purely visual
 fix — the database is untouched.  A permanent cleanup requires the user to run
 **Clear All** followed by **Build Deep**.
+
+Research Assistant
+------------------
+
+The Research Assistant (``app.assistant``) is a persistent, agentic research workspace where
+each session is a long-running investigation backed by durable DB rows.
+
+Turn lifecycle:
+
+1. ``POST /assistant/sessions/{session_id}/messages`` creates an ``AssistantMessage`` and an
+   ``AssistantTask`` (job_id = UUID), then queues the task via ``scheduler.submit(job_id)``.
+2. The ``Orchestrator`` rehydrates session context (messages, history summary, user profile)
+   and optionally rewrites the user's query for better retrieval quality.
+3. ``LLMPlanner`` selects tools from the registry's JSON-schema view and returns a ``Plan``
+   (ordered list of ``PlannedStep``). ``HeuristicPlanner`` handles fallbacks.
+4. The orchestrator executes steps, writing one ``AssistantStep`` row per tool call. Completed
+   steps are skipped on replay (crash-safe resume).
+5. After each parallel wave the ``StepCache`` is consulted; pure tools are cached by
+   ``(tool, params_hash, user_id, namespace_key)`` with tool-specific TTLs.
+6. The ``Synthesizer`` grounds the final answer in step outputs and emits a ``blocks`` list
+   of typed UI elements (paper_grid, comparison_table, mermaid, web_results, etc.).
+7. All progress is published as ``AssistantEvent`` objects over the in-process SSE bus;
+   the frontend subscribes via ``GET /assistant/tasks/{job_id}/stream``.
+
+Guardrails (per turn):
+
+- Maximum 12 plan steps
+- 180 s per-step timeout
+- 3 consecutive empty execution waves → circuit-break and synthesize from available results
+- Duplicate tool+params combinations are deduplicated before execution
+
+Recovery: ``reconcile_orphans()`` (called in FastAPI lifespan startup) sweeps
+``running``/``pending`` tasks, resumes tasks younger than 2 hours, and fails the rest.
+
+Rolling history: once a session has more than 14 messages, the oldest turns are compressed
+into a ≤600-word summary stored in ``session.state["history_summary"]``.  The 10 most recent
+messages are always kept verbatim for context.
+
+Namespace packs: domain-specific tool overlays — PubMed for ``q-bio``, FRED for ``econ``,
+NASA ADS for ``astro-ph``, INSPIRE HEP for ``hep-*``, ClinicalTrials for clinical queries.
+Each pack adds its tools to the global set visible to the planner for sessions in that namespace.
 
 Token Usage Tracking
 --------------------

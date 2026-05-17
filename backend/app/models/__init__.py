@@ -1,5 +1,13 @@
 """Import all models so SQLAlchemy registers them on Base.metadata."""
 
+from app.models.assistant import (
+    AssistantArtifact,
+    AssistantAttachment,
+    AssistantMessage,
+    AssistantSession,
+    AssistantStep,
+    AssistantTask,
+)
 from app.models.genie import GenieElement, GenieSession, IdeaCapsule
 from app.models.graph import (
     KnowledgeEdge,
@@ -31,4 +39,6 @@ __all__ = [
     "WorkflowRun", "TokenUsage",
     "GenieElement", "IdeaCapsule", "GenieSession",
     "GeneratedArtifact",
+    "AssistantSession", "AssistantMessage", "AssistantTask", "AssistantStep",
+    "AssistantArtifact", "AssistantAttachment",
 ]

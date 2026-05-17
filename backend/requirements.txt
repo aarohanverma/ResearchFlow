@@ -24,6 +24,7 @@ langgraph-checkpoint==2.1.2
 langchain-core==0.3.36
 langsmith==0.2.3
 langchain-mcp-adapters==0.0.5
+arxiv-mcp-server==0.2.10        # in-process MCP server (matches mcp/arxiv-mcp-server image)
 
 # ─── Resilience ───────────────────────────────────────────────────────────────
 tenacity==9.0.0
@@ -42,16 +43,19 @@ pydantic-settings==2.7.0
 email-validator==2.2.0
 
 # ─── PDF Parsing ──────────────────────────────────────────────────────────────
-# Parser priority chain at runtime (graceful fallback at every tier):
-#   Docling (primary, structured) → Marker (high accuracy) → Gemini Vision (OCR)
+# Default parser: Marker (PDF_PARSER=marker). Runtime fallback chain:
+#   <chosen> → Marker (always in chain) → Gemini Vision → minimal placeholder
 #
-# Docling brings PyTorch transitively. The parser auto-detects CUDA at runtime
-# and uses the GPU when available; otherwise it runs on CPU. On CPU-only
-# servers you can install the slimmer CPU torch wheel:
+# Docling is opt-in (PDF_PARSER=docling). It provides richer section hierarchy,
+# tables, equations, and figures but pulls in PyTorch + EasyOCR which can spike
+# RAM by ~2 GB on first parse — unsuitable for small VMs without explicit opt-in.
+# Docling is NOT auto-added to the fallback chain to prevent silent OOM crashes.
+#
+# On CPU-only hosts install the slimmer CPU torch wheel before pip-installing:
 #   pip install docling --extra-index-url https://download.pytorch.org/whl/cpu
-docling==2.93.0            # primary parser — section hierarchy, tables, equations, figures
+docling==2.93.0            # opt-in parser (PDF_PARSER=docling) — rich structured output
 easyocr==1.7.2             # CPU/GPU OCR backend for Docling — handles scanned PDFs
-marker-pdf==0.3.10         # secondary parser — strong on two-column academic layouts
+marker-pdf==0.3.10         # DEFAULT parser — strong on two-column academic layouts, memory-safe
 pymupdf==1.27.2.3          # required by GeminiVisionFallback for page rendering
 
 # ─── Media Generation ─────────────────────────────────────────────────────────

@@ -42,6 +42,24 @@ module, class, and function in the backend.
    api/api.v1.bookmarks
    api/api.v1.settings
    api/api.v1.generate
+   api/api.v1.assistant
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Research Assistant
+
+   api/assistant.orchestrator
+   api/assistant.planner
+   api/assistant.planner_llm
+   api/assistant.synthesizer
+   api/assistant.events
+   api/assistant.scheduler
+   api/assistant.recovery
+   api/assistant.step_cache
+   api/assistant.session_metadata
+   api/assistant.interest_updater
+   api/assistant.tools.base
+   api/assistant.tools.registry
 
 .. toctree::
    :maxdepth: 3
@@ -54,6 +72,7 @@ module, class, and function in the backend.
    api/repositories.user
    api/repositories.workflow
    api/repositories.artifact
+   api/repositories.assistant
 
 .. toctree::
    :maxdepth: 3
@@ -66,6 +85,7 @@ module, class, and function in the backend.
    api/services.email_service
    api/services.content_loader
    api/services.job_store
+   api/services.research_assistant
 
 .. toctree::
    :maxdepth: 3
@@ -93,6 +113,7 @@ module, class, and function in the backend.
    api/models.user
    api/models.workflow
    api/models.artifact
+   api/models.assistant
 
 .. toctree::
    :maxdepth: 2

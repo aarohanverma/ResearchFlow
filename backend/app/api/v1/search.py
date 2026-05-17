@@ -248,6 +248,8 @@ async def deep_search(
         namespace_keys=body.namespace_keys,
         limit=body.limit,
         db=db,
+        include_arxiv_mcp=body.include_arxiv_mcp,
+        arxiv_max_results=body.arxiv_max_results,
     )
     # Apply the same minor orientation nudge as basic search.
     # Convert Pydantic objects → dicts first since _apply_orientation_nudge uses dict.get().
@@ -292,7 +294,7 @@ async def deep_search_background(
     await cache.set(
         f"ds_job:{job_id}",
         {"status": "pending", "query": body.query, "rewritten_query": None,
-         "results": None, "error": None, "cached": False},
+         "results": None, "error": None, "cached": False, "imported_count": 0},
         ttl_seconds=_DS_CACHE_TTL,
     )
 
@@ -305,6 +307,8 @@ async def deep_search_background(
             query=body.query,
             namespace_keys=body.namespace_keys,
             limit=body.limit,
+            include_arxiv_mcp=body.include_arxiv_mcp,
+            arxiv_max_results=body.arxiv_max_results,
         )
     )
     _background_tasks.add(task)
@@ -346,6 +350,7 @@ async def deep_search_status(job_id: str, user_id: CurrentUserID):
         results=data.get("results"),
         error=data.get("error"),
         cached=data.get("cached", False),
+        imported_count=int(data.get("imported_count", 0) or 0),
     )
 
 
@@ -359,6 +364,8 @@ async def _run_deep_search_background(
     query: str,
     namespace_keys: list[str] | None,
     limit: int,
+    include_arxiv_mcp: bool = True,
+    arxiv_max_results: int = 8,
 ) -> None:
     """Background wrapper — runs ``_run_deep_search`` and writes result to cache."""
     from app.db.session import async_session_factory
@@ -370,6 +377,8 @@ async def _run_deep_search_background(
                 namespace_keys=namespace_keys,
                 limit=limit,
                 db=db,
+                include_arxiv_mcp=include_arxiv_mcp,
+                arxiv_max_results=arxiv_max_results,
             )
         cache = get_cache()
         await cache.set(
@@ -382,6 +391,7 @@ async def _run_deep_search_background(
                             for r in (result.results or [])],
                 "error": result.error,
                 "cached": result.cached,
+                "imported_count": result.imported_count,
             },
             ttl_seconds=_DS_CACHE_TTL,
         )
@@ -391,7 +401,7 @@ async def _run_deep_search_background(
         await cache.set(
             f"ds_job:{job_id}",
             {"status": "failed", "query": query, "rewritten_query": None,
-             "results": None, "error": str(exc), "cached": False},
+             "results": None, "error": str(exc), "cached": False, "imported_count": 0},
             ttl_seconds=_DS_CACHE_TTL,
         )
 
@@ -403,6 +413,8 @@ async def _run_deep_search(
     namespace_keys: list[str] | None,
     limit: int,
     db: Any,
+    include_arxiv_mcp: bool = True,
+    arxiv_max_results: int = 8,
 ) -> DeepSearchJobResponse:
     """Core Deep Search pipeline: validate → rewrite → cache-check → retrieve → re-rank → cache-write.
 
@@ -444,6 +456,7 @@ async def _run_deep_search(
     set_workflow_context("deep_search")
     llm = get_llm_adapter()
     search_repo = SearchRepository(db)
+    imported_count = 0
 
     # ── Step 1 & 2: Validate + rewrite ────────────────────────────────────────
     ns_context = (
@@ -527,6 +540,7 @@ Return ONLY valid JSON."""
             rewritten_query=rewritten,
             results=cached_val.get("results", []),
             cached=True,
+            imported_count=0,
         )
 
     # ── Step 4: Embed query for fuzzy cache + semantic search ──────────────────
@@ -550,9 +564,30 @@ Return ONLY valid JSON."""
                 status="done",
                 query=query,
                 rewritten_query=rewritten,
-                results=fuzzy_result,
-                cached=True,
+            results=fuzzy_result,
+            cached=True,
+            imported_count=0,
+        )
+
+    # ── Optional external arXiv MCP import before local retrieval ─────────────
+    # arXiv MCP is an external retrieval primitive: it augments the saved feed,
+    # then internal keyword/vector/graph retrieval remains the source of truth.
+    if include_arxiv_mcp and arxiv_max_results > 0:
+        try:
+            from app.services.arxiv_import import ArxivImportService
+            import_ns = (namespace_keys or ["cs.AI"])[0]
+            importer = ArxivImportService(db)
+            new_papers, _skipped, _raw = await importer.import_search_results(
+                rewritten,
+                namespace_key=import_ns,
+                namespace_keys=namespace_keys or [import_ns],
+                max_results=arxiv_max_results,
             )
+            imported_count = len(new_papers)
+            if imported_count:
+                log.info("deep_search: arxiv_mcp imported=%d namespace=%s", imported_count, import_ns)
+        except Exception as exc:
+            log.warning("deep_search: arxiv_mcp import skipped: %s", exc)
 
     # ── Step 5a: Semantic retrieval ────────────────────────────────────────────
     sem_results: list[dict] = []
@@ -607,6 +642,7 @@ Return ONLY valid JSON."""
                         "novelty_score": p.novelty_score,
                         "relevance_score": p.relevance_score,
                         "is_breakthrough": p.is_breakthrough,
+                        "is_manually_imported": getattr(p, "is_manually_imported", False),
                         "key_concepts": p.key_concepts,
                         "methods_used": p.methods_used,
                         "implications": p.implications,
@@ -629,6 +665,7 @@ Return ONLY valid JSON."""
             results=[],
             cached=False,
             error=None,
+            imported_count=imported_count,
         )
 
     # ── Step 7: LLM re-rank ────────────────────────────────────────────────────
@@ -670,6 +707,7 @@ Return ONLY valid JSON."""
         rewritten_query=rewritten,
         results=serializable,
         cached=False,
+        imported_count=imported_count,
     )
 
 

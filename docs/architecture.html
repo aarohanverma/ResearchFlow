@@ -292,13 +292,25 @@ details[open] summary::before{transform:rotate(90deg)}
 
   <div class="nav-group">
     <div class="nav-group-label">Media Generation</div>
-    <a class="nav-link" href="#audit-fixes">Audit + Fix Pass</a>
+    <a class="nav-link" href="#audit-fixes">Cross-cutting guarantees</a>
     <a class="nav-link" href="#parser-layer">Parser Layer (Docling)</a>
     <a class="nav-link" href="#tts-adapter">TTS Adapter</a>
     <a class="nav-link" href="#slides-adapter">Slides Adapter (Marp)</a>
     <a class="nav-link" href="#generation-workflows">Generation Workflows</a>
     <a class="nav-link" href="#artifact-storage">Artifact Storage</a>
     <a class="nav-link" href="#generation-api">Generation API</a>
+  </div>
+
+  <div class="nav-group">
+    <div class="nav-group-label">Research Assistant</div>
+    <a class="nav-link" href="#ra-overview">RA Overview</a>
+    <a class="nav-link" href="#ra-schema">DB Schema</a>
+    <a class="nav-link" href="#ra-tools">Tool Registry</a>
+    <a class="nav-link" href="#ra-orchestrator">Orchestrator</a>
+    <a class="nav-link" href="#ra-planner">Planner</a>
+    <a class="nav-link" href="#ra-streaming">SSE Streaming</a>
+    <a class="nav-link" href="#ra-recovery">Recovery</a>
+    <a class="nav-link" href="#ra-api">API Surface</a>
   </div>
 </nav>
 
@@ -339,6 +351,7 @@ details[open] summary::before{transform:rotate(90deg)}
     <tr><td><strong>RAG Chat</strong></td><td>Query rewrite → intent classify → 3-tier scoped retrieval → graph augment → LLM rerank → Self-RAG check → cited synthesis</td><td><code>workflows/rag.py</code></td></tr>
     <tr><td><strong>Genie</strong></td><td>Seed elements → bridge discovery → hypothesis generation → LLM critique → elaboration → diagrams → PoC code → saved IdeaCapsule</td><td><code>workflows/genie.py</code></td></tr>
     <tr><td><strong>Deep Dive</strong></td><td>Single-pass: reasoning model writes a complete 11-section synthesis article grounded in the source paper text, streams tokens to the frontend, persists result to <code>idea_capsules.deep_dive_content</code></td><td><code>workflows/genie.py:run_deep_dive</code></td></tr>
+    <tr><td><strong>Research Assistant</strong></td><td>Persistent workspace per session. LLM planner selects from 30+ tools per turn; orchestrator executes steps in parallel waves, writes per-step checkpoint rows, synthesizes a block-rendered answer. Crashed workers resume from last completed step. Sessions branch up to 3 levels deep. File uploads (PDF, image, text, DOCX) parsed and attached as session context.</td><td><code>assistant/orchestrator.py</code> · <code>assistant/tools/</code></td></tr>
   </table>
 
   <div class="callout callout-anchor">
@@ -683,7 +696,7 @@ graph TB
 
   <h3>Entity-Relationship diagram (UML)</h3>
   <div class="diagram-wrap">
-    <div class="diagram-title">Full ER schema · 23 tables · key fields shown</div>
+    <div class="diagram-title">Full ER schema · 29 tables · key fields shown</div>
     <div class="mermaid">
 erDiagram
     users ||--o| user_provider_settings : "1:1 has"
@@ -715,6 +728,18 @@ erDiagram
     users ||--o{ query_log : "queries"
     papers ||--o{ feed_feedback : "rated as"
     users ||--o{ feed_feedback : "rates"
+
+    %% Research Assistant tables
+    users ||--o{ assistant_sessions : "owns"
+    assistant_sessions ||--o{ assistant_sessions : "branches"
+    assistant_sessions ||--o{ assistant_messages : "contains"
+    assistant_sessions ||--o{ assistant_tasks : "spawns"
+    assistant_messages ||--o| assistant_tasks : "produced by"
+    assistant_tasks ||--o{ assistant_steps : "consists of"
+    assistant_sessions ||--o{ assistant_attachments : "scopes"
+    papers ||--o{ assistant_attachments : "ref'd by"
+    assistant_sessions ||--o{ assistant_artifacts : "produces"
+    assistant_steps ||--o{ assistant_artifacts : "produces"
 
     users {
         uuid id PK
@@ -929,6 +954,81 @@ erDiagram
         uuid user_id FK
         uuid paper_id FK
         string feedback_type
+        timestamp created_at
+    }
+    assistant_sessions {
+        uuid id PK
+        uuid user_id FK
+        uuid parent_session_id FK
+        uuid branch_from_message_id
+        string title
+        string namespace_key
+        jsonb topic_keys
+        enum orientation
+        enum expertise_level
+        enum status
+        jsonb state
+        timestamp created_at
+        timestamp updated_at
+    }
+    assistant_messages {
+        uuid id PK
+        uuid session_id FK
+        enum role
+        text content
+        string message_type
+        jsonb citations
+        jsonb artifact_refs
+        jsonb payload
+        timestamp created_at
+    }
+    assistant_tasks {
+        uuid id PK
+        uuid session_id FK
+        uuid assistant_message_id FK
+        string job_id UK
+        enum status
+        int progress
+        text stage
+        text error
+        timestamp cancel_requested_at
+        timestamp started_at
+        timestamp completed_at
+    }
+    assistant_steps {
+        uuid id PK
+        uuid task_id FK
+        int step_index
+        string tool_name
+        enum status
+        jsonb input_params
+        jsonb output
+        jsonb cost
+        text summary
+        text error
+        timestamp started_at
+        timestamp completed_at
+    }
+    assistant_attachments {
+        uuid id PK
+        uuid session_id FK
+        enum kind
+        string label
+        text content
+        text url
+        uuid paper_id FK
+        jsonb metadata
+        timestamp created_at
+    }
+    assistant_artifacts {
+        uuid id PK
+        uuid session_id FK
+        uuid producing_step_id FK
+        enum kind
+        uuid ref_id
+        text preview
+        text href
+        jsonb metadata
         timestamp created_at
     }
     </div>
@@ -4766,6 +4866,7 @@ sequenceDiagram
   <table>
     <tr><th>Router</th><th>Prefix</th><th>File</th><th>What it exposes</th></tr>
     <tr><td><code>auth</code></td><td><code>/auth</code></td><td><code>api/v1/auth.py</code></td><td>register, login, /me</td></tr>
+    <tr><td><code>assistant</code></td><td><code>/assistant</code></td><td><code>api/v1/assistant.py</code></td><td>research workspace — sessions, messages, steps, artifacts, attachments, SSE turn streaming, arXiv import</td></tr>
     <tr><td><code>feed</code></td><td><code>/feed</code></td><td><code>api/v1/feed.py</code></td><td>scored timeline, like/dismiss feedback, manual refresh trigger</td></tr>
     <tr><td><code>papers</code></td><td><code>/papers</code></td><td><code>api/v1/papers.py</code></td><td>per-paper details, related papers</td></tr>
     <tr><td><code>search</code></td><td><code>/search</code></td><td><code>api/v1/search.py</code></td><td>hybrid search (RRF)</td></tr>
@@ -4893,6 +4994,657 @@ sequenceDiagram
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════════════════
+     SECTION · RESEARCH ASSISTANT
+═══════════════════════════════════════════════════════════════════════════ -->
+<div class="section" id="ra-overview">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Research Assistant — Persistent Agentic Workspace</h2>
+  <p>
+    The Research Assistant (RA) is a persistent, agentic research workspace implemented as a
+    first-class feature in ResearchFlow. Each <strong>session</strong> is a long-running investigation:
+    messages, branches, tool-execution steps, generated artifacts, and attached documents all live
+    under one durable database object. Users return to sessions over days or weeks; the assistant
+    picks up exactly where they left off, with full conversational history and checkpointed tool results.
+  </p>
+  <p>
+    Unlike a chatbot, the RA's intelligence is its <strong>planner</strong> and its power is its
+    <strong>tool surface</strong>. An LLM planner (with a heuristic fallback that never fails)
+    selects from 30+ registered tools per turn, groups them into parallel execution waves, and
+    then a synthesizer composes the step results into a block-rendered final message with inline citations.
+  </p>
+
+  <h3>Design principles (non-negotiable)</h3>
+  <ul>
+    <li><strong>Composability over re-implementation.</strong> Every RA capability wraps existing platform code (Deep Search, Genie, Study, RAG, embeddings, graph, media generation) — never duplicates it.</li>
+    <li><strong>Grounded by default.</strong> Every factual claim carries citations. Retrieval is always attempted before synthesis. Speculation is labelled.</li>
+    <li><strong>Transparent.</strong> Every tool call, its input params, output, and latency are stored as <code>AssistantStep</code> rows — inspectable by the frontend's reasoning-tree view.</li>
+    <li><strong>Async-first.</strong> No turn blocks the UI. Tools run as background coroutines; SSE streams typed events. Workers crash-safe via per-step checkpointing.</li>
+    <li><strong>Adaptive, never assumptive.</strong> Orientation and expertise bias prompt style and tool emphasis — they never gate features.</li>
+  </ul>
+
+  <div class="callout callout-info">
+    <div class="callout-title">📁 Source locations</div>
+    <p>
+      <code>backend/app/assistant/</code> — orchestrator, planner, synthesizer, events bus, scheduler, recovery, step cache, tools<br/>
+      <code>backend/app/services/research_assistant.py</code> — session/message/task bookkeeping<br/>
+      <code>backend/app/models/assistant.py</code> — all ORM models<br/>
+      <code>backend/app/repositories/assistant.py</code> — DB access layer<br/>
+      <code>backend/app/api/v1/assistant.py</code> — API router<br/>
+      <code>frontend/app/(app)/assistant/page.tsx</code> — three-pane workspace UI
+    </p>
+  </div>
+
+  <h3>Component diagram</h3>
+  <div class="diagram-wrap">
+    <div class="diagram-title">Research Assistant — high-level component view</div>
+    <div class="mermaid">
+flowchart LR
+    UI["Frontend<br/>assistant/page.tsx"]
+    API["FastAPI router<br/>/api/v1/assistant"]
+    SVC["ResearchAssistant<br/>service"]
+    SCHED["Scheduler<br/>(asyncio tasks)"]
+    ORCH["Orchestrator<br/>run_turn()"]
+    PLAN["LLMPlanner<br/>(+ HeuristicPlanner fallback)"]
+    REG[("Tool Registry<br/>30+ tools")]
+    CACHE[("StepCache<br/>per-tool TTL")]
+    SYN["Synthesizer<br/>(stream + blocks)"]
+    BUS{{"AssistantEvent bus<br/>(in-process pub/sub)"}}
+    SSE["SSE stream<br/>/tasks/{id}/stream"]
+    REC["Recovery<br/>reconcile_orphans()"]
+    DB[("PostgreSQL<br/>assistant_* tables")]
+
+    UI -- "POST /messages" --> API
+    UI -- "GET /stream (SSE)" --> SSE
+    API --> SVC
+    SVC -- "persist + queue" --> SCHED
+    SCHED --> ORCH
+    ORCH --> PLAN
+    PLAN -- "schema view" --> REG
+    ORCH -- "execute waves" --> REG
+    REG --> CACHE
+    REG --> DB
+    ORCH --> SYN
+    ORCH -- "publish" --> BUS
+    SYN -- "publish" --> BUS
+    BUS --> SSE
+    ORCH <--> DB
+    REC -- "on startup" --> DB
+    REC --> SCHED
+    </div>
+  </div>
+
+  <h3>Turn lifecycle (state diagram)</h3>
+  <div class="diagram-wrap">
+    <div class="diagram-title">9-step turn lifecycle — every assistant reply follows this path</div>
+    <div class="mermaid">
+stateDiagram-v2
+    [*] --> load_context
+    load_context: Load session, history,<br/>memory, profile, disabled tools
+    load_context --> off_topic_guard
+    off_topic_guard: Regex detects clearly<br/>non-research queries
+    off_topic_guard --> direct_reply: off-topic
+    off_topic_guard --> query_rewrite: on-topic
+    query_rewrite: LLM-rewrites short/<br/>ambiguous queries
+    query_rewrite --> plan
+    plan: LLMPlanner.aplan() →<br/>Plan{steps, rationale}
+    plan --> execute
+    execute: Parallel waves +<br/>sequential steps
+    execute --> coverage_guard
+    coverage_guard: Auto-import arXiv when<br/>corpus &lt; 2 papers
+    coverage_guard --> synthesize
+    synthesize: Token stream + typed<br/>blocks via SSE
+    synthesize --> finalize
+    finalize: Update message,<br/>complete task, jobstore
+    finalize --> fire_and_forget
+    fire_and_forget: Session metadata,<br/>interest profile (non-blocking)
+    fire_and_forget --> [*]
+    direct_reply --> [*]
+
+    note right of execute
+      Guardrails:
+      • Max 12 steps
+      • 180 s/step timeout
+      • 3 empty waves → break
+      • Dedup tool+params
+      • Cancel check every wave
+    end note
+    </div>
+  </div>
+
+  <h3>Sequence diagram — message → SSE stream → final blocks</h3>
+  <div class="diagram-wrap">
+    <div class="diagram-title">What happens between &quot;Send&quot; and the rendered answer</div>
+    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant FE as Frontend
+    participant API as FastAPI
+    participant SVC as RA Service
+    participant SCH as Scheduler
+    participant ORC as Orchestrator
+    participant PL as Planner
+    participant T as Tool(s)
+    participant SY as Synthesizer
+    participant DB as PostgreSQL
+    participant BUS as Event Bus
+
+    U->>FE: type message + Send
+    FE->>API: POST /sessions/{id}/messages
+    API->>SVC: create_message + create_task
+    SVC->>DB: insert AssistantMessage, AssistantTask
+    SVC->>SCH: submit(job_id)
+    API-->>FE: 202 Accepted {job_id}
+    FE->>API: GET /tasks/{job_id}/stream
+    API-->>FE: SSE open
+    SCH->>ORC: run_turn(job_id)
+    ORC->>DB: load session, history, memory
+    ORC->>PL: aplan(query, ctx)
+    PL-->>ORC: Plan{steps[], rationale}
+    ORC->>BUS: publish plan_committed
+    BUS-->>FE: SSE plan_committed
+    loop each wave
+        ORC->>T: execute step (cancellable)
+        ORC->>BUS: publish step_started
+        BUS-->>FE: SSE step_started
+        T->>DB: read/write (search, embeddings, papers)
+        T-->>ORC: ToolResult
+        ORC->>DB: insert AssistantStep
+        ORC->>BUS: publish step_completed
+        BUS-->>FE: SSE step_completed
+    end
+    ORC->>SY: synthesize_answer(results)
+    SY->>BUS: stream message_delta tokens
+    BUS-->>FE: SSE message_delta (live tokens)
+    SY-->>ORC: blocks[]
+    ORC->>DB: update AssistantMessage.payload
+    ORC->>BUS: publish message_completed
+    BUS-->>FE: SSE message_completed
+    ORC->>DB: update AssistantTask status=completed
+    ORC->>BUS: publish task_completed
+    BUS-->>FE: SSE task_completed
+    FE->>U: render blocks
+    </div>
+  </div>
+</div>
+
+<div class="section" id="ra-schema">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Database Schema — RA Tables</h2>
+  <p>Six tables form the RA persistence layer. All are additive (no existing tables altered).</p>
+
+  <div class="diagram-wrap">
+    <div class="diagram-title">RA persistence layer · 6 tables + foreign keys to users/papers</div>
+    <div class="mermaid">
+erDiagram
+    users ||--o{ assistant_sessions : "owns"
+    assistant_sessions ||--o{ assistant_sessions : "branches from"
+    assistant_sessions ||--o{ assistant_messages : "contains"
+    assistant_sessions ||--o{ assistant_tasks : "spawns"
+    assistant_messages ||--o| assistant_tasks : "produced by"
+    assistant_tasks ||--o{ assistant_steps : "consists of"
+    assistant_sessions ||--o{ assistant_attachments : "scopes"
+    papers ||--o{ assistant_attachments : "ref'd by"
+    assistant_sessions ||--o{ assistant_artifacts : "produces"
+    assistant_steps ||--o{ assistant_artifacts : "produces"
+
+    assistant_sessions {
+        uuid id PK
+        uuid user_id FK
+        uuid parent_session_id FK
+        uuid branch_from_message_id
+        string title
+        string namespace_key
+        jsonb topic_keys
+        enum status
+        jsonb state
+    }
+    assistant_messages {
+        uuid id PK
+        uuid session_id FK
+        enum role
+        text content
+        jsonb payload
+        jsonb citations
+    }
+    assistant_tasks {
+        uuid id PK
+        uuid session_id FK
+        uuid assistant_message_id FK
+        string job_id UK
+        enum status
+        int progress
+        timestamp cancel_requested_at
+    }
+    assistant_steps {
+        uuid id PK
+        uuid task_id FK
+        int step_index
+        string tool_name
+        enum status
+        jsonb input_params
+        jsonb output
+        jsonb cost
+    }
+    assistant_attachments {
+        uuid id PK
+        uuid session_id FK
+        enum kind
+        text content
+        uuid paper_id FK
+        jsonb metadata
+    }
+    assistant_artifacts {
+        uuid id PK
+        uuid session_id FK
+        uuid producing_step_id FK
+        enum kind
+        uuid ref_id
+    }
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Table</th><th>Purpose</th><th>Key columns</th></tr>
+    <tr><td><code>assistant_sessions</code></td><td>One per investigation. Branchable via <code>parent_session_id</code>. Carries namespace, topic keys, orientation, expertise, rolling JSONB state (including lazy history summary), lifecycle status.</td><td><code>id</code>, <code>parent_session_id</code>, <code>branch_from_message_id</code>, <code>state</code>, <code>status</code></td></tr>
+    <tr><td><code>assistant_messages</code></td><td>Ordered conversation: user, assistant, and system messages. Assistant messages carry structured <code>payload.blocks</code> for the block renderer and <code>payload.workflow</code> for backward compat.</td><td><code>role</code>, <code>content</code>, <code>message_type</code>, <code>citations[]</code>, <code>artifact_refs[]</code>, <code>payload</code></td></tr>
+    <tr><td><code>assistant_tasks</code></td><td>One per submitted turn. Tracks lifecycle (pending → running → completed/failed/cancelled), progress percentage, stage summary, and links back to the assistant message being populated.</td><td><code>job_id</code>, <code>status</code>, <code>progress</code>, <code>assistant_message_id</code></td></tr>
+    <tr><td><code>assistant_steps</code></td><td>One per tool call inside a turn. The unit of resumability, cancellation, and reasoning-tree rendering. Contains full input params and output for post-hoc inspection.</td><td><code>tool_name</code>, <code>step_index</code>, <code>status</code>, <code>input_params</code>, <code>output</code>, <code>cost</code>, <code>started_at</code>, <code>completed_at</code></td></tr>
+    <tr><td><code>assistant_attachments</code></td><td>Session-scoped user-supplied context: notes, URLs, paper references, uploaded PDFs, images, or plain text files. Parsed on upload (PDF → parser chain; image → Gemini Vision). Never mixed into the global paper feed unless explicitly imported.</td><td><code>kind</code>, <code>content</code>, <code>url</code>, <code>paper_id</code>, <code>metadata</code></td></tr>
+    <tr><td><code>assistant_artifacts</code></td><td>Polymorphic registry of outputs produced inside a session — study summaries, idea capsules, podcasts, slide decks, mermaid diagrams, comparison reports. Links back to the step that produced it.</td><td><code>kind</code>, <code>ref_id</code>, <code>producing_step_id</code>, <code>preview</code>, <code>href</code></td></tr>
+  </table>
+</div>
+
+<div class="section" id="ra-tools">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Tool Registry — 30+ Registered Tools</h2>
+  <p>
+    Every RA capability is an <code>AssistantTool</code> with a stable name, a Pydantic input/output schema,
+    a cost class (<code>cheap</code> / <code>moderate</code> / <code>heavy</code>), and flags for
+    <code>side_effects</code>, <code>cancellable</code>, and <code>streamable</code>.
+    The planner sees only <code>describe_for_planner()</code> output — names, summaries, and JSON schemas.
+    New tools are added by registering; no planner or orchestrator code changes.
+  </p>
+  <p>
+    The registry is namespace-aware: <code>describe_for_planner(namespace_key)</code> returns
+    only the tools visible for that namespace (global tools ∪ namespace pack — e.g. PubMed
+    appears for <code>q-bio</code> but not <code>cs.AI</code>).
+  </p>
+  <table>
+    <tr><th>Tool</th><th>Cost</th><th>Side effects</th><th>What it does</th></tr>
+    <tr><td><code>deep_search</code></td><td>heavy</td><td>no</td><td>Hybrid semantic+BM25 retrieval over the user's indexed corpus + optional arXiv MCP candidates. Default first step for any research question.</td></tr>
+    <tr><td><code>arxiv_import</code></td><td>moderate</td><td>yes (DB write)</td><td>Searches arXiv and imports matching papers into the namespace with full embeddings. Used when corpus is thin or a specific landmark paper is requested.</td></tr>
+    <tr><td><code>arxiv_search</code></td><td>moderate</td><td>no</td><td>Browse arXiv metadata without importing — for discovery/exploration when DB persistence isn't needed yet.</td></tr>
+    <tr><td><code>paper_import</code></td><td>moderate</td><td>yes (DB write)</td><td>Imports specific arXiv papers BY ID (max 10) into the feed and knowledge base. Mirrors the manual "Import arXiv paper" button — used when the user already knows the exact paper or a citation tool returned specific IDs. Sets <code>is_manually_imported=True</code>.</td></tr>
+    <tr><td><code>frontier_scan</code></td><td>heavy</td><td>no</td><td>Fetches the latest arXiv papers in the user's research area (last few weeks). Used for "what's new in X?" queries.</td></tr>
+    <tr><td><code>concept_explain</code></td><td>moderate</td><td>no</td><td>RAG-grounded concept explanation with supporting papers and an optional Mermaid concept map.</td></tr>
+    <tr><td><code>compare_papers</code></td><td>heavy</td><td>no</td><td>Structured comparison table across multiple papers (columns per paper, rows per dimension).</td></tr>
+    <tr><td><code>genie_synthesize</code></td><td>heavy</td><td>yes (creates capsule)</td><td>Runs the Genie hypothesis-generation pipeline on selected papers. Can be injected with <code>deep_search</code> results automatically.</td></tr>
+    <tr><td><code>genie_deep_dive</code></td><td>heavy</td><td>yes (creates article)</td><td>Generates the 11-section Deep Dive synthesis article for a saved idea capsule.</td></tr>
+    <tr><td><code>paper_qa</code></td><td>moderate</td><td>no</td><td>Direct question-answering grounded in a specific paper's full text.</td></tr>
+    <tr><td><code>bookmarks_query</code></td><td>moderate</td><td>no</td><td>RAG-grounded Q&amp;A over the user's bookmarked corpus.</td></tr>
+    <tr><td><code>graph_build</code></td><td>heavy</td><td>yes</td><td>Triggers a knowledge graph build for the session namespace.</td></tr>
+    <tr><td><code>graph_query</code></td><td>cheap</td><td>no</td><td>Read-only graph traversal — returns concept/method/paper neighbor clusters.</td></tr>
+    <tr><td><code>web_search</code></td><td>cheap</td><td>no</td><td>External web search via DuckDuckGo (default) or Tavily. Low-trust; labelled as external in synthesis.</td></tr>
+    <tr><td><code>pubmed</code></td><td>moderate</td><td>no</td><td>PubMed literature search — preferred for biomedical / life-science namespaces.</td></tr>
+    <tr><td><code>inspire_hep</code></td><td>moderate</td><td>no</td><td>INSPIRE HEP search — preferred for particle physics / high-energy physics.</td></tr>
+    <tr><td><code>nasa_ads</code></td><td>moderate</td><td>no</td><td>NASA ADS astronomy search — preferred for astrophysics namespaces. Requires <code>ADS_API_TOKEN</code>.</td></tr>
+    <tr><td><code>fred</code></td><td>moderate</td><td>no</td><td>FRED macroeconomic data series — preferred for economics / quantitative finance namespaces. Requires <code>FRED_API_KEY</code>.</td></tr>
+    <tr><td><code>nvd_cve</code></td><td>moderate</td><td>no</td><td>NVD CVE vulnerability database — preferred for security / systems namespaces.</td></tr>
+    <tr><td><code>clinicaltrials</code></td><td>moderate</td><td>no</td><td>ClinicalTrials.gov search — preferred for clinical medicine namespaces.</td></tr>
+    <tr><td><code>github_search</code></td><td>moderate</td><td>no</td><td>GitHub repository search — surfaces code implementations for CS queries. Rate-limited; <code>GITHUB_TOKEN</code> raises limits.</td></tr>
+    <tr><td><code>huggingface_search</code></td><td>moderate</td><td>no</td><td>Hugging Face model/dataset/space search — preferred for ML namespaces.</td></tr>
+    <tr><td><code>wolfram_alpha</code></td><td>moderate</td><td>no</td><td>Wolfram Alpha computation. Disabled when neither <code>WOLFRAM_ALPHA_APP_ID</code> nor <code>WOLFRAM_MCP_COMMAND</code> is set.</td></tr>
+    <tr><td><code>wikipedia</code></td><td>cheap</td><td>no</td><td>Wikipedia article retrieval for background context.</td></tr>
+    <tr><td><code>semantic_scholar</code></td><td>moderate</td><td>no</td><td>Semantic Scholar citation and related-paper search.</td></tr>
+    <tr><td><code>crossref</code></td><td>cheap</td><td>no</td><td>CrossRef DOI resolution and citation metadata.</td></tr>
+    <tr><td><code>unpaywall</code></td><td>cheap</td><td>no</td><td>Open-access PDF discovery via Unpaywall.</td></tr>
+    <tr><td><code>papers_with_code</code></td><td>moderate</td><td>no</td><td>Papers with Code search — surfaces benchmark results and reference implementations.</td></tr>
+    <tr><td><code>oeis</code></td><td>cheap</td><td>no</td><td>OEIS integer sequence search — preferred for mathematics namespaces.</td></tr>
+    <tr><td><code>latex_parse</code></td><td>moderate</td><td>no</td><td>Parses LaTeX fragments (equations, proofs) from paper text.</td></tr>
+    <tr><td><code>draft_section</code></td><td>heavy</td><td>no</td><td>Drafts a named section of a research document grounded in retrieved context.</td></tr>
+    <tr><td><code>research_trends</code></td><td>moderate</td><td>no</td><td>Analyses publication volume, citation velocity, and topic evolution over time.</td></tr>
+    <tr><td><code>literature_survey</code></td><td>heavy</td><td>no</td><td>Generates a structured mini literature-survey from a set of papers.</td></tr>
+    <tr><td><code>memory</code></td><td>cheap</td><td>yes (writes session state)</td><td>Reads/writes session-scoped key-value memory for persistent user facts.</td></tr>
+    <tr><td><code>media_generate</code></td><td>heavy</td><td>yes (creates artifact)</td><td>Triggers podcast or slide-deck generation for a paper or idea capsule.</td></tr>
+    <tr><td><code>citation_finder</code></td><td>moderate</td><td>no</td><td>Finds papers that cite a given arXiv paper via Semantic Scholar.</td></tr>
+    <tr><td><code>author_network</code></td><td>moderate</td><td>no</td><td>Maps co-authorship and collaboration networks around a researcher.</td></tr>
+  </table>
+
+  <h3>Namespace packs</h3>
+  <p>
+    <code>backend/app/assistant/tools/namespace_packs.py</code> defines which tools are visible for each
+    arXiv namespace. Global tools (deep_search, arxiv_import, paper_import, web_search, concept_explain,
+    compare_papers, genie_synthesize, memory, etc.) appear in every namespace. Domain packs overlay
+    additional tools.
+  </p>
+
+  <div class="diagram-wrap">
+    <div class="diagram-title">Global tools ∪ namespace pack overlays — what the planner sees</div>
+    <div class="mermaid">
+flowchart LR
+    GLOBAL["GLOBAL_TOOLS<br/>(33 tools)<br/>deep_search · arxiv_import · paper_import<br/>arxiv_search · frontier_scan · literature_survey<br/>paper_qa · compare_papers · concept_explain<br/>draft_section · citation_finder · latex_parse<br/>web_search · wikipedia · crossref · pubmed<br/>unpaywall · research_trends · author_network<br/>genie_read · genie_synthesize · genie_deep_dive<br/>graph_query · graph_build · bookmarks_query<br/>memory_* · parse_context · media_generate · wolfram_alpha"]
+
+    CSPACK["cs.*<br/>github_search<br/>huggingface_search<br/>papers_with_code<br/>nvd_cve (cs.CR)"]
+    EESS["eess.*<br/>github_search<br/>huggingface_search<br/>papers_with_code"]
+    QBIO["q-bio.*<br/>pubmed (boosted)<br/>clinicaltrials"]
+    ECON["econ.* / q-fin.*<br/>fred"]
+    ASTRO["astro-ph.*<br/>nasa_ads"]
+    HEP["hep-*<br/>inspire_hep"]
+    MATH["math.* / stat.*<br/>oeis"]
+
+    GLOBAL -. union .-> CSPACK
+    GLOBAL -. union .-> EESS
+    GLOBAL -. union .-> QBIO
+    GLOBAL -. union .-> ECON
+    GLOBAL -. union .-> ASTRO
+    GLOBAL -. union .-> HEP
+    GLOBAL -. union .-> MATH
+
+    CSPACK --> PLANNER
+    EESS --> PLANNER
+    QBIO --> PLANNER
+    ECON --> PLANNER
+    ASTRO --> PLANNER
+    HEP --> PLANNER
+    MATH --> PLANNER
+    PLANNER[/"describe_for_planner(namespace_key)<br/>returns namespace-scoped catalog"\]
+
+    style GLOBAL fill:#1e3a8a,stroke:#3b82f6,color:#fff
+    style PLANNER fill:#581c87,stroke:#a855f7,color:#fff
+    </div>
+  </div>
+</div>
+
+<div class="section" id="ra-orchestrator">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Orchestrator — Plan → Execute → Synthesize</h2>
+  <p>
+    <code>backend/app/assistant/orchestrator.py:Orchestrator.run_turn(job_id)</code> is the top-level
+    entry point for each assistant turn. It is called by the in-process scheduler
+    (<code>assistant/scheduler.py</code>) as an <code>asyncio.create_task</code>.
+  </p>
+
+  <h3>Turn lifecycle</h3>
+  <pre><code>1. Load context    — session, history (rolling window), memory, user profile, disabled tools
+2. Off-topic guard — regex patterns detect clearly non-research queries → redirect without tools
+3. Query rewrite   — LLM-rewrites short/ambiguous queries for better retrieval (skipped when specific)
+4. Plan            — LLMPlanner.aplan() → Plan{steps, rationale, actions, trace}
+5. Execute steps   — parallel waves + sequential steps; per-step AssistantStep rows
+6. Coverage guard  — auto-import from arXiv when corpus &lt; 2 papers (and no domain tool ran)
+7. Synthesize      — synthesize_answer() streams tokens via SSE; build_message_blocks() structures output
+8. Finalize        — update AssistantMessage.payload.blocks, AssistantTask.status=completed, JobStore
+9. Fire-and-forget — session_metadata refresh + UserInterestProfile update (non-blocking)</code></pre>
+
+  <h3>Execution guardrails</h3>
+  <table>
+    <tr><th>Guardrail</th><th>Limit</th><th>Behaviour when triggered</th></tr>
+    <tr><td>Max steps per turn</td><td>12</td><td>Plan clipped to first 12 steps; warning logged</td></tr>
+    <tr><td>Per-step timeout</td><td>180 s</td><td>Step marked failed; orchestrator continues next step</td></tr>
+    <tr><td>Consecutive empty waves</td><td>3</td><td>Remaining steps skipped; synthesizer runs on what was collected</td></tr>
+    <tr><td>Duplicate step dedup</td><td>—</td><td>Same tool+params signature in one plan → only first executes</td></tr>
+    <tr><td>Cancel gate</td><td>—</td><td>Checked after every wave; raises CancelledError → graceful partial result</td></tr>
+  </table>
+
+  <h3>Rolling history</h3>
+  <p>
+    When a session exceeds 14 messages, older turns are compressed via an LLM call into a dense
+    summary (≤600 words) injected as a system message. The summary is stored in
+    <code>session.state["history_summary"]</code> and reused on all subsequent turns — no redundant
+    LLM calls. Branch sessions inherit their parent's history (up to 6 messages) prepended to their own.
+  </p>
+
+  <h3>Step resumability</h3>
+  <p>
+    On restart, <code>_already_completed_steps(job_id)</code> loads prior <code>AssistantStep</code>
+    rows with <code>status=completed</code> and hydrates their outputs back into the results dict.
+    Steps that already completed are skipped; execution resumes from the first pending step.
+    Pure (no-side-effect) tools can be safely re-run; side-effecting tools check for prior outputs
+    before re-executing.
+  </p>
+</div>
+
+<div class="section" id="ra-planner">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Planner — LLM + Heuristic Fallback</h2>
+  <p>
+    <code>backend/app/assistant/planner_llm.py:LLMPlanner</code> is the primary planner. It calls the
+    quality-tier LLM with a structured JSON output contract and namespace-aware tool catalogue.
+    <code>backend/app/assistant/planner.py:HeuristicPlanner</code> is the fallback — deterministic,
+    keyword-driven, zero LLM cost. The orchestrator always gets a valid <code>Plan</code> regardless
+    of provider status.
+  </p>
+
+  <h3>Plan object</h3>
+  <pre><code>Plan(
+    rationale: str,          # short user-visible explanation of what the RA will do
+    steps: list[PlannedStep],
+    actions: list[str],      # high-level action labels for progress display
+    trace: list[str],        # internal planner reasoning (not shown to user)
+)
+PlannedStep(
+    tool: str,               # registered tool name
+    title: str,              # human-readable step label
+    params: dict,            # validated against tool.input_schema
+    parallel: bool,          # if True, runs concurrently with adjacent parallel steps
+)</code></pre>
+
+  <h3>Adaptive model routing</h3>
+  <p>
+    <code>_assess_query_complexity(query, history)</code> classifies the query as
+    <code>simple</code>, <code>medium</code>, or <code>complex</code>. Complex queries (multi-part,
+    multi-domain, ambiguous) route to the reasoning-tier LLM for planning. Simple and medium queries
+    use the quality tier to keep latency low. The synthesizer receives the same complexity label and
+    adjusts output depth accordingly.
+  </p>
+
+  <h3>Planner prompt shape</h3>
+  <p>
+    The planner sees: namespace, tool catalogue (name + summary + JSON schema only — no implementation),
+    conversation history (rolling window), session memory, orientation, expertise level, and a list of
+    disabled tools. It is instructed to always build a real execution plan (≥1 tool) — "pure reasoning"
+    is reserved only for greetings and acknowledgements. ArXiv tools are preferred for CS/AI/ML/Physics/Math;
+    domain tools are mandatory when clearly better suited (PubMed for biomedical, FRED for economics, etc.).
+  </p>
+
+  <h3>Planner decision flow</h3>
+  <div class="diagram-wrap">
+    <div class="diagram-title">From user query to validated Plan object</div>
+    <div class="mermaid">
+flowchart TD
+    Q[User query + session context] --> COMPLEX{Assess complexity<br/>simple / medium / complex}
+    COMPLEX -- simple/medium --> Q_LLM[Quality-tier LLM]
+    COMPLEX -- complex --> R_LLM[Reasoning-tier LLM]
+
+    Q_LLM --> PROMPT[Compose planner prompt<br/>+ tool catalogue +<br/>history + memory + namespace]
+    R_LLM --> PROMPT
+    PROMPT --> CALL[LLM JSON-structured call]
+    CALL -- error / timeout --> HEUR[HeuristicPlanner<br/>keyword-driven<br/>zero LLM cost]
+    CALL --> RAW[Raw Plan JSON]
+    RAW --> VALID{Schema-validate steps<br/>against tool registry}
+    VALID -- invalid step --> DROP[Drop invalid step<br/>log warning]
+    VALID -- valid --> FORBID{Apply forbidden set<br/>graph_build always<br/>media_generate when keys missing}
+    DROP --> FORBID
+    FORBID --> CLIP[Clip to max 12 steps]
+    CLIP --> DEDUP[Dedup tool+params signatures]
+    DEDUP --> PLAN[Final Plan object<br/>steps, rationale,<br/>actions, trace]
+    HEUR --> PLAN
+    PLAN --> EXEC[Orchestrator executes]
+
+    style HEUR fill:#7c2d12,stroke:#fb923c,color:#fff
+    style PLAN fill:#14532d,stroke:#22c55e,color:#fff
+    </div>
+  </div>
+</div>
+
+<div class="section" id="ra-streaming">
+  <div class="section-tag">Research Assistant</div>
+  <h2>SSE Streaming — Typed AssistantEvent Objects</h2>
+  <p>
+    The orchestrator publishes typed events to an in-process event bus
+    (<code>backend/app/assistant/events.py</code>). The API layer
+    (<code>GET /api/v1/assistant/tasks/{job_id}/stream</code>) subscribes and
+    relays events to the browser as Server-Sent Events with a 15-second heartbeat.
+  </p>
+
+  <h3>Event types</h3>
+  <table>
+    <tr><th>Event kind</th><th>When emitted</th><th>Key payload fields</th></tr>
+    <tr><td><code>plan_committed</code></td><td>After planner returns a valid plan</td><td><code>rationale</code>, <code>steps[]</code>, <code>actions[]</code></td></tr>
+    <tr><td><code>step_started</code></td><td>Before each tool begins</td><td><code>step_id</code>, <code>tool</code>, <code>title</code></td></tr>
+    <tr><td><code>step_progress</code></td><td>Mid-tool progress updates</td><td><code>step_id</code>, <code>percent</code>, <code>summary</code></td></tr>
+    <tr><td><code>step_completed</code></td><td>After each tool finishes</td><td><code>step_id</code>, <code>tool</code>, <code>summary</code>, <code>cache_hit</code></td></tr>
+    <tr><td><code>step_failed</code></td><td>After a tool errors</td><td><code>step_id</code>, <code>error</code>, <code>retryable</code></td></tr>
+    <tr><td><code>message_delta</code></td><td>Each synthesizer token</td><td><code>message_id</code>, <code>delta</code></td></tr>
+    <tr><td><code>message_completed</code></td><td>After synthesis writes to DB</td><td><code>message_id</code>, <code>citation_count</code>, <code>blocks[]</code></td></tr>
+    <tr><td><code>task_completed</code></td><td>Turn fully done</td><td><code>summary</code></td></tr>
+    <tr><td><code>task_failed</code></td><td>Unhandled orchestrator error</td><td><code>error</code></td></tr>
+    <tr><td><code>task_cancelled</code></td><td>User cancelled mid-turn</td><td><code>summary</code></td></tr>
+  </table>
+
+  <p>
+    The frontend subscribes to the SSE stream immediately after <code>POST /sessions/{id}/messages</code>
+    returns 202. It also polls <code>GET /sessions/{id}</code> as a fallback when the stream closes before
+    <code>task_completed</code> is received (e.g. page refresh, proxy timeout).
+  </p>
+
+  <h3>Event timeline for one turn</h3>
+  <div class="diagram-wrap">
+    <div class="diagram-title">Typical SSE event order — happy path</div>
+    <div class="mermaid">
+flowchart LR
+    PC([plan_committed])
+    SS1([step_started])
+    SP1([step_progress])
+    SC1([step_completed])
+    SS2([step_started])
+    SC2([step_completed])
+    MD([message_delta · streamed])
+    MC([message_completed])
+    TC([task_completed])
+
+    PC --> SS1 --> SP1 --> SC1 --> SS2 --> SC2 --> MD --> MC --> TC
+
+    HB1{{heartbeat every 15s}}
+    HB2{{heartbeat every 15s}}
+    PC -.-> HB1 -.-> SC1
+    SC2 -.-> HB2 -.-> MD
+
+    SF([step_failed])
+    SC1 -. on tool error .-> SF
+    SF -. continue plan .-> SS2
+
+    TX([task_cancelled])
+    TF([task_failed])
+    SC1 -. user cancel .-> TX
+    SY[Synthesizer] -. exception .-> TF
+
+    style PC fill:#1e3a8a,color:#fff,stroke:#3b82f6
+    style TC fill:#14532d,color:#fff,stroke:#22c55e
+    style TF fill:#7f1d1d,color:#fff,stroke:#ef4444
+    style TX fill:#7c2d12,color:#fff,stroke:#fb923c
+    </div>
+  </div>
+
+  <h3>Block-rendered messages</h3>
+  <p>
+    Assistant messages carry <code>payload.blocks</code> — a list of typed render blocks the frontend
+    dispatches to per-kind renderers:
+  </p>
+  <table>
+    <tr><th>Block kind</th><th>Rendered as</th></tr>
+    <tr><td><code>text</code></td><td>Markdown prose with inline citation chips</td></tr>
+    <tr><td><code>paper_grid</code></td><td>N-column paper card grid (sortable)</td></tr>
+    <tr><td><code>arxiv_results</code></td><td>Compact arXiv search results with import buttons</td></tr>
+    <tr><td><code>domain_papers</code></td><td>Results from PubMed / NASA ADS / INSPIRE HEP etc.</td></tr>
+    <tr><td><code>comparison_table</code></td><td>Column-per-paper, row-per-dimension structured comparison</td></tr>
+    <tr><td><code>mermaid</code></td><td>Rendered Mermaid diagram</td></tr>
+    <tr><td><code>web_results</code></td><td>External web search results (low-trust label)</td></tr>
+    <tr><td><code>genie_link</code></td><td>Card linking to a created Genie idea capsule</td></tr>
+    <tr><td><code>graph_summary</code></td><td>Knowledge graph traversal summary</td></tr>
+    <tr><td><code>nvd_results</code></td><td>CVE vulnerability cards</td></tr>
+    <tr><td><code>fred_series</code></td><td>Macroeconomic data series</td></tr>
+    <tr><td><code>trials_results</code></td><td>ClinicalTrials.gov study cards</td></tr>
+    <tr><td><code>code_results</code></td><td>GitHub repo + HuggingFace model cards</td></tr>
+    <tr><td><code>bookmarks_answer</code></td><td>RAG answer grounded in user's bookmarked corpus</td></tr>
+    <tr><td><code>import_summary</code></td><td>N papers imported from arXiv into the namespace</td></tr>
+  </table>
+</div>
+
+<div class="section" id="ra-recovery">
+  <div class="section-tag">Research Assistant</div>
+  <h2>Recovery — Crash-Safe Worker Restart</h2>
+  <p>
+    On startup, <code>app.assistant.recovery.reconcile_orphans()</code> scans all
+    <code>AssistantTask</code> rows with <code>status ∈ {pending, running}</code> and
+    takes one of three actions based on recency:
+  </p>
+  <ul>
+    <li><strong>Resume</strong> — recent tasks with completed step rows are re-submitted to the scheduler. The orchestrator skips already-completed steps and continues from the next pending step.</li>
+    <li><strong>Fail</strong> — stale tasks (older than a recency threshold) are marked <code>failed</code> with a "process restarted" error so the UI never shows a permanent spinner.</li>
+    <li><strong>Cancel</strong> — tasks with <code>cancel_requested_at</code> set are cleaned up.</li>
+  </ul>
+  <p>
+    The startup lifespan in <code>main.py</code> calls <code>reconcile_orphans()</code> in a
+    try/except — a recovery failure never blocks startup. Per-step checkpointing means a restarted
+    worker replays only the uncompleted tail of a plan, not the whole turn.
+  </p>
+</div>
+
+<div class="section" id="ra-api">
+  <div class="section-tag">Research Assistant</div>
+  <h2>API Surface — <code>/api/v1/assistant</code></h2>
+  <pre><code># Session management
+<span class="dec">GET</span>    /assistant/sessions                       ?limit&amp;namespace_key  → list
+<span class="dec">POST</span>   /assistant/sessions                       {namespace_key, topic_keys, title?}  → 201
+<span class="dec">GET</span>    /assistant/sessions/{id}                  → session + messages + tasks
+<span class="dec">DELETE</span> /assistant/sessions/{id}                  → 204 (soft-archive)
+<span class="dec">PATCH</span>  /assistant/sessions/{id}/title            {title}  → renamed session
+<span class="dec">POST</span>   /assistant/sessions/clear                 → archive all active sessions (returns count)
+<span class="dec">POST</span>   /assistant/sessions/{id}/branch           {from_message_id?, title?}  → 201 child session
+<span class="dec">GET</span>    /assistant/sessions/{id}/export           ?format=markdown|json  → file download
+
+# Turn submission and streaming
+<span class="dec">POST</span>   /assistant/sessions/{id}/messages         {content, namespace_key, topic_keys, attachments?}  → 202
+<span class="dec">GET</span>    /assistant/tasks/{job_id}/stream          → text/event-stream (typed AssistantEvent)
+<span class="dec">POST</span>   /assistant/tasks/{job_id}/cancel          → cancel running turn
+<span class="dec">GET</span>    /assistant/tasks                          → list user tasks
+<span class="dec">GET</span>    /assistant/jobs                           → notification-panel view
+
+# Reasoning tree
+<span class="dec">GET</span>    /assistant/sessions/{id}/steps            → all steps in session (reasoning tree)
+<span class="dec">GET</span>    /assistant/messages/{msg_id}/steps        → steps that produced a single message
+
+# Artifacts
+<span class="dec">GET</span>    /assistant/sessions/{id}/artifacts        → generated outputs (study/idea/podcast/slides/etc.)
+
+# Attachments
+<span class="dec">GET</span>    /assistant/sessions/{id}/attachments      → list session-scoped attachments
+<span class="dec">POST</span>   /assistant/sessions/{id}/attachments      {kind, label, content?, url?, paper_id?}  → 201
+<span class="dec">POST</span>   /assistant/sessions/{id}/attachments/upload  multipart file → 201 (auto-parsed)
+<span class="dec">DELETE</span> /assistant/sessions/{id}/attachments/{att_id}  → 204
+
+# arXiv import (used by the RA workspace UI directly)
+<span class="dec">POST</span>   /assistant/arxiv/search                   {query, namespace_keys?, max_results}
+<span class="dec">POST</span>   /assistant/arxiv/import                   {papers[], namespace_key}
+
+# Introspection
+<span class="dec">GET</span>    /assistant/tools                          → registered tool catalogue (schema-only)
+<span class="dec">GET</span>    /assistant/seeds                          ?namespace_key  → 4 seed questions for empty state</code></pre>
+
+  <div class="callout callout-tip">
+    <div class="callout-title">✅ File upload limits</div>
+    <p>
+      Uploads are capped at 25 MB per file. PDFs are parsed via the platform's parser chain
+      (Marker → Docling → Gemini Vision). Images are sent to the configured vision LLM for caption + OCR.
+      DOCX files use python-docx (with XML fallback). All text-based formats (code, markdown, CSV,
+      JSON, YAML, etc.) are decoded as UTF-8 directly. Parse failures never fail the upload — the
+      attachment row is always persisted and a <code>parse_error</code> hint is surfaced in metadata.
+    </p>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
      CLOSING
 ═══════════════════════════════════════════════════════════════════════════ -->
 <div class="section" id="closing">
@@ -4901,7 +5653,10 @@ sequenceDiagram
   <p>
     You now have the full picture: six layers, eight workflow modules (six LangGraph
     StateGraphs — Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation — plus the
-    Genie synthesis and Deep Dive async generators), ten adapter families, seven
+    Genie synthesis and Deep Dive async generators), a persistent Research Assistant
+    layer with 30+ tools, an LLM planner with heuristic fallback, six new
+    <code>assistant_*</code> tables (sessions, messages, tasks, steps, attachments, artifacts),
+    typed SSE event streaming, per-step checkpointed resume, ten adapter families, seven
     repositories, one PostgreSQL 16 database with pgvector HNSW index, a knowledge graph,
     and an async PostgreSQL checkpoint saver that lets generation workflows resume from
     the last completed node after a crash. Three deterministic algorithms (RRF, scoring,
@@ -4959,25 +5714,22 @@ window.addEventListener('scroll',()=>{
 ═══════════════════════════════════════════════════════════════════════════ -->
 
 <!-- ══════════════════════════════════════════════════════════════════════════
-     PRINCIPAL-ENGINEER AUDIT FIXES (post-Sonnet remediation pass)
+     CROSS-CUTTING ARCHITECTURE GUARANTEES
 ═══════════════════════════════════════════════════════════════════════════ -->
 <div class="section" id="audit-fixes">
-  <div class="section-tag">Architecture · Audit + Fix Pass</div>
-  <h2>Audit + Remediation Layer</h2>
+  <div class="section-tag">Architecture · Cross-cutting</div>
+  <h2>Cross-cutting Architecture Guarantees</h2>
 
-  <p>The first generation pass (by Claude Sonnet) shipped four LangGraph workflows
-  but introduced architectural debt: per-workflow in-memory job dicts, duplicated
-  source-content loading, an incomplete cache key, broken folder ID handling,
-  and abstract-only grounding. A second principal-engineer audit pass on Opus
-  identified and fixed every gap. The current architecture reflects the remediated state.</p>
+  <p>A handful of single-source-of-truth services sit underneath every workflow,
+  background job, and Research Assistant tool. They are what keep grounding,
+  background-job lifecycle, caching, and recovery consistent across the system.</p>
 
-  <h3>Fix 1 · ContentLoaderService (deep PDF grounding)</h3>
-  <p>A single service in <code>app/services/content_loader.py</code> owns all
-  source-content loading. Eliminates 4× duplication and fixes the previous
-  folder-ID bug. <strong>Critical:</strong> when a paper has no parsed PDF
-  section chunks, the loader transparently triggers an on-demand parse via
-  the configured fallback chain and persists the resulting chunks. Generations
-  always ground in the full PDF body — not just the abstract.</p>
+  <h3>ContentLoaderService — deep PDF grounding</h3>
+  <p>One service in <code>app/services/content_loader.py</code> owns all
+  source-content loading for media-generation workflows. When a paper has no
+  parsed PDF section chunks the loader transparently triggers an on-demand
+  parse via the configured fallback chain and persists the resulting chunks.
+  Generations always ground in the full PDF body, never the abstract alone.</p>
 
   <pre>
 ContentLoaderService.load(source_type, source_id, user_id) → LoadedContent
@@ -4986,9 +5738,9 @@ ContentLoaderService.load(source_type, source_id, user_id) → LoadedContent
   folder:  per-paper digest + best parsed section per paper (methodology/results)
   </pre>
 
-  <h3>Fix 2 · JobStore abstraction (cloud-friendly background jobs)</h3>
-  <p>Replaces 4× per-workflow <code>_jobs: dict</code> with a single
-  <code>JobStore</code> ABC having two adapters:</p>
+  <h3>JobStore — cloud-friendly background jobs</h3>
+  <p>A single <code>JobStore</code> ABC with two adapters keeps background-job
+  fast-path state out of per-workflow dicts:</p>
   <ul>
     <li><code>InMemoryJobStore</code> — default, single-worker.</li>
     <li><code>RedisJobStore</code> — auto-selected when <code>CACHE_BACKEND=redis</code>;
@@ -4999,46 +5751,67 @@ ContentLoaderService.load(source_type, source_id, user_id) → LoadedContent
   restart the lifespan sweeps any orphaned <code>running</code> rows to
   <code>failed</code> via <code>recover_orphaned_artifacts()</code>.</p>
 
-  <h3>Fix 3 · Spec-compliant cache key</h3>
-  <p>The <code>POST /generate/...</code> trigger now matches the cached
-  artifact only when <strong>all</strong> dimensions agree:
+  <h3>Full-dimension generation cache key</h3>
+  <p>The <code>POST /generate/...</code> trigger matches an existing artifact
+  only when <strong>all</strong> dimensions agree:
   <code>(user, source, type, expertise, orientation, provider, model, parser)</code>.
   Any change in expertise, orientation, model, or parser produces a fresh
   artifact rather than reusing a stale one.</p>
 
-  <h3>Fix 4 · Bookmark folder UI integration</h3>
+  <h3>Folder-corpus generation</h3>
   <p>The bookmarks page renders a <code>FolderGenerationBar</code> only when
-  a named folder is selected (per spec — "All Bookmarks" view does not).
+  a named folder is selected (the global "All Bookmarks" view does not).
   Each button triggers a folder-corpus generation against the
   <code>/generate/folder/{folder_id}/{type}</code> endpoint. The folder loader
-  (fixed) reads bookmarks via the
+  reads bookmarks via the
   <code>BookmarkFolderMember → Bookmark → Paper</code> join with proper
   user-ownership scoping.</p>
 
-  <h3>Fix 5 · Notification panel integration</h3>
-  <p>The JobsPanel surfaces a "Media Generation" section listing every
-  generation job. Click a completed job to redirect to the source viewer
-  (paper / capsule / bookmark folder). Polling cadence is 4s when active,
-  15s otherwise. Backend polling first calls <code>GET /generate/jobs</code>
-  to merge authoritative server-side state, then fetches each
-  <code>/generate/artifact/{id}</code> for any still-running.</p>
+  <h3>Generation jobs in the notification panel</h3>
+  <p>The <code>JobsPanel</code> surfaces a "Media Generation" section listing
+  every generation job. Clicking a completed job redirects to the source viewer
+  (paper / capsule / bookmark folder). Polling cadence is 4 s when at least one
+  job is active and 15 s otherwise. Frontend polling first calls
+  <code>GET /generate/jobs</code> to merge authoritative server-side state,
+  then fetches each <code>/generate/artifact/{id}</code> for any still-running.</p>
 
-  <h3>Fix 6 · Parser metadata persistence</h3>
-  <p>Spec required: "Persist: parser used, fallback used, parse duration,
-  parser confidence." The <code>papers</code> table now has columns
+  <h3>Parser metadata persistence</h3>
+  <p>The <code>papers</code> table carries
   <code>parser_used</code>, <code>parser_fallback_used</code>,
-  <code>parse_duration_ms</code>, <code>parser_confidence</code>. Migrations
-  are idempotent (<code>ADD COLUMN IF NOT EXISTS</code>). Both the Study
-  workflow and the on-demand ContentLoaderService PDF parse path persist
-  these fields.</p>
+  <code>parse_duration_ms</code>, and <code>parser_confidence</code>. Both the
+  Study workflow and the on-demand ContentLoaderService PDF parse path
+  populate these fields. Migrations use <code>ADD COLUMN IF NOT EXISTS</code>
+  so re-running them is idempotent.</p>
 
-  <h3>Fix 7 · Workflow recovery + idempotency</h3>
+  <h3>Workflow recovery + idempotency</h3>
   <p>A single <code>run_with_recovery()</code> helper in
   <code>workflows/_generation_runtime.py</code> wraps every workflow's
   <code>graph.ainvoke()</code> call. It transitions the DB row through
   <code>queued → running → completed | failed</code>, mirrors that into the
   JobStore, captures every exception, and enforces ordering between status
   updates so the UI never sees an inconsistent state.</p>
+
+  <h3>Fire-and-forget task rooting</h3>
+  <p>Every <code>asyncio.create_task(...)</code> spawned from request handlers
+  (manual arXiv import, Genie sessions, Deep Dive, Study jobs, token-usage
+  recording, RA post-turn metadata refresh) is held in a module-level
+  <code>set[asyncio.Task]</code> with a self-removing done callback. This
+  prevents Python 3.12+ from garbage-collecting an in-flight task before its
+  DB commit lands.</p>
+
+  <h3>RA scheduler idempotency</h3>
+  <p>The Research Assistant scheduler's <code>submit(job_id)</code> is
+  idempotent: a second call while the first task is still running returns the
+  same <code>asyncio.Task</code> rather than starting a parallel runner that
+  would race for DB writes. The cleanup callback only pops the registry entry
+  if it still references the task that completed.</p>
+
+  <h3>Graph build cancellation on clear</h3>
+  <p><code>POST /graph/clear</code> first cancels any in-flight Build Deep
+  task targeting an affected namespace, releases its lock, and only then
+  issues the <code>DELETE</code> statements. Without this guard a running
+  builder would continue inserting nodes/edges into a now-empty graph and
+  leave inconsistent partial state behind.</p>
 </div>
 
 <div class="section" id="parser-layer">

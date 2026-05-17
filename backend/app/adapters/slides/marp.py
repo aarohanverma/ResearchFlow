@@ -2,8 +2,9 @@
 
 Marp (https://marp.app) converts Markdown with ``---`` separators into
 beautiful HTML/PDF slide decks.  This adapter:
-  1. Attempts to render via the ``marp`` CLI (npx or local install).
-  2. Falls back to storing raw markdown if marp-cli is unavailable.
+
+1. Attempts to render via the ``marp`` CLI (npx or local install).
+2. Falls back to storing raw markdown if marp-cli is unavailable.
 
 The HTML output is fully self-contained (inline CSS + JS) so it can be
 served as a single file from BlobStorage.

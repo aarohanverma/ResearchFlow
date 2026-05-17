@@ -26,9 +26,15 @@ export default function LoginPage() {
     try {
       const data = await api.post<{ access_token: string }>("/auth/login", { email, password });
       setToken(data.access_token);
-      const user = await api.get<User>("/auth/me");
-      setUser(user);
-      router.push(user.onboarding_complete ? "/feed" : "/settings/onboarding");
+      try {
+        const user = await api.get<User>("/auth/me");
+        setUser(user);
+        router.push(user.onboarding_complete ? "/feed" : "/settings/onboarding");
+      } catch {
+        // Token valid but profile fetch failed — likely transient. Send to
+        // /feed and let the layout's auth guard refetch as part of nav.
+        router.push("/feed");
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Invalid credentials");
     } finally {

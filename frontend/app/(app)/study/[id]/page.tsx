@@ -731,44 +731,41 @@ function StudyLoadingAnimation() {
 const MIN_DIAGRAM_H = 240;
 const MAX_DIAGRAM_H = 540;
 
-// Mermaid is a singleton — initialize once per app session, not per render.
-// Calling initialize() on every mount causes state corruption when multiple
-// diagrams render simultaneously.
-let _mermaidInstance: typeof import("mermaid").default | null = null;
-let _mermaidReady = false;
+// Mermaid singleton — one initialization promise shared across all concurrent renders.
+// Using a promise (not a boolean flag) means concurrent callers all await the same
+// initialization rather than each racing to call initialize() themselves.
+let _mermaidPromise: Promise<typeof import("mermaid").default> | null = null;
 let _mermaidCounter = 0;
 
-async function getMermaid() {
-  if (!_mermaidInstance) {
-    _mermaidInstance = (await import("mermaid")).default;
+function getMermaid(): Promise<typeof import("mermaid").default> {
+  if (!_mermaidPromise) {
+    _mermaidPromise = (async () => {
+      const m = (await import("mermaid")).default;
+      m.initialize({
+        startOnLoad: false,
+        theme: "dark",
+        themeVariables: {
+          background: "transparent",
+          primaryColor: "#1e1b4b",
+          primaryTextColor: "#c7d2fe",
+          primaryBorderColor: "#4f46e5",
+          lineColor: "#6366f1",
+          secondaryColor: "#0f0c29",
+          tertiaryColor: "#1a1635",
+          edgeLabelBackground: "#1e1b4b",
+          nodeTextColor: "#e0e7ff",
+          fontSize: "13px",
+          fontFamily: "ui-monospace, SFMono-Regular, monospace",
+        },
+        flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
+        securityLevel: "loose",
+        suppressErrorRendering: true,
+      });
+      try { (m as unknown as { parseError?: (...a: unknown[]) => void }).parseError = () => {}; } catch {}
+      return m;
+    })();
   }
-  if (!_mermaidReady) {
-    _mermaidInstance.initialize({
-      startOnLoad: false,
-      theme: "dark",
-      themeVariables: {
-        background: "transparent",
-        primaryColor: "#1e1b4b",
-        primaryTextColor: "#c7d2fe",
-        primaryBorderColor: "#4f46e5",
-        lineColor: "#6366f1",
-        secondaryColor: "#0f0c29",
-        tertiaryColor: "#1a1635",
-        edgeLabelBackground: "#1e1b4b",
-        nodeTextColor: "#e0e7ff",
-        fontSize: "13px",
-        fontFamily: "ui-monospace, SFMono-Regular, monospace",
-      },
-      flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
-      securityLevel: "loose",
-      // Suppress mermaid's auto-injected "Syntax error in text" bomb SVG.
-      // We handle errors via our own fallback UI.
-      suppressErrorRendering: true,
-    });
-    try { (_mermaidInstance as unknown as { parseError?: (...a: unknown[]) => void }).parseError = () => {}; } catch {}
-    _mermaidReady = true;
-  }
-  return _mermaidInstance;
+  return _mermaidPromise;
 }
 
 /** Pre-validate a spec without throwing or injecting the bomb SVG. */
@@ -851,13 +848,15 @@ function quoteAllLabels(raw: string): string {
 }
 
 function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number }) {
-  const ref       = useRef<HTMLDivElement>(null);
-  const cancelRef = useRef(false);
+  const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState(false);
   const [height, setHeight] = useState(360);
 
   useEffect(() => {
-    cancelRef.current = false;
+    // Local flag — not a ref — so each effect closure has its own cancel signal.
+    // A shared cancelRef would be reset to false by the next effect run before
+    // the previous async could check it, letting stale renders write to the DOM.
+    let cancelled = false;
     setError(false);
 
     (async () => {
@@ -866,11 +865,12 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
       const clean = sanitizeMermaidSpec(spec);
       if (!clean) return;
 
-      // Unique, stable ID for this render (avoids collisions with parallel renders)
       const id = `mermaid-${++_mermaidCounter}`;
 
       let svg = "";
       const mermaid = await getMermaid();
+      if (cancelled || !ref.current) return;
+
       const tryRender = async (source: string, suffix: string): Promise<string | null> => {
         if (!(await safeMermaidParse(mermaid, source))) return null;
         try {
@@ -892,17 +892,15 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
         svg = (await tryRender(quoteAllLabels(clean), "q")) ?? "";
       }
 
+      if (cancelled || !ref.current) return;
+
       if (!svg) {
-        if (!cancelRef.current) setError(true);
-        // Defensive sweep for any bomb SVGs other code paths might have left behind.
+        setError(true);
         try {
           document.querySelectorAll('svg[aria-roledescription="error"], #mermaid-error-icon').forEach(n => n.remove());
         } catch {}
         return;
       }
-
-      // Guard: component may have unmounted during the await
-      if (cancelRef.current || !ref.current) return;
 
       ref.current.innerHTML = svg;
       const svgEl = ref.current.querySelector("svg");
@@ -934,7 +932,7 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
       setHeight(displayH);
     })();
 
-    return () => { cancelRef.current = true; };
+    return () => { cancelled = true; };
   }, [spec, maxHeight]);
 
   if (error) {

@@ -180,6 +180,9 @@ interface NamespaceStore {
   selectedTopics: string[];
   /** Collapsed subjects in sidebar */
   collapsedSubjects: string[];
+  /** Per-subject topic-selection memory — preserved when switching subjects so
+   *  flipping back doesn't lose the user's curated topic set. */
+  topicsBySubject: Record<string, string[]>;
 
   subscribeSubject:   (subjectKey: string) => void;
   unsubscribeSubject: (subjectKey: string) => void;
@@ -201,6 +204,7 @@ export const useNamespaceStore = create<NamespaceStore>()(
       activeSubject:  "cs",
       selectedTopics: ["cs.AI", "cs.LG"],
       collapsedSubjects: [],
+      topicsBySubject: { cs: ["cs.AI", "cs.LG"] },
 
       subscribeSubject: (subjectKey) =>
         set(s => ({
@@ -213,37 +217,63 @@ export const useNamespaceStore = create<NamespaceStore>()(
         set(s => {
           const next = s.subscribedSubjects.filter(k => k !== subjectKey);
           // If we're removing the active subject, switch to the first remaining
+          // and restore that subject's last selection (or fall back to the
+          // first 2 topics for a fresh first-visit default).
           const newActive = s.activeSubject === subjectKey
             ? (next[0] ?? "cs")
             : s.activeSubject;
           const newTopics = s.activeSubject === subjectKey
-            ? subjectTopics(newActive).slice(0, 2)
+            ? (s.topicsBySubject[newActive] ?? subjectTopics(newActive).slice(0, 2))
             : s.selectedTopics;
+          // Drop the removed subject's memory so it gets defaulted on resubscribe.
+          const { [subjectKey]: _gone, ...remainingMemory } = s.topicsBySubject;
           return {
             subscribedSubjects: next.length ? next : [subjectKey], // can't remove last
             activeSubject: newActive,
             selectedTopics: newTopics,
+            topicsBySubject: remainingMemory,
           };
         }),
 
       setSubject: (subjectKey) => {
-        const topics = subjectTopics(subjectKey);
-        set({ activeSubject: subjectKey, selectedTopics: topics.slice(0, 3) });
+        const { topicsBySubject, activeSubject, selectedTopics } = get();
+        // Persist current subject's selection before switching so we can
+        // restore it next time the user comes back.
+        const persistCurrent = activeSubject && selectedTopics.length > 0
+          ? { ...topicsBySubject, [activeSubject]: selectedTopics }
+          : topicsBySubject;
+        // Restore the target subject's prior selection if we have one;
+        // otherwise default to the first 3 topics for a sensible cold start.
+        const restored = persistCurrent[subjectKey] ?? subjectTopics(subjectKey).slice(0, 3);
+        set({
+          activeSubject: subjectKey,
+          selectedTopics: restored,
+          topicsBySubject: persistCurrent,
+        });
       },
 
       toggleTopic: (topicKey) => {
-        const { selectedTopics, activeSubject } = get();
+        const { selectedTopics, activeSubject, topicsBySubject } = get();
         const subject = TOPIC_TO_SUBJECT[topicKey];
         if (!subject || subject.key !== activeSubject) return;
         const has = selectedTopics.includes(topicKey);
-        const next = has
+        const candidate = has
           ? selectedTopics.filter(k => k !== topicKey)
           : [...selectedTopics, topicKey];
-        set({ selectedTopics: next.length ? next : [topicKey] });
+        const next = candidate.length ? candidate : [topicKey];
+        set({
+          selectedTopics: next,
+          topicsBySubject: { ...topicsBySubject, [activeSubject]: next },
+        });
       },
 
-      selectAllTopics: (subjectKey) =>
-        set({ selectedTopics: subjectTopics(subjectKey) }),
+      selectAllTopics: (subjectKey) => {
+        const all = subjectTopics(subjectKey);
+        set(s => ({
+          selectedTopics: all,
+          topicsBySubject: { ...s.topicsBySubject, [subjectKey]: all },
+        }));
+      },
 
       toggleSubjectCollapse: (subjectKey) =>
         set(s => ({
@@ -256,7 +286,22 @@ export const useNamespaceStore = create<NamespaceStore>()(
 
       getPrimaryNamespaceKey: () => get().selectedTopics[0] ?? "cs.AI",
     }),
-    { name: "rf-namespace-v3" }
+    {
+      name: "rf-namespace-v4",
+      // Migrate: prior versions persisted only `selectedTopics` flat. Seed
+      // `topicsBySubject` from the snapshot so the first switch doesn't blank.
+      migrate: (persisted, _version) => {
+        const p = (persisted ?? {}) as Partial<NamespaceStore>;
+        if (!p.topicsBySubject && p.activeSubject && p.selectedTopics) {
+          return {
+            ...p,
+            topicsBySubject: { [p.activeSubject]: p.selectedTopics },
+          } as NamespaceStore;
+        }
+        return p as NamespaceStore;
+      },
+      version: 4,
+    },
   )
 );
 

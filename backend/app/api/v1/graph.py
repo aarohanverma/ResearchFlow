@@ -17,6 +17,7 @@ from app.services.graph import GraphService
 log = logging.getLogger(__name__)
 
 _BUILD_CACHE_TTL = 7_200  # 2 h — keeps job status accessible after completion
+_BUILD_TASKS: dict[str, asyncio.Task] = {}
 
 # Limit concurrent deep-build tasks to avoid exhausting the LLM rate limit
 # and saturating the DB connection pool when many namespaces are selected.
@@ -269,7 +270,16 @@ async def _run_build_deep_background(
         async with _BUILD_SEMAPHORE:
             async with async_session_factory() as db:
                 svc = GraphService(db)
-                result = await svc.build_deep_graph(namespace_key, orientation=orientation)
+
+                async def _should_cancel() -> bool:
+                    data = await cache.get(f"graph:build:{job_id}")
+                    return bool(data and data.get("cancel_requested"))
+
+                result = await svc.build_deep_graph(
+                    namespace_key,
+                    orientation=orientation,
+                    should_cancel=_should_cancel,
+                )
 
         if result.get("already_up_to_date"):
             msg = "Graph is already up to date — no new papers since last build."
@@ -283,6 +293,11 @@ async def _run_build_deep_background(
                 f"{result.get('related_edges_added', 0)} related-to edges added."
             )
 
+        # Ensure subgraph cache is clear before writing "done" so the frontend's
+        # loadGraph() call (triggered by status transition) always hits fresh DB data.
+        await GraphService.clear_subgraph_cache(namespace_key)
+        await GraphService.clear_subgraph_cache(None)
+
         await cache.set(
             f"graph:build:{job_id}",
             {"status": "done", "namespace_key": namespace_key, "result": result, "message": msg},
@@ -290,11 +305,25 @@ async def _run_build_deep_background(
         )
         log.info("build_deep_background: job=%s done namespace=%s", job_id, namespace_key)
 
+    except asyncio.CancelledError:
+        msg = "Graph build cancelled. Partial taxonomy committed before cancellation remains available."
+        await cache.set(
+            f"graph:build:{job_id}",
+            {
+                "status": "cancelled",
+                "namespace_key": namespace_key,
+                "message": msg,
+                "cancel_requested": True,
+            },
+            ttl_seconds=_BUILD_CACHE_TTL,
+        )
+        log.info("build_deep_background: job=%s cancelled namespace=%s", job_id, namespace_key)
+        raise
     except Exception as exc:
         log.exception("build_deep_background: job=%s FAILED: %s", job_id, exc)
         await cache.set(
             f"graph:build:{job_id}",
-            {"status": "failed", "namespace_key": namespace_key, "error": str(exc)},
+            {"status": "failed", "namespace_key": namespace_key, "error": str(exc), "message": str(exc)},
             ttl_seconds=_BUILD_CACHE_TTL,
         )
     finally:
@@ -349,13 +378,15 @@ async def build_deep_graph_background(
     await cache.set(lock_key, job_id, ttl_seconds=_BUILD_CACHE_TTL)
     await cache.set(
         f"graph:build:{job_id}",
-        {"status": "running", "namespace_key": namespace_key},
+        {"status": "running", "namespace_key": namespace_key, "lock_key": lock_key, "cancel_requested": False},
         ttl_seconds=_BUILD_CACHE_TTL,
     )
 
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_build_deep_background(job_id, namespace_key, orientation, lock_key)
     )
+    _BUILD_TASKS[job_id] = task
+    task.add_done_callback(lambda _: _BUILD_TASKS.pop(job_id, None))
 
     return {
         "job_id": job_id,
@@ -370,13 +401,37 @@ async def build_deep_status(job_id: str, user_id: CurrentUserID):
     """Poll the status of a background Build Deep job.
 
     Returns ``{status, message, result}`` where ``status`` is one of
-    ``"running"``, ``"done"``, or ``"failed"``.
+    ``"running"``, ``"done"``, ``"failed"``, or ``"cancelled"``.
     """
     cache = get_cache()
     data = await cache.get(f"graph:build:{job_id}")
     if data is None:
         return {"status": "not_found", "message": "Job not found or expired (TTL 2 h)."}
     return data
+
+
+@router.post("/build-deep/{job_id}/cancel", status_code=200)
+async def cancel_build_deep(job_id: str, user_id: CurrentUserID):
+    """Cancel a running Build Deep task and release its namespace lock."""
+    cache = get_cache()
+    data = await cache.get(f"graph:build:{job_id}")
+    if data is None:
+        return {"status": "not_found", "message": "Job not found or expired."}
+
+    lock_key = data.get("lock_key")
+    task = _BUILD_TASKS.get(job_id)
+    if task and not task.done():
+        task.cancel()
+
+    data.update({
+        "status": "cancelled",
+        "cancel_requested": True,
+        "message": "Graph build cancellation requested. Partial graph state was preserved.",
+    })
+    await cache.set(f"graph:build:{job_id}", data, ttl_seconds=_BUILD_CACHE_TTL)
+    if lock_key:
+        await cache.delete(lock_key)
+    return {"status": "cancelled", "job_id": job_id}
 
 
 @router.post("/deduplicate", status_code=200)
@@ -458,7 +513,13 @@ async def clear_graph(
     user_id: CurrentUserID,
     namespace_keys: str | None = Query(default=None, description="Comma-separated namespaces to clear. Omit to clear all."),
 ):
-    """Delete graph nodes/edges and caches scoped to the given namespaces (or all if omitted)."""
+    """Delete graph nodes/edges and caches scoped to the given namespaces (or all if omitted).
+
+    Race-safety: any in-flight Build Deep tasks targeting an affected namespace
+    are cancelled BEFORE the DELETE statements run. Without this, a running
+    builder would continue inserting nodes/edges into a now-empty graph and
+    leave an inconsistent partial state behind.
+    """
     from app.models.graph import KnowledgeNode, KnowledgeEdge
     from sqlalchemy import delete, or_
     import hashlib as _hl
@@ -466,6 +527,31 @@ async def clear_graph(
     ns_list: list[str] | None = None
     if namespace_keys:
         ns_list = [k.strip() for k in namespace_keys.split(",") if k.strip()]
+
+    # Cancel any in-flight Build Deep job that targets a cleared namespace.
+    # When no namespace filter is supplied we cancel every running build.
+    cache = get_cache()
+    cancelled_jobs: list[str] = []
+    for job_id, task in list(_BUILD_TASKS.items()):
+        if task.done():
+            continue
+        data = await cache.get(f"graph:build:{job_id}") or {}
+        target_ns = data.get("namespace_key")
+        if ns_list is not None and target_ns not in ns_list:
+            continue
+        task.cancel()
+        data["cancel_requested"] = True
+        data["status"] = "cancelled"
+        await cache.set(f"graph:build:{job_id}", data, ttl_seconds=_BUILD_CACHE_TTL)
+        lock_key = data.get("lock_key")
+        if lock_key:
+            await cache.delete(lock_key)
+        cancelled_jobs.append(job_id)
+    if cancelled_jobs:
+        # Give cancellation a brief moment to land — short enough not to block
+        # the request, long enough that most in-flight INSERTs return first.
+        import asyncio as _a
+        await _a.sleep(0.1)
 
     if ns_list:
         # Scoped clear: remove nodes whose namespace_key is in the list
@@ -495,7 +581,6 @@ async def clear_graph(
     await db.commit()
 
     # Clear subgraph cache + build locks only for the affected namespaces
-    cache = get_cache()
     targets = ns_list if ns_list else [None]  # None → global "__all__" hash
     for ns in targets:
         await GraphService.clear_subgraph_cache(ns)
@@ -505,7 +590,10 @@ async def clear_graph(
     await GraphService.clear_subgraph_cache(None)
 
     scope = ", ".join(ns_list) if ns_list else "all namespaces"
-    return {"message": f"Graph cleared for {scope}. Run Build Deep to regenerate."}
+    msg = f"Graph cleared for {scope}. Run Build Deep to regenerate."
+    if cancelled_jobs:
+        msg += f" Cancelled {len(cancelled_jobs)} in-flight build(s)."
+    return {"message": msg, "cancelled_jobs": cancelled_jobs}
 
 
 @router.post("/cleanup", status_code=200)

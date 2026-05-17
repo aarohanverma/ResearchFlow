@@ -21,6 +21,23 @@ from app.workflows.genie import run_genie, run_genie_background
 
 router = APIRouter(prefix="/genie", tags=["genie"])
 
+# Strong references to background tasks so Python 3.12+ doesn't GC them while
+# they're still running (which would emit a RuntimeWarning and may cancel the
+# task before the workflow completes). Tasks self-remove on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task:
+    """Root a fire-and-forget coroutine in :data:`_background_tasks`.
+
+    Returns the task so callers can attach additional callbacks if needed.
+    The task is removed from the set on completion so the set stays bounded.
+    """
+    task = asyncio.create_task(coro, name=name) if name else asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 @router.get("/elements")
 async def list_elements(
@@ -271,8 +288,8 @@ async def synthesize_background(body: GenieRequest, user_id: CurrentUserID, db: 
     """
     if len(body.seed_element_ids) < 2:
         raise HTTPException(status_code=400, detail="At least 2 seed elements required")
-    if len(body.seed_element_ids) > 5:
-        raise HTTPException(status_code=422, detail="Background synthesis accepts 2–5 seed elements. Use the inline endpoint for up to 10.")
+    if len(body.seed_element_ids) > 10:
+        raise HTTPException(status_code=422, detail="Background synthesis accepts 2–10 seed elements.")
 
     session = GenieSession(
         user_id=user_id,
@@ -284,12 +301,13 @@ async def synthesize_background(body: GenieRequest, user_id: CurrentUserID, db: 
     await db.commit()
 
     # Fire and forget (manual background synthesis)
-    asyncio.create_task(
+    _spawn_background(
         run_genie_background(
             user_id, str(session.id), body.seed_element_ids, body.namespace_key or "cs.AI",
             sem_threshold=body.sem_threshold,
             source_mode="manual",
-        )
+        ),
+        name=f"genie:manual:{session.id}",
     )
 
     return {"session_id": str(session.id), "status": "running"}
@@ -349,12 +367,12 @@ async def synthesize_auto(
 
     if namespace_key:
         rows = await db.execute(
-            sa_text("SELECT id, title FROM papers WHERE namespace_key = :ns ORDER BY (novelty_score + relevance_score) DESC LIMIT 6"),
+            sa_text("SELECT id, title FROM papers WHERE namespace_key = :ns ORDER BY (novelty_score + relevance_score) DESC LIMIT 10"),
             {"ns": namespace_key},
         )
     else:
         rows = await db.execute(
-            sa_text("SELECT id, title FROM papers ORDER BY (novelty_score + relevance_score) DESC LIMIT 6")
+            sa_text("SELECT id, title FROM papers ORDER BY (novelty_score + relevance_score) DESC LIMIT 10")
         )
     top_papers = rows.fetchall()
 
@@ -385,7 +403,7 @@ async def synthesize_auto(
             await db.flush()
         seed_ids.append(str(el.id))
 
-    seed_ids = seed_ids[:5]
+    seed_ids = seed_ids[:10]
     session = GenieSession(user_id=user_id, seed_element_ids=seed_ids, status="running")
     db.add(session)
     await db.flush()
@@ -894,13 +912,14 @@ async def auto_batch_synthesis(
     await db.commit()
 
     for session_id_bg, el_ids_bg, ns_bg in pending_tasks:
-        asyncio.create_task(
+        _spawn_background(
             run_genie_background(
                 user_id, session_id_bg, el_ids_bg, ns_bg,
                 is_auto=True,
                 sem_threshold=sem_threshold,
                 source_mode="auto",
-            )
+            ),
+            name=f"genie:auto:{session_id_bg}",
         )
 
     return {
@@ -1298,12 +1317,13 @@ async def query_discover(
             await db.flush()
             await db.commit()
 
-            asyncio.create_task(
+            _spawn_background(
                 run_genie_background(
                     user_id, str(session.id), el_ids, ns_for_session, is_auto=True,
                     source_mode="query",
                     source_query=rewritten or query,
-                )
+                ),
+                name=f"genie:query:{session.id}",
             )
             session_id_result = str(session.id)
         except Exception as exc:
@@ -1614,8 +1634,122 @@ async def deep_dive_background(capsule_id: uuid.UUID, user_id: CurrentUserID, db
     capsule.deep_dive_status = "generating"
     await db.commit()
 
-    asyncio.create_task(run_deep_dive_background(str(capsule_id), str(user_id)))
+    _spawn_background(
+        run_deep_dive_background(str(capsule_id), str(user_id)),
+        name=f"genie:deep_dive:{capsule_id}",
+    )
     return {"status": "generating", "capsule_id": str(capsule_id)}
+
+
+# ── Capsule combine — fuse two ideas into a hybrid hypothesis ────────────────
+
+class CapsuleCombineRequest(BaseModel):
+    """Request body for POST /genie/capsules/combine.
+
+    Accepts the new multi-parent form ``capsule_ids`` (2–3 ids) and also the
+    legacy pair form ``capsule_a_id`` / ``capsule_b_id`` so existing callers
+    keep working. The two-id legacy fields are merged into ``capsule_ids`` at
+    request-validation time.
+    """
+
+    capsule_ids: list[uuid.UUID] | None = None
+    capsule_a_id: uuid.UUID | None = None
+    capsule_b_id: uuid.UUID | None = None
+
+
+@router.post("/capsules/combine", status_code=202)
+async def combine_capsules(
+    body: CapsuleCombineRequest,
+    user_id: CurrentUserID,
+    db: DBSession,
+):
+    """Queue a hybrid-idea combine in the background; returns immediately with a session id.
+
+    The combine pipeline runs a strict feasibility judge (must identify a bridge,
+    overlap, or shared-system relationship), pulls source paper chunks from both
+    parents, runs a reasoning-tier fusion synthesis, refines weak fields, then
+    generates a Mermaid concept map and a PoC code sketch — all without any
+    token-budget truncation. The full run takes anywhere from ~20 s (cached deep
+    dives, light grounding) to several minutes (cold deep dives on the parents).
+
+    Because the wall-clock cost is unpredictable, the endpoint returns a
+    ``GenieSession`` id immediately and runs the workflow as a background task
+    rooted in :data:`_background_tasks`. The frontend polls
+    ``GET /genie/sessions/{session_id}`` to watch progress: ``status="running"``
+    while in flight, ``status="done"`` with ``result_capsule_id`` set on success,
+    ``status="failed"`` or ``status="done_empty"`` with the judge's reason in
+    ``error`` on rejection.
+
+    Args:
+        body: ``CapsuleCombineRequest`` with the two parent capsule UUIDs.
+        user_id: UUID of the authenticated user (must own both capsules).
+        db: Injected async DB session — used only to pre-validate the parents
+            and create the session row.
+
+    Returns:
+        ``{"session_id": str, "status": "running", "parent_ids": [str, str]}``
+
+    Raises:
+        HTTPException(400): when the two ids are identical.
+        HTTPException(404): when either parent capsule is missing or not owned
+            by the user (cheap up-front check before any LLM cost).
+    """
+    from app.models.genie import GenieSession
+    from app.workflows.genie_combine import run_capsule_combine_background
+
+    # Reconcile request shape — prefer ``capsule_ids`` when supplied, otherwise
+    # fall back to the legacy pair fields. Either path must yield 2–3 distinct
+    # capsule ids before we burn any LLM tokens.
+    ids: list[uuid.UUID] = list(body.capsule_ids or [])
+    if not ids and body.capsule_a_id and body.capsule_b_id:
+        ids = [body.capsule_a_id, body.capsule_b_id]
+    if len(ids) < 2 or len(ids) > 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Combine requires 2 or 3 capsule ids (`capsule_ids`).",
+        )
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=400, detail="Capsule ids must be distinct.")
+
+    # Cheap ownership pre-check.
+    found = await db.execute(
+        select(IdeaCapsule.id).where(
+            IdeaCapsule.id.in_(ids),
+            IdeaCapsule.user_id == user_id,
+        )
+    )
+    found_ids = {row[0] for row in found.fetchall()}
+    if len(found_ids) < len(ids):
+        raise HTTPException(
+            status_code=404,
+            detail="One or more capsules not found (or not owned by this user).",
+        )
+
+    # Create the session row up-front so the UI has something to poll.
+    session = GenieSession(
+        user_id=user_id,
+        seed_element_ids=[],
+        status="running",
+    )
+    db.add(session)
+    await db.flush()
+    session_id = session.id
+    await db.commit()
+
+    _spawn_background(
+        run_capsule_combine_background(
+            user_id=user_id,
+            capsule_ids=ids,
+            session_id=session_id,
+        ),
+        name=f"genie:combine:{session_id}",
+    )
+
+    return {
+        "session_id": str(session_id),
+        "status": "running",
+        "parent_ids": [str(i) for i in ids],
+    }
 
 
 class CapsuleChatRequest(BaseModel):

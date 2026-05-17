@@ -18,6 +18,7 @@ export interface Paper {
   is_breakthrough: boolean;
   tldr: string | null;
   ingested_at: string;
+  is_manually_imported?: boolean;
 }
 
 export interface FeedItem {
@@ -90,7 +91,7 @@ export interface IdeaCapsule {
   seed_element_ids: string[];
   status: "draft" | "saved" | "dismissed";
   is_scout_generated: boolean;
-  source_mode: "manual" | "auto" | "query";
+  source_mode: "manual" | "auto" | "query" | "combined";
   source_query: string | null;
   deep_dive_content?: string | null;
   deep_dive_status?: string;

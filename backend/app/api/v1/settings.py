@@ -213,6 +213,7 @@ class ApiKeysRequest(BaseModel):
     openai_key: str | None = None
     anthropic_key: str | None = None
     google_key: str | None = None
+    wolfram_key: str | None = None
 
 
 @router.get("/api-keys")
@@ -224,7 +225,6 @@ async def get_api_keys(user_id: CurrentUserID, db: DBSession):
     ps = await repo.get_provider_settings(user_id)
 
     def _mask(val: str | None) -> str:
-        """Mask an API key string, showing only the first 4 characters and replacing the rest with bullets."""
         if not val:
             return ""
         visible = val[:4]
@@ -234,15 +234,17 @@ async def get_api_keys(user_id: CurrentUserID, db: DBSession):
         "openai":    _cfg.openai_api_key,
         "anthropic": _cfg.anthropic_api_key,
         "google":    _cfg.google_api_key,
+        "wolfram":   _cfg.wolfram_alpha_app_id,
     }
     user_keys = {
         "openai":    ps.encrypted_openai_key    if ps else None,
         "anthropic": ps.encrypted_anthropic_key if ps else None,
         "google":    ps.encrypted_google_key    if ps else None,
+        "wolfram":   ps.encrypted_wolfram_key   if ps else None,
     }
 
     result = {}
-    for provider in ("openai", "anthropic", "google"):
+    for provider in ("openai", "anthropic", "google", "wolfram"):
         env_val  = env_keys[provider] or ""
         user_val = user_keys[provider] or ""
         is_overridden = bool(user_val)
@@ -267,6 +269,8 @@ async def update_api_keys(body: ApiKeysRequest, user_id: CurrentUserID, db: DBSe
         updates["encrypted_anthropic_key"] = body.anthropic_key or None
     if body.google_key is not None:
         updates["encrypted_google_key"]    = body.google_key    or None
+    if body.wolfram_key is not None:
+        updates["encrypted_wolfram_key"]   = body.wolfram_key   or None
     if updates:
         await repo.update_provider_settings(user_id, updates)
         await db.commit()

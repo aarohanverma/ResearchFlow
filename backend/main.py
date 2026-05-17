@@ -163,6 +163,20 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("search index creation skipped: %s", exc)
 
+    # Enable pg_trgm for fuzzy keyword search (idempotent, silently skipped if unavailable)
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_papers_title_trgm
+                ON papers USING GIN (title gin_trgm_ops)
+            """))
+        log.info("pg_trgm extension and trigram index ensured")
+    except Exception as exc:
+        log.warning("pg_trgm setup skipped (fuzzy search will degrade to ILIKE): %s", exc)
+
     # Schema migrations — ADD COLUMN IF NOT EXISTS is idempotent
     try:
         from app.db.session import engine
@@ -235,6 +249,42 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("papers parser-metadata migration skipped: %s", exc)
 
+    # Add is_manually_imported flag to papers (idempotent)
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                ALTER TABLE papers
+                ADD COLUMN IF NOT EXISTS is_manually_imported BOOLEAN NOT NULL DEFAULT FALSE
+            """))
+        log.info("papers.is_manually_imported column ensured")
+    except Exception as exc:
+        log.warning("papers.is_manually_imported migration skipped: %s", exc)
+
+    # Create paper_namespace_hides table (idempotent) — stores per-user, per-namespace hide state
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS paper_namespace_hides (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    paper_id UUID NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                    namespace_key VARCHAR(100) NOT NULL,
+                    hidden_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_paper_hide UNIQUE (user_id, paper_id, namespace_key)
+                )
+            """))
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_paper_hides_user_ns
+                ON paper_namespace_hides (user_id, namespace_key)
+            """))
+        log.info("paper_namespace_hides table ensured")
+    except Exception as exc:
+        log.warning("paper_namespace_hides table creation skipped: %s", exc)
+
     # Ensure the guest/test user always exists in local dev — idempotent
     if settings.environment == "local":
         try:
@@ -252,6 +302,19 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("LangGraph checkpoint store init failed (workflows will run without checkpointing): %s", exc)
 
+    # Add created_at to langgraph_checkpoints if it was created before this column existed.
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                ALTER TABLE langgraph_checkpoints
+                ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            """))
+        log.info("langgraph_checkpoints.created_at column ensured")
+    except Exception as exc:
+        log.warning("langgraph_checkpoints migration skipped: %s", exc)
+
     # Sweep any GeneratedArtifact rows left in ``running``/``queued`` state by
     # a previous worker crash. With checkpointing active, jobs that have partial
     # state are re-dispatched from the last completed node rather than restarted
@@ -263,6 +326,26 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             log.info("startup recovery: %d orphaned generation job(s) processed", recovered)
     except Exception as exc:
         log.warning("startup recovery skipped: %s", exc)
+
+    # Reconcile any AssistantTask rows left as running/pending by a previous
+    # worker crash. Recent + cancellable tasks are re-submitted (the
+    # orchestrator's idempotent step replay skips completed steps); stale or
+    # too-old tasks are marked failed so the UI doesn't show forever-spinners.
+    try:
+        # Importing the service registers the orchestrator with the scheduler,
+        # which reconcile_orphans needs.
+        import app.services.research_assistant  # noqa: F401
+        from app.assistant.recovery import reconcile_orphans
+        recovery_counts = await reconcile_orphans()
+        if any(recovery_counts.values()):
+            log.info(
+                "assistant recovery: resumed=%d failed=%d cancelled=%d",
+                recovery_counts["resumed"],
+                recovery_counts["failed"],
+                recovery_counts["cancelled"],
+            )
+    except Exception as exc:
+        log.warning("assistant recovery skipped: %s", exc)
 
     start_scheduler()
     log.info("scheduler started")

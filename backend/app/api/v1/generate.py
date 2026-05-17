@@ -223,7 +223,12 @@ async def list_jobs(user_id: CurrentUserID):
     JobsPanel to surface generation jobs alongside Study/Genie/Graph jobs.
     """
     store = get_job_store()
-    jobs = await store.list_by_user(str(user_id))
+    all_jobs = await store.list_by_user(str(user_id))
+    # Filter to only media-generation jobs — the store is shared with assistant
+    # tasks (kind="assistant") which must not appear here or the frontend will
+    # try to render them as GenerationJob objects (missing generation_type →
+    # "undefined generation started" toast).
+    jobs = [j for j in all_jobs if j.get("generation_type") is not None]
     return JobsListResponse(jobs=jobs, total=len(jobs))
 
 

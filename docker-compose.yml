@@ -32,6 +32,19 @@ services:
       timeout: 5s
       retries: 5
 
+  # Official arXiv MCP server (stdio). Pinned for parity with the in-process
+  # `arxiv-mcp-server` pip dep installed in the backend image. Kept alive as
+  # a sidecar so `docker compose run arxiv-mcp ...` works for ad-hoc CLI use;
+  # the backend itself spawns a local subprocess (no socket bridge needed).
+  arxiv-mcp:
+    image: mcp/arxiv-mcp-server:latest
+    restart: unless-stopped
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - arxiv_papers:/data/papers
+    environment:
+      ARXIV_STORAGE_PATH: /data/papers
+
   backend:
     build:
       context: ./backend
@@ -45,9 +58,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      arxiv-mcp:
+        condition: service_started
     volumes:
       - ./backend:/app
       - blobcache:/var/cache/researchflow
+      - arxiv_papers:/data/papers
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
@@ -70,3 +86,4 @@ volumes:
   pgdata:
   redisdata:
   blobcache:
+  arxiv_papers:

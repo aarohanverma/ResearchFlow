@@ -79,6 +79,7 @@ class PaperResponse(BaseModel):
     is_breakthrough: bool
     tldr: str | None = None
     ingested_at: datetime
+    is_manually_imported: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -278,6 +279,7 @@ class SearchResultItem(BaseModel):
     novelty_score: float
     relevance_score: float
     is_breakthrough: bool
+    is_manually_imported: bool = False
     key_concepts: list[str] | None = None
     methods_used: list[str] | None = None
     implications: str | None = None
@@ -285,7 +287,7 @@ class SearchResultItem(BaseModel):
     ingested_at: datetime | None = None
     tldr: str | None = None
     search_score: float
-    match_type: str   # "keyword" | "semantic" | "hybrid"
+    match_type: str   # "keyword" | "semantic" | "hybrid" | "deep"
 
 
 class SearchResponse(BaseModel):
@@ -323,6 +325,11 @@ class DeepSearchRequest(BaseModel):
                     "Omit to search all indexed papers.",
     )
     limit: int = Field(default=20, ge=1, le=50, description="Maximum results to return")
+    include_arxiv_mcp: bool = Field(
+        default=True,
+        description="When useful, fetch fresh arXiv results through MCP and import non-duplicates into the feed.",
+    )
+    arxiv_max_results: int = Field(default=8, ge=0, le=25)
 
 
 class DeepSearchJobResponse(BaseModel):
@@ -341,3 +348,219 @@ class DeepSearchJobResponse(BaseModel):
     results: list[SearchResultItem] | None = None
     error: str | None = None
     cached: bool = False
+    imported_count: int = 0
+
+
+# ── Research Assistant ────────────────────────────────────────────────────────
+
+class AssistantSessionCreateRequest(BaseModel):
+    """Request body for creating a Research Assistant session."""
+
+    title: str | None = Field(default=None, max_length=240)
+    namespace_key: str = Field(min_length=1, max_length=120)
+    topic_keys: list[str] = Field(default_factory=list, max_length=32)
+
+
+class AssistantMessageRequest(BaseModel):
+    """Request body for submitting a message to a Research Assistant session.
+
+    Bounds: ``namespace_key`` 1–120 chars; up to 32 topic keys per turn; up to
+    16 attachment refs. These caps mirror the implicit DB column lengths so an
+    overflow trips validation before reaching the orchestrator.
+    """
+
+    content: str = Field(min_length=1, max_length=6000)
+    namespace_key: str = Field(min_length=1, max_length=120)
+    topic_keys: list[str] = Field(default_factory=list, max_length=32)
+    attachments: list[dict] = Field(default_factory=list, max_length=16)
+
+
+class AssistantBranchRequest(BaseModel):
+    """Request body for branching an existing Research Assistant session."""
+
+    from_message_id: UUID | None = None
+    title: str | None = Field(default=None, max_length=240)
+
+
+class AssistantMessageResponse(BaseModel):
+    """Persisted assistant workspace message."""
+
+    id: UUID
+    session_id: UUID
+    role: str
+    content: str
+    message_type: str
+    citations: list[str]
+    artifact_refs: list[dict]
+    payload: dict
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantTaskResponse(BaseModel):
+    """Persisted assistant background task."""
+
+    id: UUID
+    job_id: str
+    session_id: UUID
+    assistant_message_id: UUID | None
+    task_type: str
+    title: str
+    namespace_key: str
+    status: str
+    progress: dict
+    result: dict
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantSessionResponse(BaseModel):
+    """Persistent Research Assistant session summary/detail."""
+
+    id: UUID
+    title: str
+    namespace_key: str
+    topic_keys: list[str]
+    parent_session_id: UUID | None
+    branch_from_message_id: UUID | None
+    orientation: str
+    expertise_level: str
+    summary: str | None
+    state: dict
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    messages: list[AssistantMessageResponse] = []
+    tasks: list[AssistantTaskResponse] = []
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantSubmitResponse(BaseModel):
+    """Response after queuing an assistant orchestration turn."""
+
+    session: AssistantSessionResponse
+    user_message: AssistantMessageResponse
+    assistant_message: AssistantMessageResponse
+    task: AssistantTaskResponse
+
+
+class AssistantStepResponse(BaseModel):
+    """A single tool invocation inside an assistant turn (reasoning-tree node)."""
+
+    id: UUID
+    session_id: UUID
+    parent_message_id: UUID
+    parent_step_id: UUID | None
+    job_id: str
+    step_index: int
+    tool_name: str
+    title: str
+    status: str
+    input_params: dict
+    output: dict
+    progress: dict
+    cost: dict
+    error: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantArtifactResponse(BaseModel):
+    """Generated output anchored in an assistant session."""
+
+    id: UUID
+    session_id: UUID
+    user_id: UUID
+    producing_step_id: UUID | None
+    producing_message_id: UUID | None
+    kind: str
+    ref_id: str
+    title: str
+    href: str | None
+    preview: dict
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssistantToolDescriptor(BaseModel):
+    """Schema-only view of a registered assistant tool."""
+
+    name: str
+    summary: str
+    cost_class: str
+    side_effects: bool
+    cancellable: bool
+    streamable: bool
+    input_schema: dict
+    output_schema: dict
+
+
+class AssistantAttachmentCreateRequest(BaseModel):
+    """Create a session-scoped attachment (note / URL / paper-ref / image / pdf)."""
+
+    kind: str = Field(min_length=1, max_length=40)  # note | url | paper_ref | pdf | image
+    label: str = Field(default="", max_length=240)
+    content: str | None = None
+    url: str | None = None
+    paper_id: UUID | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class AssistantAttachmentResponse(BaseModel):
+    """Persisted attachment row attached to an assistant session.
+
+    The model attribute is ``metadata_`` (trailing underscore — ``metadata``
+    is reserved by SQLAlchemy's declarative base). The Pydantic alias keeps
+    the JSON contract clean (``metadata``) while still reading from the model.
+    """
+
+    id: UUID
+    session_id: UUID
+    user_id: UUID
+    message_id: UUID | None
+    kind: str
+    label: str
+    content: str | None
+    url: str | None
+    paper_id: UUID | None
+    metadata: dict = Field(default_factory=dict, validation_alias="metadata_",
+                           serialization_alias="metadata")
+    created_at: datetime
+
+    model_config = {"from_attributes": True, "populate_by_name": True}
+
+
+class AssistantSessionRenameRequest(BaseModel):
+    """Body for PATCH /assistant/sessions/{id}/title."""
+
+    title: str = Field(min_length=1, max_length=240)
+
+
+class ArxivSearchRequest(BaseModel):
+    """Search arXiv through MCP/RSS fallback."""
+
+    query: str = Field(min_length=2, max_length=500)
+    namespace_keys: list[str] = []
+    max_results: int = Field(default=10, ge=1, le=50)
+
+
+class ArxivImportRequest(BaseModel):
+    """Import selected arXiv papers into the feed.
+
+    Bounds protect against memory-pressure attacks: ``papers`` is capped at
+    100 entries; each is a free-form dict but the service layer rejects ones
+    missing required fields. ``namespace_key`` must be non-empty.
+    """
+
+    namespace_key: str = Field(min_length=1, max_length=120)
+    papers: list[dict] = Field(min_length=1, max_length=100)

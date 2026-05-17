@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { BookmarkIcon, ExternalLinkIcon } from "lucide-react";
+import { BookmarkIcon, ExternalLinkIcon, EyeOffIcon, EyeIcon } from "lucide-react";
 import type { FeedItem } from "@/types";
 import { cleanAbstract } from "@/lib/utils";
 import { useBookmarksStore } from "@/store/bookmarks";
@@ -13,9 +13,11 @@ interface Props {
   isSelected: boolean;
   onClick: () => void;
   onFeedback: (paperId: string, signal: string) => void;
+  isHidden?: boolean;
+  onHide?: () => void;
 }
 
-export function PaperCard({ item, isSelected, onClick, onFeedback }: Props) {
+export function PaperCard({ item, isSelected, onClick, onFeedback, isHidden, onHide }: Props) {
   const { paper } = item;
   const { initialize, isBookmarked, add, remove } = useBookmarksStore();
   const bookmarked = isBookmarked(paper.id);
@@ -48,7 +50,7 @@ export function PaperCard({ item, isSelected, onClick, onFeedback }: Props) {
     <motion.div
       layout
       initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
+      animate={{ opacity: isHidden ? 0.45 : 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.96 }}
       transition={{ duration: 0.2 }}
       onClick={onClick}
@@ -57,9 +59,10 @@ export function PaperCard({ item, isSelected, onClick, onFeedback }: Props) {
       }`}
       style={{
         background: isSelected ? "rgba(99,102,241,0.06)" : "var(--rf-card)",
-        borderColor: isSelected ? undefined : "var(--rf-card-border)",
+        borderColor: isSelected ? undefined : isHidden ? "var(--rf-border)" : "var(--rf-card-border)",
         boxShadow: isSelected ? "0 4px 16px rgba(99,102,241,0.08)" : "0 1px 3px rgba(0,0,0,0.04)",
         transform: "translateZ(0)",
+        filter: isHidden ? "saturate(0.5)" : undefined,
       }}
     >
       {/* Top row */}
@@ -157,6 +160,21 @@ export function PaperCard({ item, isSelected, onClick, onFeedback }: Props) {
             )}
           </AnimatePresence>
         </div>
+
+        {onHide && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onHide(); }}
+            title={isHidden ? "Unhide from this namespace" : "Hide from this namespace"}
+            className={`flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1.5 rounded-lg transition-all duration-150 ${
+              isHidden
+                ? "text-indigo-400 bg-indigo-950/40 hover:bg-indigo-900/40"
+                : "text-gray-600 hover:text-gray-300 hover:bg-gray-800"
+            }`}
+          >
+            {isHidden ? <EyeIcon size={12} /> : <EyeOffIcon size={12} />}
+            {isHidden ? "Unhide" : "Hide"}
+          </button>
+        )}
 
         <a
           href={paper.source_url}

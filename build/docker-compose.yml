@@ -43,6 +43,20 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── arXiv MCP server (official Docker Hub image, stdio) ────────────────────
+  # Pinned for parity with the in-process `arxiv-mcp-server` pip dep in the
+  # backend image. Kept alive as a sidecar so the official binary can also be
+  # invoked ad-hoc via `docker compose run arxiv-mcp ...`. Backend itself
+  # spawns a local subprocess (stdio) — no socket bridge required.
+  arxiv-mcp:
+    image: mcp/arxiv-mcp-server:latest
+    restart: unless-stopped
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - arxiv_papers:/data/papers
+    environment:
+      ARXIV_STORAGE_PATH: /data/papers
+
   # ── FastAPI backend ─────────────────────────────────────────────────────────
   backend:
     build:
@@ -62,8 +76,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      arxiv-mcp:
+        condition: service_started
     volumes:
       - blobcache:/var/cache/researchflow
+      - arxiv_papers:/data/papers
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
@@ -94,3 +111,4 @@ volumes:
   pgdata:
   redisdata:
   blobcache:
+  arxiv_papers:

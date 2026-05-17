@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { api } from "@/lib/api";
+import { toast } from "@/hooks/use-toast";
 import type { GenerationSourceType } from "@/types";
 
 export interface StudyJob {
@@ -27,7 +28,7 @@ export interface GenieJob {
 export interface GraphBuildJob {
   job_id: string;
   namespace_key: string | null;
-  status: "running" | "done" | "failed";
+  status: "running" | "done" | "failed" | "cancelled";
   message: string | null;
   created_at: string;
   completed_at: string | null;
@@ -59,12 +60,60 @@ export interface DeepDiveJob {
   error: string | null;
 }
 
+export interface AssistantJob {
+  kind: "assistant";
+  job_id: string;
+  task_id: string;
+  session_id: string;
+  assistant_message_id: string | null;
+  title: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  namespace_key: string | null;
+  summary: string | null;
+  created_at: string;
+  completed_at: string | null;
+  href: string;
+}
+
+export interface ArxivImportJob {
+  job_id: string;
+  arxiv_id: string;
+  title: string;
+  namespace_key: string;
+  status: "running" | "completed" | "failed";
+  summary: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 export type AnyJob =
   | ({ kind: "study" } & StudyJob)
   | ({ kind: "genie" } & GenieJob)
   | ({ kind: "graph" } & GraphBuildJob)
   | ({ kind: "generation" } & GenerationJob)
-  | ({ kind: "deepdive" } & DeepDiveJob);
+  | ({ kind: "deepdive" } & DeepDiveJob)
+  | AssistantJob
+  | ({ kind: "arxiv_import" } & ArxivImportJob);
+
+const toastEvents = new Set<string>();
+
+function notifyJobEvent(key: string, title: string, status: string, summary?: string | null) {
+  const event =
+    status === "completed" || status === "done" ? "completed" :
+    status === "failed" || status === "error" ? "failed" :
+    status === "cancelled" ? "cancelled" :
+    status === "running" || status === "pending" || status === "queued" || status === "generating" ? "started" :
+    "";
+  if (!event) return;
+  const eventKey = `${key}:${event}`;
+  if (toastEvents.has(eventKey)) return;
+  toastEvents.add(eventKey);
+  toast({
+    title: `${title} ${event}`,
+    description: summary ?? undefined,
+    variant: event === "completed" ? "success" : event === "failed" ? "error" : "default",
+  });
+}
 
 interface JobsStore {
   jobs: StudyJob[];
@@ -72,6 +121,8 @@ interface JobsStore {
   graphBuildJobs: GraphBuildJob[];
   generationJobs: GenerationJob[];
   deepDiveJobs: DeepDiveJob[];
+  assistantJobs: AssistantJob[];
+  arxivImportJobs: ArxivImportJob[];
   // Artifact IDs dismissed this session. fetchJobs filters these out so
   // polls never resurrect a row the user already dismissed.
   // Plain string[] so Zustand can serialize it (Set is not JSON-safe).
@@ -79,6 +130,8 @@ interface JobsStore {
   // Same idea for study jobs — /study/jobs returns the full list every poll,
   // so dismissing locally without tracking the ID lets the next poll bring it back.
   dismissedStudyJobIds: string[];
+  dismissedAssistantJobIds: string[];
+  dismissedArxivImportJobIds: string[];
   // Per-job pin keys. Pinned jobs survive Clear All and cannot be dismissed.
   pinnedJobKeys: string[];
   unreadCount: number;
@@ -90,6 +143,7 @@ interface JobsStore {
   dismissGenieJob: (session_id: string) => void;
   dismissJob: (job_id: string) => void;
   addGraphBuildJob: (job: GraphBuildJob) => void;
+  cancelGraphBuildJob: (job_id: string) => Promise<void>;
   dismissGraphBuildJob: (job_id: string) => void;
   addGenerationJob: (job: GenerationJob) => void;
   updateGenerationJob: (artifact_id: string, updates: Partial<GenerationJob>) => void;
@@ -97,6 +151,10 @@ interface JobsStore {
   dismissGenerationJob: (artifact_id: string) => void;
   addDeepDiveJob: (job: DeepDiveJob) => void;
   dismissDeepDiveJob: (capsule_id: string) => void;
+  cancelAssistantJob: (job_id: string) => Promise<void>;
+  dismissAssistantJob: (job_id: string) => void;
+  addArxivImportJob: (job: ArxivImportJob) => void;
+  dismissArxivImportJob: (job_id: string) => void;
   pinJob: (key: string) => void;
   unpinJob: (key: string) => void;
   markRead: () => void;
@@ -110,8 +168,12 @@ export const useJobsStore = create<JobsStore>()(
       graphBuildJobs: [],
       generationJobs: [],
       deepDiveJobs: [],
+      assistantJobs: [],
+      arxivImportJobs: [],
       dismissedArtifactIds: [],
       dismissedStudyJobIds: [],
+      dismissedAssistantJobIds: [],
+      dismissedArxivImportJobIds: [],
       pinnedJobKeys: [],
       unreadCount: 0,
       lastSeenAt: null,
@@ -228,6 +290,47 @@ export const useJobsStore = create<JobsStore>()(
             })
           );
 
+          let updatedAssistant = get().assistantJobs;
+          try {
+            const remoteAssistant = await api.get<{ jobs: AssistantJob[]; total: number }>("/assistant/jobs");
+            const dismissedAssistant = new Set(get().dismissedAssistantJobIds);
+            const byId = new Map<string, AssistantJob>();
+            for (const j of remoteAssistant.jobs || []) {
+              if (!dismissedAssistant.has(j.job_id)) byId.set(j.job_id, j);
+            }
+            for (const j of get().assistantJobs) {
+              if (!dismissedAssistant.has(j.job_id) && !byId.has(j.job_id)) byId.set(j.job_id, j);
+            }
+            updatedAssistant = Array.from(byId.values());
+          } catch { /* assistant jobs are best-effort */ }
+
+          // Poll running arXiv import jobs — fetch status for each individually
+          // since the backend stores them by job_id in the job store.
+          const dismissedArxivSet = new Set(get().dismissedArxivImportJobIds);
+          const updatedArxiv = await Promise.all(
+            get().arxivImportJobs
+              .filter((j) => !dismissedArxivSet.has(j.job_id))
+              .map(async (j) => {
+                if (j.status === "completed" || j.status === "failed") return j;
+                try {
+                  const fresh = await api.get<ArxivImportJob>(
+                    `/papers/import-arxiv/status/${encodeURIComponent(j.job_id)}`
+                  );
+                  const terminal = fresh.status === "completed" || fresh.status === "failed";
+                  return {
+                    ...j,
+                    status: fresh.status,
+                    summary: fresh.summary ?? j.summary,
+                    completed_at: terminal && !j.completed_at
+                      ? new Date().toISOString()
+                      : j.completed_at,
+                  };
+                } catch {
+                  return j;
+                }
+              })
+          );
+
           const newStudyDone = jobs.filter(
             (j) =>
               j.status === "done" &&
@@ -264,6 +367,51 @@ export const useJobsStore = create<JobsStore>()(
               (!lastSeenAt || dj.completed_at > lastSeenAt)
           ).length;
 
+          const newAssistantDone = updatedAssistant.filter(
+            (aj) =>
+              aj.status === "completed" &&
+              aj.completed_at &&
+              (!lastSeenAt || aj.completed_at > lastSeenAt)
+          ).length;
+
+          const newArxivDone = updatedArxiv.filter(
+            (aj) =>
+              aj.status === "completed" &&
+              aj.completed_at &&
+              (!lastSeenAt || aj.completed_at > lastSeenAt)
+          ).length;
+
+          const prev = get();
+          for (const j of jobs) {
+            const old = prev.jobs.find((p) => p.job_id === j.job_id);
+            if (!old && (j.status === "pending" || j.status === "running")) notifyJobEvent(j.job_id, "Study job", j.status, j.paper_title);
+            if (old && old.status !== j.status) notifyJobEvent(j.job_id, "Study job", j.status, j.paper_title);
+          }
+          for (const j of updatedGraphBuilds) {
+            const old = prev.graphBuildJobs.find((p) => p.job_id === j.job_id);
+            if (!old && j.status === "running") notifyJobEvent(j.job_id, "Graph build", j.status, j.namespace_key ?? undefined);
+            if (old && old.status !== j.status) notifyJobEvent(j.job_id, "Graph build", j.status, j.message);
+          }
+          for (const j of updatedGeneration) {
+            const old = prev.generationJobs.find((p) => p.artifact_id === j.artifact_id);
+            if (!old && (j.status === "queued" || j.status === "running")) notifyJobEvent(j.artifact_id, `${j.generation_type} generation`, j.status, j.title);
+            if (old && old.status !== j.status) notifyJobEvent(j.artifact_id, `${j.generation_type} generation`, j.status, j.title);
+          }
+          for (const j of updatedDeepDives) {
+            const old = prev.deepDiveJobs.find((p) => p.capsule_id === j.capsule_id);
+            if (!old && j.status === "generating") notifyJobEvent(j.capsule_id, "Deep Dive", j.status, j.capsule_title);
+            if (old && old.status !== j.status) notifyJobEvent(j.capsule_id, "Deep Dive", j.status, j.capsule_title);
+          }
+          for (const j of updatedAssistant) {
+            const old = prev.assistantJobs.find((p) => p.job_id === j.job_id);
+            if (!old && (j.status === "pending" || j.status === "running")) notifyJobEvent(j.job_id, "Research Assistant", j.status, j.summary);
+            if (old && old.status !== j.status) notifyJobEvent(j.job_id, "Research Assistant", j.status, j.summary);
+          }
+          for (const j of updatedArxiv) {
+            const old = prev.arxivImportJobs.find((p) => p.job_id === j.job_id);
+            if (old && old.status !== j.status) notifyJobEvent(j.job_id, `Feed Import: ${j.namespace_key}`, j.status, j.summary);
+          }
+
           // Functional set so we re-filter against the LATEST dismissed list.
           // Without this, a dismiss action that fires between the poll's
           // network awaits and this set() call would be silently
@@ -275,13 +423,19 @@ export const useJobsStore = create<JobsStore>()(
             );
             const dropStudySet = new Set(s.dismissedStudyJobIds);
             const finalJobs = jobs.filter((j) => !dropStudySet.has(j.job_id));
+            const dropAssistantSet = new Set(s.dismissedAssistantJobIds);
+            const finalAssistant = updatedAssistant.filter((j) => !dropAssistantSet.has(j.job_id));
+            const dropArxivSet = new Set(s.dismissedArxivImportJobIds);
+            const finalArxiv = updatedArxiv.filter((j) => !dropArxivSet.has(j.job_id));
             return {
               jobs: finalJobs,
               genieJobs: updatedGenie,
               graphBuildJobs: updatedGraphBuilds,
               generationJobs: finalGen,
               deepDiveJobs: updatedDeepDives,
-              unreadCount: newStudyDone + newGenieDone + newGraphDone + newGenerationDone + newDeepDiveDone,
+              assistantJobs: finalAssistant,
+              arxivImportJobs: finalArxiv,
+              unreadCount: newStudyDone + newGenieDone + newGraphDone + newGenerationDone + newDeepDiveDone + newAssistantDone + newArxivDone,
             };
           });
         } catch {}
@@ -307,6 +461,7 @@ export const useJobsStore = create<JobsStore>()(
       },
 
       addGenieJob: (job) => {
+        notifyJobEvent(job.session_id, "Genie synthesis", job.status, job.label);
         set((s) => ({
           genieJobs: [
             ...s.genieJobs.filter((gj) => gj.session_id !== job.session_id),
@@ -342,6 +497,7 @@ export const useJobsStore = create<JobsStore>()(
       },
 
       addGraphBuildJob: (job) => {
+        notifyJobEvent(job.job_id, "Graph build", job.status, job.namespace_key ?? undefined);
         set((s) => ({
           graphBuildJobs: [
             ...s.graphBuildJobs.filter((g) => g.job_id !== job.job_id),
@@ -357,7 +513,21 @@ export const useJobsStore = create<JobsStore>()(
         });
       },
 
+      cancelGraphBuildJob: async (job_id) => {
+        set((s) => ({
+          graphBuildJobs: s.graphBuildJobs.map((g) =>
+            g.job_id === job_id
+              ? { ...g, status: "cancelled" as const, message: "Cancellation requested", completed_at: new Date().toISOString() }
+              : g
+          ),
+        }));
+        try {
+          await api.post(`/graph/build-deep/${encodeURIComponent(job_id)}/cancel`);
+        } catch {}
+      },
+
       addGenerationJob: (job) => {
+        notifyJobEvent(job.artifact_id, `${job.generation_type} generation`, job.status, job.title);
         set((s) => ({
           generationJobs: [
             ...s.generationJobs.filter((g) => g.artifact_id !== job.artifact_id),
@@ -394,6 +564,7 @@ export const useJobsStore = create<JobsStore>()(
       },
 
       addDeepDiveJob: (job) => {
+        notifyJobEvent(job.capsule_id, "Deep Dive", job.status, job.capsule_title);
         set((s) => ({
           deepDiveJobs: [
             ...s.deepDiveJobs.filter((d) => d.capsule_id !== job.capsule_id),
@@ -406,6 +577,53 @@ export const useJobsStore = create<JobsStore>()(
         set((s) => {
           if (s.pinnedJobKeys.includes(capsule_id)) return s;
           return { deepDiveJobs: s.deepDiveJobs.filter((d) => d.capsule_id !== capsule_id) };
+        });
+      },
+
+      cancelAssistantJob: async (job_id) => {
+        set((s) => ({
+          assistantJobs: s.assistantJobs.map((j) =>
+            j.job_id === job_id
+              ? { ...j, status: "cancelled" as const, summary: "Cancellation requested", completed_at: new Date().toISOString() }
+              : j
+          ),
+        }));
+        try {
+          await api.post(`/assistant/tasks/${encodeURIComponent(job_id)}/cancel`);
+        } catch {}
+      },
+
+      dismissAssistantJob: (job_id) => {
+        set((s) => {
+          if (s.pinnedJobKeys.includes(job_id)) return s;
+          return {
+            assistantJobs: s.assistantJobs.filter((j) => j.job_id !== job_id),
+            dismissedAssistantJobIds: s.dismissedAssistantJobIds.includes(job_id)
+              ? s.dismissedAssistantJobIds
+              : [...s.dismissedAssistantJobIds, job_id],
+          };
+        });
+      },
+
+      addArxivImportJob: (job) => {
+        notifyJobEvent(job.job_id, `Feed Import: ${job.namespace_key}`, job.status, job.summary);
+        set((s) => ({
+          arxivImportJobs: [
+            ...s.arxivImportJobs.filter((j) => j.job_id !== job.job_id),
+            job,
+          ],
+        }));
+      },
+
+      dismissArxivImportJob: (job_id) => {
+        set((s) => {
+          if (s.pinnedJobKeys.includes(job_id)) return s;
+          return {
+            arxivImportJobs: s.arxivImportJobs.filter((j) => j.job_id !== job_id),
+            dismissedArxivImportJobIds: s.dismissedArxivImportJobIds.includes(job_id)
+              ? s.dismissedArxivImportJobIds
+              : [...s.dismissedArxivImportJobIds, job_id],
+          };
         });
       },
 
@@ -441,7 +659,7 @@ export const useJobsStore = create<JobsStore>()(
       // whose generation_type is no longer supported (e.g. legacy "video"
       // / "interactive" rows from earlier installs) so the JobsPanel
       // never tries to render a deprecated card and crash the app.
-      version: 2,
+      version: 3,
       migrate: (persisted: unknown, _version: number) => {
         const state = (persisted ?? {}) as Partial<JobsStore>;
         const allowed = new Set<GenerationJob["generation_type"]>(["podcast", "slides"]);
@@ -454,6 +672,8 @@ export const useJobsStore = create<JobsStore>()(
         return {
           ...(state as object),
           generationJobs: cleanGen,
+          arxivImportJobs: Array.isArray(state.arxivImportJobs) ? state.arxivImportJobs : [],
+          dismissedArxivImportJobIds: Array.isArray(state.dismissedArxivImportJobIds) ? state.dismissedArxivImportJobIds : [],
         } as JobsStore;
       },
       partialize: (state) => ({
@@ -467,11 +687,15 @@ export const useJobsStore = create<JobsStore>()(
         // refresh anyway.
         genieJobs: state.genieJobs,
         graphBuildJobs: state.graphBuildJobs,
+        assistantJobs: state.assistantJobs,
+        arxivImportJobs: state.arxivImportJobs,
         pinnedJobKeys: state.pinnedJobKeys,
         // Persist dismissals — without these the backend re-serves dismissed
         // rows on hard reload and the notification returns.
         dismissedStudyJobIds: state.dismissedStudyJobIds,
         dismissedArtifactIds: state.dismissedArtifactIds,
+        dismissedAssistantJobIds: state.dismissedAssistantJobIds,
+        dismissedArxivImportJobIds: state.dismissedArxivImportJobIds,
       }),
     }
   )

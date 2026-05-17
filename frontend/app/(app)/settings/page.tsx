@@ -353,16 +353,57 @@ function TopicsPanel() {
 }
 
 /* ── Provider Panel ───────────────────────────────────────────────────────── */
+
+// Model catalogues — one block per provider so the UI never offers a model
+// the chosen provider cannot serve. Update these when providers ship a new
+// model; the dropdown order is "newest / strongest first within each tier".
+type LlmProvider = "openai" | "anthropic" | "google";
+type EmbeddingProvider = "openai" | "gemini" | "voyage";
+
+const LLM_MODELS: Record<LlmProvider, { cheap: string[]; quality: string[]; reasoning: string[] }> = {
+  openai: {
+    cheap:     ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-3.5-turbo"],
+    quality:   ["gpt-5.4-mini", "gpt-5-mini", "gpt-4.1", "gpt-4o"],
+    reasoning: ["gpt-5.4", "gpt-5", "o4-mini", "o3", "o3-mini", "o1"],
+  },
+  anthropic: {
+    cheap:     ["claude-haiku-4-5", "claude-haiku-3-5"],
+    quality:   ["claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-3-7"],
+    reasoning: ["claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"],
+  },
+  google: {
+    cheap:     ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"],
+    quality:   ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro"],
+    reasoning: ["gemini-2.5-pro", "gemini-1.5-pro"],
+  },
+};
+
+const EMBEDDING_MODELS: Record<EmbeddingProvider, string[]> = {
+  openai: ["text-embedding-3-large", "text-embedding-3-small", "text-embedding-ada-002"],
+  gemini: ["gemini-embedding-2-preview", "text-embedding-004"],
+  // Voyage adapter is reserved — the runtime falls back to OpenAI with a warning.
+  voyage: ["voyage-3", "voyage-3-large", "voyage-code-3"],
+};
+
+interface ProviderConfig {
+  llm_provider: LlmProvider;
+  cheap_model: string;
+  quality_model: string;
+  reasoning_model: string;
+  embedding_provider: EmbeddingProvider;
+  embedding_model: string;
+}
+
 function ProviderPanel() {
   // Initial values match config.py defaults; overwritten by the GET response
   // which always returns the effective backend configuration.
-  const [cfg, setCfg] = useState({
+  const [cfg, setCfg] = useState<ProviderConfig>({
     llm_provider: "openai",
     cheap_model: "gpt-4o-mini",
     quality_model: "gpt-5.4-mini",
     reasoning_model: "gpt-5.4",
-    embedding_provider: "gemini",
-    embedding_model: "gemini-embedding-2-preview",
+    embedding_provider: "openai",
+    embedding_model: "text-embedding-3-large",
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -370,7 +411,7 @@ function ProviderPanel() {
   useEffect(() => {
     // Backend always returns effective settings (DB row or system defaults),
     // so we can overwrite the local state unconditionally.
-    api.get<typeof cfg>("/settings/provider")
+    api.get<ProviderConfig>("/settings/provider")
       .then((d) => setCfg((c) => ({ ...c, ...d })))
       .catch(() => {});
   }, []);
@@ -385,14 +426,43 @@ function ProviderPanel() {
     setSaving(false);
   }
 
-  const fields = [
-    { key: "llm_provider",       label: "LLM Provider",       options: ["openai", "anthropic", "google"] },
-    { key: "cheap_model",        label: "Fast / Cheap Model",  options: ["gpt-4o-mini", "claude-haiku-4-5", "gemini-2.0-flash"] },
-    { key: "quality_model",      label: "Quality Model",       options: ["gpt-5.4-mini", "gpt-4o", "claude-sonnet-4-6", "gemini-2.5-pro"] },
-    { key: "reasoning_model",    label: "Reasoning Model",     options: ["gpt-5.4", "o3", "o3-mini", "claude-opus-4-7", "claude-opus-4-6"] },
-    { key: "embedding_provider", label: "Embedding Provider",  options: ["gemini", "openai", "voyage"] },
-    { key: "embedding_model",    label: "Embedding Model",     options: ["gemini-embedding-2-preview", "text-embedding-3-large", "voyage-3"] },
-  ] as const;
+  // When the LLM provider changes, snap each tier's model to the provider's
+  // first available option only if the current selection isn't valid for the
+  // new provider — that way switching providers doesn't silently keep the
+  // wrong model name selected and silently fall back at request time.
+  function setLlmProvider(next: LlmProvider) {
+    setCfg(c => {
+      const cat = LLM_MODELS[next];
+      return {
+        ...c,
+        llm_provider: next,
+        cheap_model:     cat.cheap.includes(c.cheap_model)     ? c.cheap_model     : cat.cheap[0],
+        quality_model:   cat.quality.includes(c.quality_model) ? c.quality_model   : cat.quality[0],
+        reasoning_model: cat.reasoning.includes(c.reasoning_model) ? c.reasoning_model : cat.reasoning[0],
+      };
+    });
+  }
+
+  function setEmbeddingProvider(next: EmbeddingProvider) {
+    setCfg(c => {
+      const opts = EMBEDDING_MODELS[next];
+      return {
+        ...c,
+        embedding_provider: next,
+        embedding_model: opts.includes(c.embedding_model) ? c.embedding_model : opts[0],
+      };
+    });
+  }
+
+  const cat = LLM_MODELS[cfg.llm_provider];
+  const embOpts = EMBEDDING_MODELS[cfg.embedding_provider];
+
+  // Tiers carry an explanatory hint so users know which model gets called when.
+  const tiers: { key: "cheap_model" | "quality_model" | "reasoning_model"; label: string; hint: string; options: string[] }[] = [
+    { key: "cheap_model",     label: "Fast / Cheap Model", hint: "Used for query rewrite, intent classification, rerank, enrichment batches.", options: cat.cheap },
+    { key: "quality_model",   label: "Quality Model",       hint: "Used for RAG synthesis, Genie hypothesize / critique, default Research Assistant turn.", options: cat.quality },
+    { key: "reasoning_model", label: "Reasoning Model",     hint: "Used for Genie elaborate, PoC code, Deep Dive article, idea-combine fusion.", options: cat.reasoning },
+  ];
 
   return (
     <Card
@@ -400,19 +470,64 @@ function ProviderPanel() {
       title="AI Provider Configuration"
       description="Changes take effect on the next request. Requires valid API keys in .env.local."
     >
-      <div className="space-y-3">
-        {fields.map(({ key, label, options }) => (
+      <div className="space-y-4">
+        {/* LLM provider */}
+        <div className="space-y-1">
+          <label className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">LLM Provider</label>
+          <select
+            value={cfg.llm_provider}
+            onChange={(e) => setLlmProvider(e.target.value as LlmProvider)}
+            className="w-full bg-gray-800 border border-gray-700/60 rounded-xl px-3.5 py-2.5 text-sm text-gray-300 outline-none focus:border-indigo-500 transition-colors"
+          >
+            <option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
+            <option value="google">google</option>
+          </select>
+        </div>
+
+        {/* Model tiers — gated to the chosen LLM provider */}
+        {tiers.map(({ key, label, hint, options }) => (
           <div key={key} className="space-y-1">
             <label className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">{label}</label>
             <select
-              value={(cfg as Record<string, string>)[key]}
+              value={cfg[key]}
               onChange={(e) => setCfg((c) => ({ ...c, [key]: e.target.value }))}
               className="w-full bg-gray-800 border border-gray-700/60 rounded-xl px-3.5 py-2.5 text-sm text-gray-300 outline-none focus:border-indigo-500 transition-colors"
             >
               {options.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
+            <p className="text-[10px] text-gray-600 mt-1">{hint}</p>
           </div>
         ))}
+
+        {/* Embedding provider + model (gated) */}
+        <div className="pt-2 border-t border-gray-800/60 space-y-4">
+          <div className="space-y-1">
+            <label className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">Embedding Provider</label>
+            <select
+              value={cfg.embedding_provider}
+              onChange={(e) => setEmbeddingProvider(e.target.value as EmbeddingProvider)}
+              className="w-full bg-gray-800 border border-gray-700/60 rounded-xl px-3.5 py-2.5 text-sm text-gray-300 outline-none focus:border-indigo-500 transition-colors"
+            >
+              <option value="openai">openai</option>
+              <option value="gemini">gemini</option>
+              <option value="voyage">voyage (reserved — falls back to openai at runtime)</option>
+            </select>
+          </div>
+          <div className="space-y-1">
+            <label className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">Embedding Model</label>
+            <select
+              value={cfg.embedding_model}
+              onChange={(e) => setCfg((c) => ({ ...c, embedding_model: e.target.value }))}
+              className="w-full bg-gray-800 border border-gray-700/60 rounded-xl px-3.5 py-2.5 text-sm text-gray-300 outline-none focus:border-indigo-500 transition-colors"
+            >
+              {embOpts.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+            <p className="text-[10px] text-gray-600 mt-1">
+              All embedding outputs are stored as 768-dim vectors (Matryoshka truncation when the model is larger).
+            </p>
+          </div>
+        </div>
       </div>
       <SaveButton saving={saving} saved={saved} onClick={save} />
     </Card>
@@ -421,14 +536,14 @@ function ProviderPanel() {
 
 /* ── API Keys Panel ───────────────────────────────────────────────────────── */
 interface KeyStatus { is_set: boolean; from_env: boolean; is_overridden: boolean; masked: string }
-interface ApiKeyState { openai: KeyStatus; anthropic: KeyStatus; google: KeyStatus }
-type Provider = "openai" | "anthropic" | "google";
+interface ApiKeyState { openai: KeyStatus; anthropic: KeyStatus; google: KeyStatus; wolfram: KeyStatus }
+type Provider = "openai" | "anthropic" | "google" | "wolfram";
 
 function ApiKeysPanel() {
   const [status, setStatus] = useState<ApiKeyState | null>(null);
   // null = not editing; "" = editing with empty value; "sk-..." = editing with typed value
-  const [editing, setEditing] = useState<Record<Provider, string | null>>({ openai: null, anthropic: null, google: null });
-  const [visible, setVisible] = useState<Record<Provider, boolean>>({ openai: false, anthropic: false, google: false });
+  const [editing, setEditing] = useState<Record<Provider, string | null>>({ openai: null, anthropic: null, google: null, wolfram: null });
+  const [visible, setVisible] = useState<Record<Provider, boolean>>({ openai: false, anthropic: false, google: false, wolfram: false });
   const [saving, setSaving] = useState<Provider | null>(null);
 
   useEffect(() => {
@@ -457,9 +572,10 @@ function ApiKeysPanel() {
   }
 
   const KEYS: { id: Provider; label: string; placeholder: string; hint: string }[] = [
-    { id: "openai",    label: "OpenAI",    placeholder: "sk-…",     hint: "Used for GPT models and text-embedding-3" },
-    { id: "anthropic", label: "Anthropic", placeholder: "sk-ant-…", hint: "Used for Claude models" },
-    { id: "google",    label: "Google",    placeholder: "AIza…",    hint: "Used for Gemini models and embeddings" },
+    { id: "openai",    label: "OpenAI",         placeholder: "sk-…",     hint: "Used for GPT models and text-embedding-3" },
+    { id: "anthropic", label: "Anthropic",      placeholder: "sk-ant-…", hint: "Used for Claude models" },
+    { id: "google",    label: "Google",         placeholder: "AIza…",    hint: "Used for Gemini models and embeddings" },
+    { id: "wolfram",   label: "Wolfram Alpha",  placeholder: "XXXX-…",   hint: "Enables the Wolfram Alpha computation tool in the Research Assistant (free at developer.wolframalpha.com)" },
   ];
 
   return (
@@ -772,23 +888,43 @@ function UsagePanel() {
             <StatCard label="Input tokens"  value={fmtNum(totals.input_tokens)}  tone="indigo" />
             <StatCard label="Output tokens" value={fmtNum(totals.output_tokens)} tone="violet" />
             <StatCard label="Total tokens"  value={fmtNum(totals.total_tokens)}  tone="emerald" emphasis />
-            <StatCard label="LLM calls"     value={fmtNum(totals.calls)}         tone="amber" sub={`${(totals.cost_usd || 0).toFixed(4)} USD est.`} />
+            <StatCard label="LLM calls"     value={fmtNum(totals.calls)}         tone="amber" />
           </div>
 
           {/* Per-day mini bar chart (only meaningful for multi-day ranges) */}
           {(data?.by_day.length || 0) > 1 && (
             <div className="bg-gray-900/40 border border-gray-800/60 rounded-xl p-4 mb-5">
               <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">Daily total</p>
+              {/* Fixed-height plot area so percentage-height bars render against
+                  a concrete reference. The label sits below the plot row, not
+                  inside it (an items-end column made percentages collapse). */}
               <div className="flex items-end gap-1.5 h-24">
                 {data!.by_day.map(d => {
                   const h = Math.max(2, (d.total_tokens / maxDayTotal) * 100);
                   return (
-                    <div key={d.date} className="flex-1 flex flex-col items-center gap-1" title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}>
-                      <div className="w-full bg-indigo-600/40 hover:bg-indigo-500/70 rounded-t transition-colors" style={{ height: `${h}%` }} />
-                      <span className="text-[8px] text-gray-600">{d.date.slice(5)}</span>
+                    <div
+                      key={d.date}
+                      className="flex-1 h-full flex items-end"
+                      title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
+                    >
+                      <div
+                        className="w-full bg-indigo-600/50 hover:bg-indigo-500/80 rounded-t transition-colors"
+                        style={{ height: `${h}%`, minHeight: 2 }}
+                      />
                     </div>
                   );
                 })}
+              </div>
+              <div className="flex gap-1.5 mt-1.5">
+                {data!.by_day.map(d => (
+                  <span
+                    key={d.date}
+                    className="flex-1 text-center text-[8px] text-gray-600 font-mono"
+                    title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
+                  >
+                    {d.date.slice(5)}
+                  </span>
+                ))}
               </div>
             </div>
           )}

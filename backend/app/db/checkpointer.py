@@ -45,6 +45,7 @@ _DDL = [
         checkpoint          BYTEA NOT NULL,
         metadata_type       TEXT NOT NULL DEFAULT 'json',
         metadata            BYTEA NOT NULL,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
     )
     """,
@@ -522,6 +523,38 @@ class AsyncPostgresCheckpointer(BaseCheckpointSaver):
                 thread_id,
             )
             return row is not None
+
+    async def cleanup_old_checkpoints(self, older_than_days: int = 30) -> int:
+        """Delete checkpoint rows (and associated blobs/writes) older than N days.
+
+        Returns the number of thread_ids whose checkpoints were fully removed.
+        Safe to call while other workflows are running — only affects rows
+        whose ``created_at`` is older than the cutoff.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT thread_id FROM langgraph_checkpoints "
+                "WHERE created_at < NOW() - $1::INTERVAL",
+                f"{older_than_days} days",
+            )
+            old_threads = [r["thread_id"] for r in rows]
+            if not old_threads:
+                return 0
+
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM langgraph_checkpoint_writes WHERE thread_id = ANY($1::text[])",
+                    old_threads,
+                )
+                await conn.execute(
+                    "DELETE FROM langgraph_checkpoint_blobs WHERE thread_id = ANY($1::text[])",
+                    old_threads,
+                )
+                await conn.execute(
+                    "DELETE FROM langgraph_checkpoints WHERE thread_id = ANY($1::text[])",
+                    old_threads,
+                )
+        return len(old_threads)
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

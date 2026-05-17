@@ -288,6 +288,7 @@ async def recover_orphaned_artifacts() -> int:
     """Resume or fail artifacts left in ``running``/``queued`` state after a crash.
 
     For each orphaned artifact:
+
     - If a LangGraph checkpoint exists for its UUID, re-dispatch the workflow so
       it resumes from the last completed node (no wasted tokens).
     - If no checkpoint exists (crashed before the first node saved state),
@@ -474,7 +475,8 @@ async def _redispatch_artifact(artifact) -> None:
 
     # Dispatch as background task — startup must never block on recovery execution.
     # run_with_recovery is a total-failure safety net and will never raise.
-    asyncio.create_task(
+    # Root the task in _ACTIVE_TASKS so Python 3.12+ doesn't GC it mid-flight.
+    task = asyncio.create_task(
         run_with_recovery(
             job_id=job_id,
             artifact_id=artifact_id,
@@ -484,3 +486,5 @@ async def _redispatch_artifact(artifact) -> None:
         ),
         name=f"recover:{gen_type.value}:{artifact_id}",
     )
+    _ACTIVE_TASKS[str(artifact_id)] = task
+    task.add_done_callback(lambda _t: _ACTIVE_TASKS.pop(str(artifact_id), None))

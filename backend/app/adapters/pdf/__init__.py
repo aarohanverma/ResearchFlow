@@ -34,6 +34,7 @@ def get_pdf_parser() -> PDFParser:
     """Return the configured PDF parser backend.
 
     Selection logic:
+
     - ``PDF_PARSER=marker`` (default) → MarkerParser. Memory-safe on laptops.
     - ``PDF_PARSER=docling``           → DoclingParser if installed; otherwise
       logs a warning and falls back to MarkerParser. Docling is RAM-heavy
@@ -71,7 +72,7 @@ async def parse_with_fallback(pdf_bytes: bytes) -> ParsedPaper:
 
     The chosen parser (``PDF_PARSER``) leads. Remaining installed parsers
     follow in this fallback order:
-        Marker → Docling (only if explicitly selected) → Gemini Vision.
+    Marker → Docling (only if explicitly selected) → Gemini Vision.
 
     Each tier has a wall-clock timeout to prevent stalling the workflow:
 

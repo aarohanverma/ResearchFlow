@@ -41,6 +41,7 @@ _paper_cols = """
                 p.novelty_score,
                 p.relevance_score,
                 p.is_breakthrough,
+                p.is_manually_imported,
                 p.key_concepts,
                 p.methods_used,
                 p.implications,
@@ -61,6 +62,7 @@ _paper_cols_basic = """
                 p.novelty_score,
                 p.relevance_score,
                 p.is_breakthrough,
+                p.is_manually_imported,
                 p.key_concepts,
                 p.methods_used,
                 p.implications,
@@ -210,6 +212,37 @@ class SearchRepository:
         if rows:
             return [dict(row._mapping) for row in rows]
 
+        # Trigram fuzzy fallback — catches typos and near-matches that FTS misses.
+        # Requires the pg_trgm extension (enabled at startup; silently falls through if absent).
+        trgm_params: dict = {"q": query, "threshold": 0.12, "limit": _MAX_KW_RESULTS}
+        trgm_ns = self._ns_filter(namespace_keys, trgm_params)
+        trgm_sql = text(f"""
+            SELECT {_paper_cols},
+                greatest(
+                    similarity(p.title, :q),
+                    similarity(COALESCE(p.tldr, ''), :q) * 0.7,
+                    similarity(COALESCE(p.abstract, ''), :q) * 0.4
+                ) AS kw_score
+            FROM papers p
+            WHERE (
+                similarity(p.title, :q) > :threshold OR
+                similarity(COALESCE(p.tldr, ''), :q) > :threshold OR
+                similarity(COALESCE(p.abstract, ''), :q) > :threshold
+            )
+            {trgm_ns}
+            ORDER BY kw_score DESC
+            LIMIT :limit
+        """)
+        try:
+            result = await self._db.execute(trgm_sql, trgm_params)
+            rows = result.fetchall()
+        except Exception as exc:
+            log.debug("trigram search unavailable (pg_trgm not enabled?): %s", exc)
+            rows = []
+
+        if rows:
+            return [dict(row._mapping) for row in rows]
+
         # ILIKE fallback — catches acronyms, model names, short terms FTS misses
         like_params: dict = {"q": f"%{query}%", "limit": _MAX_KW_RESULTS}
         like_ns = self._ns_filter(namespace_keys, like_params)
@@ -307,6 +340,7 @@ class SearchRepository:
                 p.novelty_score,
                 p.relevance_score,
                 p.is_breakthrough,
+                p.is_manually_imported,
                 p.key_concepts,
                 p.methods_used,
                 p.implications,
@@ -357,14 +391,19 @@ class SearchRepository:
           - Hybrid: paper appears in BOTH keyword and semantic results (shown, scored highest)
           - Keyword: paper appears in keyword results only (shown)
           - Semantic-only: paper appears only in semantic results (excluded — never shown alone)
+            EXCEPTION: papers flagged ``is_manually_imported`` are first-class
+            citizens — they were explicitly added by the user, so a strong
+            semantic match is enough to surface them even when title/abstract
+            keywords don't overlap with the query.
 
-        Semantic is used purely as a re-ranking signal, not an independent result source.
-        Deduplicates by external_id to remove cross-namespace copies of the same arXiv paper.
+        Semantic is used purely as a re-ranking signal for non-manually-imported
+        papers. Deduplicates by external_id to remove cross-namespace copies.
         """
         scores: dict[str, float] = {}
         paper_data: dict[str, dict] = {}
 
-        # Semantic scores first (re-ranking signal only — will be dropped if no kw match)
+        # Semantic scores first (re-ranking signal only — will be dropped if no kw match,
+        # unless the paper is manually imported).
         for rank, row in enumerate(sem_results, start=1):
             pid = str(row["paper_id"])
             scores[pid] = scores.get(pid, 0.0) + _SEM_WEIGHT / (_RRF_K + rank)
@@ -383,15 +422,15 @@ class SearchRepository:
         # Sort by fused RRF score
         sorted_ids = sorted(scores, key=lambda p: scores[p], reverse=True)
 
-        # Emit only papers that appear in keyword results (hybrid or keyword).
-        # Semantic-only papers are excluded: semantic re-ranks but never adds new results.
-        # Deduplicate by external_id to remove cross-namespace copies.
+        # Emit papers that appear in keyword results (hybrid or keyword), PLUS
+        # manually-imported papers that match semantically — they were user-added
+        # so we never drop them silently.
         seen_external: set[str] = set()
         results = []
         for pid in sorted_ids:
             row = paper_data[pid]
-            if row.get("match_type") == "semantic":
-                continue  # no keyword match — exclude
+            if row.get("match_type") == "semantic" and not row.get("is_manually_imported"):
+                continue  # auto-ingested papers need a keyword hit to surface
             eid = str(row.get("external_id") or "")
             if eid and eid in seen_external:
                 continue

@@ -1,5 +1,6 @@
 """GraphService — high-level graph operations built on GraphRepository."""
 
+import asyncio
 import json
 import logging
 import re
@@ -1022,7 +1023,12 @@ class GraphService:
         except Exception:
             pass
 
-    async def build_deep_graph(self, namespace_key: str | None = None, orientation: str = "both") -> dict:
+    async def build_deep_graph(
+        self,
+        namespace_key: str | None = None,
+        orientation: str = "both",
+        should_cancel=None,
+    ) -> dict:
         """Build a deep, LLM-generated TOPIC → SUBTOPIC → CLUSTER → PAPER hierarchy.
 
         The LLM taxonomizes papers into research areas (SUBTOPIC nodes) and
@@ -1031,6 +1037,11 @@ class GraphService:
         TOPIC → SUBTOPIC → CONCEPT cluster → PAPER → CONCEPT/METHOD leaf.
         """
         from app.adapters.llm import get_llm_adapter
+
+        async def _cancel_checkpoint(stage: str) -> None:
+            if should_cancel and await should_cancel():
+                log.info("build_deep_graph cancelled namespace=%s stage=%s", namespace_key, stage)
+                raise asyncio.CancelledError(f"Graph build cancelled at {stage}")
 
         # Fetch ALL papers for the namespace (no hard cap — processed in batches).
         # Orders by (novelty + relevance) so most significant papers are taxonomized
@@ -1066,9 +1077,14 @@ class GraphService:
         cache_key = namespace_key or "__all__"
         if GraphService._build_cache.get(cache_key) == len(papers):
             log.info("build_deep_graph: up to date for %s (%d papers)", namespace_key, len(papers))
+            # Clear subgraph cache so the frontend gets fresh DB data even on "up to date"
+            # — this fixes false-negative "no graph data" when cache was stale/empty.
+            await GraphService.clear_subgraph_cache(namespace_key)
+            await GraphService.clear_subgraph_cache(None)
             return {"areas_created": 0, "clusters_created": 0, "papers_mapped": 0, "total_papers_processed": len(papers), "already_up_to_date": True}
 
         llm = get_llm_adapter()
+        await _cancel_checkpoint("before_taxonomy")
 
         # Build a lookup: paper uuid → paper object
         id_to_paper: dict[str, _Paper] = {str(p.id): p for p in papers}
@@ -1122,6 +1138,7 @@ class GraphService:
 
         canonical: dict[str, dict[str, list[str]]] = {}
         try:
+            await _cancel_checkpoint("phase1_taxonomy")
             canon_res = await llm.complete(
                 [{"role": "user", "content": canonical_prompt}],
                 model=llm.quality_model,
@@ -1146,7 +1163,8 @@ class GraphService:
 
         if canonical:
             # Two-phase: assign papers to fixed canonical structure
-            canonical_json = json.dumps(canonical, indent=2)
+            # Compact JSON — same taxonomy structure, ~30% fewer tokens than indent=2.
+            canonical_json = json.dumps(canonical, separators=(",", ":"))
             assign_prompt = (
                 "Assign each paper to the BEST matching cluster in this canonical taxonomy.\n\n"
                 f"Taxonomy:\n{canonical_json}\n\n"
@@ -1159,6 +1177,7 @@ class GraphService:
             )
 
             for batch in batches:
+                await _cancel_checkpoint("phase2_assignment")
                 paper_block = "\n".join(_summarize(p) for p in batch)
                 try:
                     res = await llm.complete(
@@ -1200,6 +1219,7 @@ class GraphService:
                 + 'Return ONLY: {"taxonomy": {"Area": {"Sub-area": {"Cluster": ["uuid", ...]}}}}'
             )
             for batch in batches:
+                await _cancel_checkpoint("fallback_assignment")
                 paper_block = "\n".join(_summarize(p) for p in batch)
                 try:
                     res = await llm.complete(
@@ -1234,6 +1254,7 @@ class GraphService:
         papers_mapped = 0
 
         for area_name, sub_areas in merged.items():
+            await _cancel_checkpoint("persist_area")
             # TOPIC → SUBTOPIC → CONCEPT(area)
             area_node = await self._repo.get_or_create_node(
                 NodeType.concept, label=area_name, namespace_key=namespace_key,

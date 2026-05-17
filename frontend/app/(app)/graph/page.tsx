@@ -379,9 +379,14 @@ function runForce(
     .force("tierY", d3.forceY<SimNode>(d => _nodeTierY(d)).strength(d =>
       d.type === "TOPIC" || d.type === "SUBTOPIC" ? 0.9 : 0.55
     ))
+    .alphaDecay(0.035)  // faster convergence
     .stop();
 
-  for (let i = 0; i < 500; i++) sim.tick();
+  // Run up to 300 ticks — enough for stable layout at a lower cost than 500.
+  // alphaDecay=0.035 means the sim reaches alpha~0.05 around tick 85, so
+  // meaningful movement stops well before 300; extra ticks cost nearly nothing.
+  const maxTicks = Math.min(300, 80 + simNodes.length * 2);
+  for (let i = 0; i < maxTicks; i++) sim.tick();
 
   const pos = new Map<string, {x:number;y:number}>();
   for (const n of simNodes) pos.set(n.id, { x: n.x ?? 0, y: n.y ?? 0 });
@@ -788,6 +793,7 @@ export default function GraphPage() {
   // on every JobsPanel poll (e.g. while a podcast generates in the background).
   const graphBuildJobs = useJobsStore((s) => s.graphBuildJobs);
   const addGraphBuildJob = useJobsStore((s) => s.addGraphBuildJob);
+  const cancelGraphBuildJob = useJobsStore((s) => s.cancelGraphBuildJob);
   const dismissGraphBuildJob = useJobsStore((s) => s.dismissGraphBuildJob);
   const activeBuildJob = graphBuildJobs.find(g => g.status === "running");
   const buildingDeep = !!activeBuildJob;
@@ -887,7 +893,8 @@ export default function GraphPage() {
       prev.find(p => p.job_id === g.job_id)?.status === "running"
     );
     if (justFinished.length > 0 && mountedRef.current) {
-      loadGraph();
+      // Small delay ensures backend cache invalidation completes before reload.
+      setTimeout(() => { if (mountedRef.current) loadGraph(); }, 1200);
     }
     prevBuildJobs.current = graphBuildJobs;
   }, [graphBuildJobs]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1354,7 +1361,10 @@ export default function GraphPage() {
             try {
               // Dismiss all running/pending graph build jobs from the store so
               // the button re-enables and the notification is cleaned up.
-              graphBuildJobs.forEach(g => dismissGraphBuildJob(g.job_id));
+              graphBuildJobs.forEach(g => {
+                if (g.status === "running") cancelGraphBuildJob(g.job_id);
+                dismissGraphBuildJob(g.job_id);
+              });
               // Scope the clear to the currently selected namespaces so other
               // namespaces' caches and locks are untouched.
               const ns = selectedTopics.length > 0
@@ -1438,6 +1448,26 @@ export default function GraphPage() {
             : <ZapIcon size={10} />}
           {buildingDeep ? "Building…" : "Build Deep"}
         </button>
+
+        {/* Inline Stop button — visible only while a build is in flight, so
+            the user can cancel without digging into the notifications panel. */}
+        {buildingDeep && (
+          <button
+            onClick={() => {
+              const running = graphBuildJobs.filter(g => g.status === "running");
+              running.forEach(g => cancelGraphBuildJob(g.job_id));
+            }}
+            style={{
+              display: "flex", alignItems: "center", gap: 5, padding: "4px 10px",
+              borderRadius: 8, border: "1px solid rgba(239,68,68,0.4)",
+              background: "rgba(239,68,68,0.1)", color: "#f87171",
+              fontSize: "11px", fontWeight: 600, cursor: "pointer",
+            }}
+            title="Cancel all running graph builds. Partial taxonomy already committed is preserved."
+          >
+            Stop
+          </button>
+        )}
 
         {/* Stats */}
         <div style={{ display: "flex", alignItems: "center", gap: 14, marginLeft: "auto" }}>

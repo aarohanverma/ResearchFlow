@@ -25,6 +25,7 @@ import {
   CodeIcon,
   SparklesIcon,
   FileTextIcon,
+  GitMergeIcon,
 } from "lucide-react";
 import type { IdeaCapsule, DiagramSpec, GeneratedArtifact, GenerationType } from "@/types";
 import MarkdownRenderer, { sanitizeMermaidSpec, sanitizeMermaidAggressive } from "@/components/ui/MarkdownRenderer";
@@ -629,7 +630,11 @@ function CapsuleHero({ capsule }: { capsule: IdeaCapsule }) {
     >
       <div className="flex items-center gap-2 mb-5 flex-wrap">
         {/* Origin mode tag */}
-        {capsule.source_mode === "query" ? (
+        {capsule.source_mode === "combined" ? (
+          <span className="px-3 py-1 rounded-full bg-fuchsia-950/50 border border-fuchsia-700/30 text-fuchsia-400 text-[11px] font-semibold flex items-center gap-1.5">
+            <GitMergeIcon size={10} />Combined
+          </span>
+        ) : capsule.source_mode === "query" ? (
           <span className="px-3 py-1 rounded-full bg-violet-950/50 border border-violet-700/30 text-violet-400 text-[11px] font-semibold flex items-center gap-1.5">
             <SearchIcon size={10} />Query
           </span>
@@ -655,6 +660,12 @@ function CapsuleHero({ capsule }: { capsule: IdeaCapsule }) {
         <p className="text-sm text-violet-400/70 italic mb-6 flex items-center gap-1.5">
           <SearchIcon size={12} className="flex-shrink-0" />
           &ldquo;{capsule.source_query}&rdquo;
+        </p>
+      )}
+      {capsule.source_mode === "combined" && capsule.source_query && (
+        <p className="text-sm text-fuchsia-400/80 mb-6 flex items-center gap-1.5">
+          <GitMergeIcon size={12} className="flex-shrink-0" />
+          <span className="italic">{capsule.source_query}</span>
         </p>
       )}
 
@@ -1124,6 +1135,16 @@ export default function IdeaDeepDivePage() {
   const [ddText, setDdText] = useState("");
   const [ddStatusMsg, setDdStatusMsg] = useState("");
 
+  // Combine-with-another-capsule modal state.
+  // ``combineOpen`` controls visibility; ``combineList`` is lazy-loaded the
+  // first time the picker opens so the page doesn't pay for it upfront.
+  const [combineOpen, setCombineOpen] = useState(false);
+  const [combineList, setCombineList] = useState<IdeaCapsule[] | null>(null);
+  const [combineLoading, setCombineLoading] = useState(false);
+  const [combineSubmitting, setCombineSubmitting] = useState(false);
+  const [combineError, setCombineError] = useState<string | null>(null);
+  const [combineQuery, setCombineQuery] = useState("");
+
   // Reset deep-dive state whenever the idea id changes so stale content from a
   // previous idea never flashes while the new one is loading.
   useEffect(() => {
@@ -1196,6 +1217,95 @@ export default function IdeaDeepDivePage() {
       clearInterval(interval);
     };
   }, [ddStatus, ddText, id, token]);
+
+  // Lazily load every other capsule the user owns so the picker can show them.
+  async function openCombine() {
+    setCombineOpen(true);
+    setCombineError(null);
+    if (combineList !== null) return;
+    setCombineLoading(true);
+    try {
+      const list = await api.get<IdeaCapsule[]>("/genie/capsules");
+      setCombineList(list);
+    } catch (e) {
+      setCombineError(`Failed to load capsule list: ${String(e).slice(0, 120)}`);
+      setCombineList([]);
+    } finally {
+      setCombineLoading(false);
+    }
+  }
+
+  // Submit the combine request. The backend queues the combine and returns a
+  // GenieSession id immediately (202). We then poll the session row every
+  // ~2.5 s until it lands on a terminal status:
+  //   * status="done" + result_capsule_id  → navigate to the new hybrid capsule
+  //   * status="failed" or "done_empty"    → surface the error to the user
+  //
+  // Polling caps at 6 minutes (~145 attempts) — combine can be heavy when both
+  // parents' deep dives need to be generated first, but anything longer than
+  // 6 minutes is almost certainly a stuck task and we want the user to know.
+  async function submitCombine(otherId: string) {
+    if (!id || !otherId || combineSubmitting) return;
+    setCombineSubmitting(true);
+    setCombineError(null);
+    try {
+      const queued = await api.post<{ session_id: string; status: string; parent_ids: string[] }>(
+        "/genie/capsules/combine",
+        { capsule_a_id: id, capsule_b_id: otherId },
+      );
+      if (!queued?.session_id) {
+        setCombineError("Combine could not be queued.");
+        return;
+      }
+      const sessionId = queued.session_id;
+      const POLL_MS = 2500;
+      const MAX_ATTEMPTS = 145; // ~6 minutes
+      let attempts = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let lastStatus: any = null;
+      while (attempts < MAX_ATTEMPTS) {
+        attempts += 1;
+        await new Promise<void>(resolve => setTimeout(resolve, POLL_MS));
+        try {
+          const sess = await api.get<{ status: string; capsule_id?: string | null; error?: string | null }>(
+            `/genie/sessions/${sessionId}`,
+          );
+          lastStatus = sess;
+          if (sess.status === "done" && sess.capsule_id) {
+            setCombineOpen(false);
+            router.push(`/genie/idea/${sess.capsule_id}`);
+            return;
+          }
+          if (sess.status === "failed" || sess.status === "done_empty" || sess.status === "cancelled") {
+            setCombineError(
+              sess.error
+              || (sess.status === "done_empty"
+                ? "These two ideas didn't combine into a meaningful hybrid. Pick a different pair."
+                : "Combine failed. Please try again."),
+            );
+            return;
+          }
+          // status === "running" → keep polling
+        } catch {
+          // Transient network error — keep polling.
+        }
+      }
+      setCombineError(
+        (lastStatus && typeof lastStatus.error === "string" && lastStatus.error)
+          || "Combine is taking longer than expected — check back in a moment.",
+      );
+    } catch (e: unknown) {
+      // 400 / 404 / 5xx surface here. The backend uses 422 historically for
+      // infeasible pairs, but the new endpoint moves that verdict into the
+      // session row (status="done_empty" + error).
+      const err = e as { status?: number; detail?: string | { message?: string }; message?: string };
+      const detail = typeof err?.detail === "string" ? err.detail : err?.detail?.message;
+      const reason = detail || err?.message || "Combine request failed. Please try again.";
+      setCombineError(reason);
+    } finally {
+      setCombineSubmitting(false);
+    }
+  }
 
   async function startDeepDiveBg() {
     if (!id || !token || ddStatus === "streaming") return;
@@ -1308,6 +1418,14 @@ export default function IdeaDeepDivePage() {
                       {showChat ? "Close Chat" : "Ask Questions"}
                     </button>
                   )}
+                  <button
+                    onClick={openCombine}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"
+                    title="Fuse this idea with another to produce a new hybrid hypothesis"
+                  >
+                    <GitMergeIcon size={12} />
+                    Combine with…
+                  </button>
                 </>
               )}
             </div>
@@ -1539,6 +1657,125 @@ export default function IdeaDeepDivePage() {
 
       <AnimatePresence>
         {showChat && id && <IdeaChatPanel capsuleId={id} onClose={() => setShowChat(false)} />}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {combineOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
+            onClick={() => !combineSubmitting && setCombineOpen(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.96, y: 12, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.96, y: 12, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-2xl rounded-2xl bg-gray-950 border border-gray-800 shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+            >
+              <div className="px-6 pt-5 pb-4 border-b border-gray-800/60 flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-violet-950/40 border border-violet-800/30 flex items-center justify-center text-violet-300">
+                  <GitMergeIcon size={18} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-base font-semibold text-white">Combine with another idea</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    A reasoning-tier model fuses both deep dives into a new hybrid hypothesis. A feasibility judge will decline pairs that are too similar or too disjoint.
+                  </p>
+                </div>
+                <button
+                  onClick={() => !combineSubmitting && setCombineOpen(false)}
+                  disabled={combineSubmitting}
+                  className="text-gray-500 hover:text-gray-200 transition-colors p-1 disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label="Close"
+                >
+                  <XIcon size={16} />
+                </button>
+              </div>
+
+              <div className="px-6 py-3 border-b border-gray-800/40">
+                <input
+                  type="text"
+                  value={combineQuery}
+                  onChange={(e) => setCombineQuery(e.target.value)}
+                  placeholder="Search your ideas by title…"
+                  className="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-violet-600/50"
+                  autoFocus
+                />
+              </div>
+
+              {combineError && (
+                <div className="mx-6 mt-3 px-3 py-2 rounded-lg bg-red-950/40 border border-red-800/40 text-red-300 text-xs">
+                  {combineError}
+                </div>
+              )}
+
+              <div className="flex-1 overflow-y-auto px-3 py-2">
+                {combineLoading ? (
+                  <div className="flex items-center justify-center py-12 text-sm text-gray-500 gap-2">
+                    <Loader2Icon size={14} className="animate-spin" />
+                    Loading your ideas…
+                  </div>
+                ) : (combineList ?? []).filter(c => c.id !== id && (
+                  !combineQuery.trim() || (c.title || "").toLowerCase().includes(combineQuery.toLowerCase().trim())
+                )).length === 0 ? (
+                  <div className="text-center py-12 text-sm text-gray-500">
+                    {(combineList?.length ?? 0) === 0
+                      ? "You don't have any other saved ideas yet."
+                      : "No matches. Try a different search."}
+                  </div>
+                ) : (
+                  <ul className="space-y-1">
+                    {(combineList ?? [])
+                      .filter(c => c.id !== id && (
+                        !combineQuery.trim() || (c.title || "").toLowerCase().includes(combineQuery.toLowerCase().trim())
+                      ))
+                      .map((c) => (
+                        <li key={c.id}>
+                          <button
+                            onClick={() => submitCombine(c.id)}
+                            disabled={combineSubmitting}
+                            className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-gray-900 transition-colors flex items-start gap-3 disabled:opacity-50 disabled:cursor-wait"
+                          >
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium text-gray-200 truncate">{c.title || "Untitled"}</p>
+                              <p className="text-xs text-gray-500 line-clamp-2 mt-0.5">{c.hypothesis || ""}</p>
+                              <div className="flex items-center gap-2 mt-1.5 text-[10px] text-gray-600">
+                                <span className="px-1.5 py-0.5 rounded bg-gray-900 border border-gray-800">
+                                  {c.source_mode || "manual"}
+                                </span>
+                                <span>novelty {(c.novelty_score ?? 0).toFixed(2)}</span>
+                                <span>·</span>
+                                <span>feasibility {(c.feasibility_score ?? 0).toFixed(2)}</span>
+                              </div>
+                            </div>
+                            <SparklesIcon size={12} className="text-violet-400/60 mt-1 flex-shrink-0" />
+                          </button>
+                        </li>
+                      ))}
+                  </ul>
+                )}
+              </div>
+
+              <div className="px-6 py-3 border-t border-gray-800/60 flex items-center justify-between">
+                <p className="text-[11px] text-gray-600">
+                  {combineSubmitting ? "Running feasibility check + fusion synthesis…" : "Click an idea to combine."}
+                </p>
+                <button
+                  onClick={() => !combineSubmitting && setCombineOpen(false)}
+                  disabled={combineSubmitting}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-400 hover:text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
       </AnimatePresence>
     </div>
   );

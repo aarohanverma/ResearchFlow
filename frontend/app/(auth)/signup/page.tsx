@@ -10,29 +10,43 @@ import type { User } from "@/types";
 import { ZapIcon, EyeIcon, EyeOffIcon, Loader2Icon, ArrowRightIcon } from "lucide-react";
 
 const FIELDS = [
-  { key: "display_name", label: "Your name", type: "text", placeholder: "Ada Lovelace" },
-  { key: "email",        label: "Email",      type: "email", placeholder: "you@example.com" },
-  { key: "password",     label: "Password",   type: "password", placeholder: "8+ characters" },
+  { key: "display_name",    label: "Your name",       type: "text",     placeholder: "Ada Lovelace" },
+  { key: "email",           label: "Email",           type: "email",    placeholder: "you@example.com" },
+  { key: "password",        label: "Password",        type: "password", placeholder: "8+ characters" },
+  { key: "confirmPassword", label: "Confirm password",type: "password", placeholder: "Re-enter password" },
 ] as const;
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function SignupPage() {
   const router = useRouter();
   const { setToken, setUser } = useAuthStore();
-  const [form, setForm] = useState({ email: "", password: "", display_name: "" });
+  const [form, setForm] = useState({ email: "", password: "", confirmPassword: "", display_name: "" });
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (form.password.length < 8) { setError("Password must be at least 8 characters"); return; }
-    setLoading(true);
     setError("");
+    // Pre-flight validation — fail fast before the network round-trip so the
+    // user gets immediate feedback on common mistakes.
+    if (!form.display_name.trim()) { setError("Please enter your name"); return; }
+    if (!EMAIL_RE.test(form.email)) { setError("Please enter a valid email address"); return; }
+    if (form.password.length < 8) { setError("Password must be at least 8 characters"); return; }
+    if (form.password !== form.confirmPassword) { setError("Passwords do not match"); return; }
+    setLoading(true);
     try {
-      const data = await api.post<{ access_token: string }>("/auth/register", form);
+      const { confirmPassword: _omit, ...payload } = form;
+      const data = await api.post<{ access_token: string }>("/auth/register", payload);
       setToken(data.access_token);
-      const user = await api.get<User>("/auth/me");
-      setUser(user);
+      try {
+        const user = await api.get<User>("/auth/me");
+        setUser(user);
+      } catch {
+        // Token created but profile fetch failed — token is valid, the layout
+        // guard will retry `/auth/me`. Don't block the user with an error.
+      }
       router.push("/settings/onboarding");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Registration failed");
@@ -81,18 +95,25 @@ export default function SignupPage() {
                 </label>
                 <div className="relative">
                   <input
-                    type={key === "password" && showPw ? "text" : type}
+                    type={(key === "password" || key === "confirmPassword") && showPw ? "text" : type}
                     value={form[key]}
                     onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
                     placeholder={placeholder}
                     required
                     autoFocus={idx === 0}
-                    className={`input-base ${key === "password" ? "pr-11" : ""}`}
+                    autoComplete={
+                      key === "password" ? "new-password"
+                      : key === "confirmPassword" ? "new-password"
+                      : key === "email" ? "email"
+                      : "name"
+                    }
+                    className={`input-base ${(key === "password" || key === "confirmPassword") ? "pr-11" : ""}`}
                   />
                   {key === "password" && (
                     <button
                       type="button"
                       onClick={() => setShowPw((s) => !s)}
+                      aria-label={showPw ? "Hide password" : "Show password"}
                       className="absolute right-3.5 top-1/2 -translate-y-1/2 text-gray-600 hover:text-gray-400 transition-colors"
                       tabIndex={-1}
                     >

@@ -770,7 +770,22 @@ async def _assemble_content(state: StudyState) -> StudyState:
         "Never end with '...', never trail off mid-sentence, never write 'continued' or 'to be continued'. "
         "Write EVERY paragraph to its natural conclusion. If a section has 5 points, write all 5. "
         "Only stop when the content is genuinely finished — not when you think you might be running long. "
-        "A complete rich section is always better than a short one that cuts off."
+        "A complete rich section is always better than a short one that cuts off.\n"
+        "\n"
+        "MARKDOWN FORMATTING (the frontend renders GitHub-flavored markdown — use it well):\n"
+        "• **Bold** the first occurrence of every key term, plus every model / dataset / "
+        "metric name. *Italics* for paper titles and emphasis. `inline code` for symbols, "
+        "hyperparameters, file paths, and numeric thresholds.\n"
+        "• Math: inline `$...$`, display `$$...$$`. Always real LaTeX. Never ASCII fallbacks.\n"
+        "• Lists: `- ` bullets and `1. ` ordered steps. ONE blank line before the first item, "
+        "no blank lines between items, ONE blank line after the list ends.\n"
+        "• Tables: pipe-separated markdown. Use them whenever you have ≥ 3 row-aligned facts "
+        "(benchmark numbers, hyperparameter sweeps, comparison rows).\n"
+        "• Code blocks: triple-backtick fences with a language tag (```python, ```bash, etc.).\n"
+        "• Sub-sub-sections: `### Heading` when a section naturally splits into 2+ ideas.\n"
+        "• Block quotes: `> ` prefix for short direct quotes from the paper.\n"
+        "• Always leave ONE blank line before every heading, list, code block, table, or quote.\n"
+        "• Do NOT emit a top-level `# Heading` — the renderer adds the section title already."
     )
 
     async def section(instruction: str, content: str, tokens: int = 500, ctx_limit: int = 3500) -> str:
@@ -1570,6 +1585,12 @@ def get_user_jobs(user_id: str) -> list[dict]:
     )
 
 
+# Strong references to spawned study jobs so Python 3.12+ doesn't GC them
+# before they complete (which would cancel the LangGraph run mid-flight and
+# leave _jobs[job_id]['status'] permanently "running"). Tasks self-remove.
+_study_background_tasks: set[asyncio.Task] = set()
+
+
 async def _run_job(job_id: str, paper_id: UUID, expertise_level: str, user_id: UUID) -> None:
     """Execute a background study job and update its in-memory status record."""
     _jobs[job_id]["status"] = "running"
@@ -1618,7 +1639,12 @@ def queue_study(paper_id: UUID, expertise_level: str, user_id: UUID, paper_title
         "created_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
     }
-    asyncio.create_task(_run_job(job_id, paper_id, expertise_level, user_id))
+    task = asyncio.create_task(
+        _run_job(job_id, paper_id, expertise_level, user_id),
+        name=f"study:{job_id}",
+    )
+    _study_background_tasks.add(task)
+    task.add_done_callback(_study_background_tasks.discard)
     return job_id
 
 

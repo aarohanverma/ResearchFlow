@@ -421,7 +421,9 @@ fi
 if is_real_key "$GOOGLE_KEY"; then
     EMB_PROVIDER="gemini"; EMB_MODEL="gemini-embedding-2-preview"; EMB_DIM="768"
 else
-    EMB_PROVIDER="openai"; EMB_MODEL="text-embedding-3-large"; EMB_DIM="3072"
+    # OpenAI text-embedding-3-large outputs 3072-dim natively; the adapter requests
+    # 768-dim via OpenAI's Matryoshka truncation so vectors fit the pgvector(768) column.
+    EMB_PROVIDER="openai"; EMB_MODEL="text-embedding-3-large"; EMB_DIM="768"
 fi
 
 EXISTING_JWT="$(read_env_val JWT_SECRET)"

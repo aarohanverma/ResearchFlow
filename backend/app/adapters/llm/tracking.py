@@ -27,6 +27,23 @@ from app.core.tracking import current_node, current_user_id, current_workflow
 log = logging.getLogger(__name__)
 
 
+# Module-level set keeps strong references to fire-and-forget recording tasks
+# so Python 3.12+ doesn't garbage-collect them mid-flight (which would emit a
+# RuntimeWarning and may cancel the task before the DB write completes).
+_tracking_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_recording(coro) -> None:
+    """Root a fire-and-forget recording coroutine in the module-level task set.
+
+    The task is removed from the set when it completes so the set stays bounded.
+    Recording failures are already swallowed inside :func:`_record_usage`.
+    """
+    task = asyncio.create_task(coro)
+    _tracking_tasks.add(task)
+    task.add_done_callback(_tracking_tasks.discard)
+
+
 # Rough USD per 1K tokens — kept here so we don't depend on TokenUsageTracker
 # (which would require a DB session that isn't available at LLM-call time).
 # These are illustrative; users on the dashboard see token counts as the
@@ -116,7 +133,7 @@ class TrackingLLMAdapter:
     async def complete(self, *args: Any, **kwargs: Any) -> CompletionResult:
         """Forward to inner.complete and record usage."""
         result = await self._inner.complete(*args, **kwargs)
-        asyncio.create_task(_record_usage(
+        _spawn_recording(_record_usage(
             provider=result.provider_used,
             model=result.model_used,
             input_tokens=result.input_tokens,
@@ -138,7 +155,7 @@ class TrackingLLMAdapter:
         try:
             in_chars = sum(len(m.get("content", "")) for m in messages)
             out_chars = len(str(result))
-            asyncio.create_task(_record_usage(
+            _spawn_recording(_record_usage(
                 provider=self._inner.provider_id,
                 model=model,
                 input_tokens=in_chars // 4,
@@ -169,7 +186,7 @@ class TrackingLLMAdapter:
                 out_chars += len(token)
                 yield token
         finally:
-            asyncio.create_task(_record_usage(
+            _spawn_recording(_record_usage(
                 provider=self._inner.provider_id,
                 model=model,
                 input_tokens=in_chars // 4,
@@ -180,7 +197,7 @@ class TrackingLLMAdapter:
     async def complete_with_tools(self, *args: Any, **kwargs: Any) -> CompletionResult:
         """Forward to inner.complete_with_tools and record final usage."""
         result = await self._inner.complete_with_tools(*args, **kwargs)
-        asyncio.create_task(_record_usage(
+        _spawn_recording(_record_usage(
             provider=result.provider_used,
             model=result.model_used,
             input_tokens=result.input_tokens,

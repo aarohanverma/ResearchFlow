@@ -37,11 +37,17 @@ def resolve_embedding_provider(preferred: str | None = None) -> tuple[str, str]:
         }.get(prov, ""))
 
     if _has_key(p):
-        model = settings.default_embedding_model if p == (preferred or settings.default_embedding_provider) else _PROVIDER_DEFAULT_MODEL.get(p, "")
-        return p, model or _PROVIDER_DEFAULT_MODEL.get(p, "")
+        # Use the configured default model when p IS the system default provider
+        # (respects any custom model override in config); use the provider's own
+        # canonical default model for every other case.
+        if p == settings.default_embedding_provider:
+            model = settings.default_embedding_model
+        else:
+            model = _PROVIDER_DEFAULT_MODEL.get(p, settings.default_embedding_model)
+        return p, model
 
     # Preferred provider has no key — fall back in priority order.
-    for fallback in ("gemini", "openai", "voyage"):
+    for fallback in ("openai", "gemini", "voyage"):
         if fallback != p and _has_key(fallback):
             log.warning(
                 "embedding: %s requested but no API key configured — falling back to %s",
@@ -77,11 +83,21 @@ def get_embedding_adapter(provider: str | None = None) -> EmbeddingAdapter:
     if effective_provider == "gemini":
         return GeminiEmbeddingAdapter()
     if effective_provider == "voyage":
-        from app.adapters.embedding.voyage_embed import VoyageEmbeddingAdapter  # type: ignore[import]
-        return VoyageEmbeddingAdapter()
+        # Voyage adapter is reserved for a future provider plug-in. The
+        # embedding factory keeps the value in its Literal type so user-supplied
+        # configs do not break Pydantic validation, but the implementation file
+        # is not shipped. Fall back to OpenAI with a clear warning instead of
+        # raising ImportError at call time.
+        log.warning(
+            "embedding: provider='voyage' requested but VoyageEmbeddingAdapter "
+            "is not implemented in this build — falling back to OpenAI"
+        )
+        from app.adapters.embedding.openai_embed import OpenAIEmbeddingAdapter
+        return OpenAIEmbeddingAdapter()
 
-    # Unknown — default to Gemini
-    return GeminiEmbeddingAdapter()
+    # Unknown provider string — fall back to OpenAI
+    from app.adapters.embedding.openai_embed import OpenAIEmbeddingAdapter
+    return OpenAIEmbeddingAdapter()
 
 
 __all__ = [

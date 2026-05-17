@@ -1,7 +1,169 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { CopyIcon, CheckIcon } from "lucide-react";
+
+
+// ── Decoration pipeline (highlights + keyword search) ────────────────────────
+//
+// Highlights and search marks are RENDERED AS REACT ELEMENTS, not inserted
+// into the DOM after render. That's the whole point: React owns the mark
+// elements, so React's reconciliation never tears them down. Streaming, polling,
+// and any other re-render is fine — the marks are part of the virtual DOM and
+// survive automatically.
+//
+// The renderer accepts a ``MarkdownDecorations`` object that describes the
+// highlights and the current search query. ``InlineText`` (the leaf that turns
+// a plain-text span into React) finds occurrences of each highlight's text and
+// the search query within its segment and emits ``<mark>`` JSX nodes. The
+// data attributes on those nodes let the parent component locate marks for
+// navigation (``data-rf-search-key``) and the click handler ties highlight
+// removal to React state.
+
+export interface DecorationHighlight {
+  id: string;
+  text: string;
+  color: string;
+}
+
+export interface MarkdownDecorations {
+  /** Highlights to render inside this content. */
+  highlights?: DecorationHighlight[];
+  /** Lowercase trimmed search query — matched case-insensitively. */
+  searchQuery?: string;
+  /** Optional stable key prefix so the parent can correlate ``data-rf-search-key`` values across messages. */
+  searchKeyPrefix?: string;
+  /** Called when the user clicks a highlight mark to remove it. */
+  onRemoveHighlight?: (id: string) => void;
+}
+
+interface DecorationMatch {
+  start: number;
+  end: number;
+  kind: "highlight" | "search";
+  id?: string;
+  color?: string;
+}
+
+/** Build the sorted, non-overlapping match list for one text segment. */
+function _findMatches(text: string, dec?: MarkdownDecorations): DecorationMatch[] {
+  if (!dec) return [];
+  const matches: DecorationMatch[] = [];
+
+  // Highlights — case-sensitive (the user selected the exact text).
+  for (const hl of dec.highlights || []) {
+    if (!hl.text) continue;
+    let cursor = 0;
+    while (true) {
+      const pos = text.indexOf(hl.text, cursor);
+      if (pos === -1) break;
+      matches.push({
+        start: pos,
+        end: pos + hl.text.length,
+        kind: "highlight",
+        id: hl.id,
+        color: hl.color,
+      });
+      cursor = pos + Math.max(1, hl.text.length);
+    }
+  }
+
+  // Search query — case-insensitive.
+  const q = (dec.searchQuery || "").trim().toLowerCase();
+  if (q) {
+    const lower = text.toLowerCase();
+    let cursor = 0;
+    while (true) {
+      const pos = lower.indexOf(q, cursor);
+      if (pos === -1) break;
+      matches.push({
+        start: pos,
+        end: pos + q.length,
+        kind: "search",
+      });
+      cursor = pos + Math.max(1, q.length);
+    }
+  }
+
+  if (matches.length === 0) return matches;
+
+  // Sort by start, then prefer longer matches on tie.
+  matches.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+
+  // Resolve overlaps — keep earlier (longer) matches, drop ones that overlap.
+  const filtered: DecorationMatch[] = [];
+  let cursor = 0;
+  for (const m of matches) {
+    if (m.start < cursor) continue;
+    filtered.push(m);
+    cursor = m.end;
+  }
+  return filtered;
+}
+
+/** Take a plain string and produce React nodes with decoration ``<mark>`` wrappers. */
+function _decorateString(
+  s: string,
+  dec: MarkdownDecorations | undefined,
+  keyPrefix: string,
+): ReactNode[] {
+  const matches = _findMatches(s, dec);
+  if (matches.length === 0) return [s];
+  const out: ReactNode[] = [];
+  let pos = 0;
+  matches.forEach((m, i) => {
+    if (m.start > pos) out.push(s.slice(pos, m.start));
+    const seg = s.slice(m.start, m.end);
+    if (m.kind === "highlight") {
+      const id = m.id || "";
+      out.push(
+        <mark
+          key={`${keyPrefix}-h-${i}-${id}`}
+          data-rf-highlight="1"
+          data-rf-highlight-id={id}
+          onClick={(e) => {
+            if (!dec?.onRemoveHighlight) return;
+            e.preventDefault();
+            e.stopPropagation();
+            dec.onRemoveHighlight(id);
+          }}
+          style={{
+            background: m.color || "#fef08a",
+            color: "#1f2937",
+            borderRadius: 2,
+            padding: "0 1px",
+            cursor: "pointer",
+          }}
+          title="Click to remove highlight"
+        >
+          {seg}
+        </mark>
+      );
+    } else {
+      // search mark — searchKeyPrefix lets the parent navigate by index
+      const searchKey = `${dec?.searchKeyPrefix || ""}-${keyPrefix}-${i}`;
+      out.push(
+        <mark
+          key={`${keyPrefix}-s-${i}`}
+          data-rf-search="1"
+          data-rf-search-key={searchKey}
+          style={{
+            background: "#fbbf24",
+            color: "#1f2937",
+            borderRadius: 2,
+            padding: "0 1px",
+          }}
+        >
+          {seg}
+        </mark>
+      );
+    }
+    pos = m.end;
+  });
+  if (pos < s.length) out.push(s.slice(pos));
+  return out;
+}
 
 // ── Mermaid diagram ───────────────────────────────────────────────────────────
 
@@ -280,10 +442,19 @@ export function CodeBlock({ code, lang }: { code: string; lang: string }) {
 
 // ── Inline text ───────────────────────────────────────────────────────────────
 
-export function InlineText({ text }: { text: string }) {
+export function InlineText({
+  text,
+  onCitationClick,
+  decorations,
+}: {
+  text: string;
+  onCitationClick?: (num: string, isArxiv: boolean) => void;
+  decorations?: MarkdownDecorations;
+}) {
   const normalised = text.replace(/\\\(([\s\S]+?)\\\)/g, (_m, e) => `$${e}$`);
+  // citation markers [1], [A1] included so they render as interactive chips
   const parts = normalised.split(
-    /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\$[^$\n]{1,80}\$)/g
+    /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\$[^$\n]{1,80}\$|\[A?\d+\])/g
   );
   return (
     <>
@@ -299,8 +470,49 @@ export function InlineText({ text }: { text: string }) {
             </code>
           );
         if (/^\$[^$]+\$$/.test(part)) {
-          // Inline KaTeX — lazy import to avoid SSR issues
           return <InlineMath key={i} expr={part.slice(1, -1)} />;
+        }
+        // Inline citation links: [1] → indexed corpus paper, [A1] → arXiv candidate
+        const citeMatch = part.match(/^\[(A?)(\d+)\]$/);
+        if (citeMatch) {
+          const isArxiv = citeMatch[1] === "A";
+          const num = citeMatch[2];
+          const label = isArxiv ? `A${num}` : num;
+          if (onCitationClick) {
+            return (
+              <span
+                key={i}
+                onClick={() => onCitationClick(label, isArxiv)}
+                title={isArxiv ? `View arXiv candidate ${label}` : `View paper ${label}`}
+                style={{
+                  color: isArxiv ? "#fbbf24" : "#818cf8",
+                  cursor: "pointer",
+                  textDecoration: "underline",
+                  textDecorationStyle: "dotted",
+                  textUnderlineOffset: 2,
+                  fontSize: "0.85em",
+                  verticalAlign: "super",
+                  fontWeight: 500,
+                }}
+              >
+                [{label}]
+              </span>
+            );
+          }
+          return (
+            <span key={i} style={{
+              color: "#818cf8", fontSize: "0.85em",
+              verticalAlign: "super", fontWeight: 500,
+            }}>
+              [{label}]
+            </span>
+          );
+        }
+        // Plain text segment — apply highlight / search decorations as JSX
+        // (not via DOM mutation, so React owns the marks and they survive
+        // re-renders automatically).
+        if (typeof part === "string" && part && decorations) {
+          return <Fragment key={i}>{_decorateString(part, decorations, String(i))}</Fragment>;
         }
         return part;
       })}
@@ -321,13 +533,67 @@ function InlineMath({ expr }: { expr: string }) {
   return <span dangerouslySetInnerHTML={{ __html: html }} className="mx-0.5" />;
 }
 
+// ── Inline-list normalizer ────────────────────────────────────────────────────
+
+/**
+ * LLMs often compress lists onto a single line:
+ *   "1. Foo 2. Bar 3. Baz"  →  each item on its own line
+ *   "- Foo - Bar - Baz"      →  each item on its own line
+ *   "Intro: - Foo - Bar"     →  intro line, then each item
+ * This runs before paragraph splitting so the bullet/number renderers
+ * see proper line-separated items.
+ */
+function normalizeInlineLists(raw: string): string {
+  return raw.split('\n').map(line => {
+    const t = line.trim();
+    if (!t) return line;
+
+    // 1. Inline numbered list: starts with "N." and has further "M." items inlined
+    //    "1. Good retrieval 2. Incomplete retrieval 3. Conflicting retrieval"
+    if (/^\d+\.\s/.test(t)) {
+      // Replace "[non-whitespace][spaces][digit+period+space]" with newline boundary
+      const split = t.replace(/(\S)\s+(\d+\.\s)/g, '$1\n$2');
+      if (split !== t) return split;
+    }
+
+    // 2. Inline bullet list: starts with "- " and has more "- " items inlined
+    //    "- Answer accuracy: ... - Context compliance: ..."
+    if (/^-\s/.test(t) && / - /.test(t)) {
+      return t.replace(/\s+-\s+/g, '\n- ');
+    }
+
+    // 3. "Intro text: - item1 - item2 - item3" — prose intro followed by inline list
+    //    "Measure: - accuracy - compliance - efficiency"
+    if (/:\s*-\s/.test(t) && (t.match(/ - /g) || []).length >= 1) {
+      const m = t.match(/^(.*?:)\s*-\s/);
+      if (m) {
+        const intro = m[1];
+        const rest = '- ' + t.slice(m[0].length);
+        return intro + '\n' + rest.replace(/\s+-\s+/g, '\n- ');
+      }
+    }
+
+    return line;
+  }).join('\n');
+}
+
 // ── Full markdown renderer ────────────────────────────────────────────────────
 
-export function renderMarkdown(rawContent: string): React.ReactNode[] {
+export function renderMarkdown(
+  rawContent: string,
+  onCitationClick?: (num: string, isArxiv: boolean) => void,
+  decorations?: MarkdownDecorations,
+): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
+  const IT = ({ text }: { text: string }) => (
+    <InlineText text={text} onCitationClick={onCitationClick} decorations={decorations} />
+  );
+
+  // Normalize inline lists before any other processing
+  const normalised = normalizeInlineLists(rawContent);
 
   // Normalise LaTeX delimiters → $ syntax
-  const content = rawContent
+  const content = normalised
     .replace(/\\\[([\s\S]*?)\\\]/g, (_m, e) => `$$${e}$$`)
     .replace(/\\\(([\s\S]*?)\\\)/g, (_m, e) => `$${e}$`);
 
@@ -382,33 +648,40 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
           const afterHead = trimmed.slice(firstLine.length).trim();
           if (level === 1) {
             nodes.push(
-              <h1 key={key} className="text-2xl font-bold text-white mt-8 mb-3">
-                <InlineText text={headText} />
+              <h1 key={key} className="text-2xl font-bold text-white mt-8 mb-3 tracking-tight">
+                <IT text={headText} />
               </h1>
             );
           } else if (level === 2) {
             nodes.push(
               <div key={key} className="mt-10 mb-4 pb-2 border-b border-gray-700/60">
-                <h2 className="text-xl font-bold text-white leading-snug"><InlineText text={headText} /></h2>
+                <h2 className="text-xl font-bold text-white leading-snug tracking-tight"><InlineText text={headText} decorations={decorations} /></h2>
               </div>
             );
           } else if (level === 3) {
+            // h3 is a real sub-section heading — was previously styled as a
+            // tiny uppercase label which was easy to miss inside a wall of
+            // prose. Render it like an actual heading: medium-sized, sentence
+            // case, with a thin colour accent so it visually separates groups
+            // of paragraphs without competing with h2.
             nodes.push(
-              <h3 key={key} className="text-sm font-semibold text-gray-300 uppercase tracking-widest mt-6 mb-2">
-                <InlineText text={headText} />
+              <h3 key={key} className="text-base font-semibold text-gray-100 mt-7 mb-2.5 leading-snug">
+                <IT text={headText} />
               </h3>
             );
           } else {
+            // h4+ → bold inline-style sub-headings; still distinguishable
+            // from regular prose but quieter than h3.
             nodes.push(
-              <p key={key} className="text-sm font-medium text-gray-400 mt-3 mb-1">
-                <InlineText text={headText} />
+              <p key={key} className="text-sm font-semibold text-gray-200 mt-4 mb-1.5">
+                <IT text={headText} />
               </p>
             );
           }
           if (afterHead) {
             nodes.push(
-              <p key={`${key}-body`} className="text-sm text-gray-300 leading-[1.85]">
-                <InlineText text={afterHead} />
+              <p key={`${key}-body`} className="text-sm text-gray-300 leading-[1.85] break-words">
+                <IT text={afterHead} />
               </p>
             );
           }
@@ -419,7 +692,7 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
         if (/^\d+\.\s/.test(trimmed)) {
           const items = trimmed.split(/\n(?=\d+\.\s)/);
           nodes.push(
-            <ol key={key} className="space-y-1.5 my-1">
+            <ol key={key} className="space-y-2 my-2">
               {items.map((item, k) => {
                 const m = item.match(/^(\d+)\.\s([\s\S]*)$/);
                 const num = m ? m[1] : String(k + 1);
@@ -429,8 +702,8 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
                     <span className="flex-shrink-0 w-5 h-5 rounded-full bg-gray-800 border border-gray-700/50 text-[10px] font-bold text-gray-400 flex items-center justify-center mt-0.5">
                       {num}
                     </span>
-                    <span className="text-sm text-gray-300 leading-relaxed flex-1">
-                      <InlineText text={text} />
+                    <span className="text-sm text-gray-300 leading-relaxed flex-1 min-w-0 break-words">
+                      <IT text={text} />
                     </span>
                   </li>
                 );
@@ -444,13 +717,13 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
         if (/^[-•*]\s/.test(trimmed)) {
           const items = trimmed.split(/\n(?=[-•*]\s)/);
           nodes.push(
-            <ul key={key} className="space-y-1.5 my-1">
+            <ul key={key} className="space-y-2 my-2">
               {items.map((item, k) => {
                 const text = item.replace(/^[-•*]\s/, "");
                 return (
                   <li key={k} className="flex gap-2.5 items-start text-sm text-gray-300 leading-relaxed">
                     <span className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-indigo-400/60 mt-2.5" />
-                    <span className="flex-1"><InlineText text={text} /></span>
+                    <span className="flex-1 min-w-0 break-words"><IT text={text} /></span>
                   </li>
                 );
               })}
@@ -465,7 +738,7 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
           nodes.push(
             <div key={key} className="border-l-2 border-indigo-500/50 bg-indigo-950/15 rounded-r-lg px-4 py-2.5 my-1">
               <p className="text-sm text-indigo-200/80 leading-relaxed italic">
-                <InlineText text={bq} />
+                <IT text={bq} />
               </p>
             </div>
           );
@@ -481,13 +754,13 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
             const headers = parseRow(head);
             if (headers.length >= 2) {
               nodes.push(
-                <div key={key} className="overflow-x-auto rounded-xl border border-gray-700/50 my-2">
+                <div key={key} className="overflow-x-auto rounded-xl border border-gray-700/50 my-3">
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-gray-700/50 bg-gray-800/40">
                         {headers.map((h, hi) => (
-                          <th key={hi} className="px-4 py-2.5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider whitespace-nowrap">
-                            <InlineText text={h} />
+                          <th key={hi} className="px-4 py-2.5 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider align-top">
+                            <IT text={h} />
                           </th>
                         ))}
                       </tr>
@@ -496,8 +769,8 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
                       {body.map((row, ri) => (
                         <tr key={ri} className="hover:bg-gray-800/20 transition-colors">
                           {parseRow(row).map((cell, ci2) => (
-                            <td key={ci2} className={`px-4 py-2.5 text-gray-300 ${ci2 === 0 ? "font-medium text-white" : ""}`}>
-                              <InlineText text={cell} />
+                            <td key={ci2} className={`px-4 py-2.5 text-gray-300 align-top break-words ${ci2 === 0 ? "font-medium text-white" : ""}`}>
+                              <IT text={cell} />
                             </td>
                           ))}
                         </tr>
@@ -511,10 +784,12 @@ export function renderMarkdown(rawContent: string): React.ReactNode[] {
           }
         }
 
-        // Regular paragraph
+        // Regular paragraph — generous line-height for readability across long
+        // multi-paragraph outputs (Study Mode, Deep Dive). `break-words` keeps
+        // long identifiers and URLs from forcing horizontal scroll.
         nodes.push(
-          <p key={key} className="text-sm text-gray-300 leading-[1.85]">
-            <InlineText text={trimmed} />
+          <p key={key} className="text-sm text-gray-300 leading-[1.8] break-words">
+            <IT text={trimmed} />
           </p>
         );
       });
@@ -551,11 +826,20 @@ function DisplayMath({ expr }: { expr: string }) {
 export default function MarkdownRenderer({
   content,
   className = "",
+  onCitationClick,
+  decorations,
 }: {
   content: string;
   className?: string;
+  onCitationClick?: (num: string, isArxiv: boolean) => void;
+  /**
+   * Optional decoration pipeline — supply ``highlights`` and/or ``searchQuery``
+   * to have matches rendered as ``<mark>`` React elements that survive
+   * arbitrary re-renders (streaming, polling, parent state updates).
+   */
+  decorations?: MarkdownDecorations;
 }) {
-  const nodes = renderMarkdown(content);
+  const nodes = renderMarkdown(content, onCitationClick, decorations);
   return (
     <div className={`space-y-3 min-w-0 ${className}`}>
       {nodes}

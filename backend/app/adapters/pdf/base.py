@@ -167,6 +167,7 @@ class PDFParser(ABC):
     """Abstract base class for PDF parsing backends.
 
     Each concrete implementation must:
+
     1. Override ``parse`` to convert raw PDF bytes into a ``ParsedPaper``.
     2. Set ``parser_name`` on the returned object.
     3. Never raise from within ``parse`` — return a best-effort result

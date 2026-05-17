@@ -18,6 +18,7 @@ DEEP GROUNDING (CRITICAL):
     For folders, we include parsed section content for any papers already parsed.
 
 This module exists to:
+
 1. Eliminate duplication of ``_load_paper_content`` across the podcast and slides workflows.
 2. Fix the folder loader bug where source_id was being misinterpreted as user_id.
 3. Centralize content-shaping logic so prompt grounding stays consistent across all

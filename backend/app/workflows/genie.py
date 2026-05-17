@@ -695,7 +695,8 @@ async def _critique(state: GenieState) -> GenieState:
         "both": "",
     }.get(orientation, "")
 
-    hyp_text = json.dumps(hypotheses, indent=2) + orientation_hint
+    # Compact JSON — same content, ~30% fewer tokens than indent=2.
+    hyp_text = json.dumps(hypotheses, separators=(",", ":")) + orientation_hint
 
     result = await llm.complete(
         [
@@ -857,7 +858,7 @@ async def _elaborate(state: GenieState) -> GenieState:
         [
             {"role": "system", "content": system_content},
             {"role": "user", "content": (
-                f"Hypothesis:\n{json.dumps(hyp, indent=2)}\n\n"
+                f"Hypothesis:\n{json.dumps(hyp, separators=(',', ':'))}\n\n"
                 f"Source context:\n{context_summary}"
             )},
         ],
@@ -1412,11 +1413,29 @@ REQUIREMENTS:
 - Target 3500–5000 words across all sections. Every section must be substantive. Be thorough, not padded.
 - Lead each section with its most important point.
 - Every claim must reference specific models, papers, methods, or benchmarks from the sources.
-- Use inline LaTeX ($...$) for equations. Use ## headings, **bold** key terms on first use.
-- Mermaid diagrams: only when structure/flow is genuinely clearer as a diagram than prose.
-  Format: ```mermaid block, flowchart TD or graph LR, max 10 nodes.
-  ALWAYS output a blank line before and after the diagram block.
-- FORMATTING RULE: always output a blank line before every ## heading, without exception.
+
+FORMATTING (the renderer supports full GitHub-flavored markdown — use it):
+- ## headings for the 11 sections below. Always ONE blank line before EVERY heading.
+- **Bold** the first occurrence of a key term per section, plus all metric/model/dataset names.
+- *Italics* for paper titles and proper-noun emphasis.
+- `Inline code` for symbols, hyperparameter names, file paths, numeric thresholds.
+- Equations: inline `$...$`, display `$$...$$`. Always real LaTeX, never ASCII.
+- Lists: `- ` bullets and `1. ` ordered steps. ONE blank line before the first item,
+  no blank lines between items, ONE blank line after the list closes.
+- Tables: pipe-separated markdown. Mandatory whenever you present ≥ 3 row-aligned
+  facts (comparison, benchmark numbers, ablations).
+- Code blocks: triple-backticks with a language tag (```python, ```bash, ```mermaid).
+  Close every block on its own line. Never embed tables inside code blocks.
+- Mermaid diagrams: only when the structure/flow is genuinely clearer as a diagram
+  than as prose. Format: ```mermaid fence, `flowchart TD` or `graph LR`, max 10 nodes,
+  short labels (no smart quotes), no trailing semicolons.
+- Block quotes: `> ` prefix for direct quotes from a source paper, with [N] citation.
+
+LAYOUT DISCIPLINE:
+- ONE blank line before every heading, before every list, before every code block,
+  before every table, before every Mermaid diagram. Without exception.
+- NEVER glue a heading to the prose above it.
+- NEVER produce two consecutive ## headings without intervening prose.
 
 STRUCTURE — all 11 sections in order:
 

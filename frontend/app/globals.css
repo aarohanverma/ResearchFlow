@@ -6,79 +6,163 @@
 /* These CSS custom properties are used by inline styles via var(--rf-*).        */
 /* Switching data-theme on <html> swaps the entire palette in one attribute.     */
 
+/* ──────────────────────────────────────────────────────────────────────────
+   ResearchFlow design tokens — Premium Scholarly Command Workspace
+   Slate/zinc base with semantic accents:
+     - --rf-accent (indigo)  : primary actions, selected state
+     - --rf-retrieval (cyan) : search, retrieval, discovery, graph
+     - --rf-insight (amber)  : insight, novelty, warning, "needs review"
+     - --rf-success (emerald): completed states
+     - --rf-destructive (rose): errors, destructive
+   Both modes are first-class: dark = focused research cockpit, light =
+   premium academic reader. No purple gradients, no neon glow.
+───────────────────────────────────────────────────────────────────────── */
+
 :root,
 [data-theme="dark"] {
-  /* backgrounds */
-  --rf-bg:           #060912;
-  --rf-surface:      rgba(17,24,39,0.9);
-  --rf-surface2:     rgba(6,9,18,0.97);
-  --rf-surface3:     rgba(31,41,55,0.7);
-  --rf-overlay:      rgba(0,0,0,0.6);
-  /* borders */
-  --rf-border:       rgba(255,255,255,0.05);
-  --rf-border2:      rgba(55,65,81,0.5);
-  --rf-border3:      rgba(75,85,99,0.4);
-  /* text */
-  --rf-text1:        #f9fafb;
-  --rf-text2:        #e5e7eb;
-  --rf-text3:        #9ca3af;
-  --rf-text4:        #6b7280;
-  --rf-text5:        #374151;
-  /* sidebar */
-  --rf-sidebar:      rgba(6,9,18,0.97);
-  --rf-nav-active:   rgba(99,102,241,0.14);
-  --rf-nav-border:   rgba(99,102,241,0.2);
-  /* card */
-  --rf-card:         rgba(17,24,39,0.7);
-  --rf-card-border:  rgba(55,65,81,0.6);
-  --rf-card-hover:   rgba(99,102,241,0.08);
+  /* page surfaces — graphite/slate, slightly cool, calm */
+  --rf-bg:           #0b0f17;            /* page background — deep slate */
+  --rf-surface:      #11161f;            /* default surface */
+  --rf-surface1:     #11161f;            /* alias */
+  --rf-surface2:     #161c27;            /* hover / second surface */
+  --rf-surface3:     #1d2533;            /* active / third surface */
+  --rf-overlay:      rgba(2,6,15,0.68);
+
+  /* borders — slate-blue, visible without yelling */
+  --rf-border:       rgba(148,163,184,0.10);
+  --rf-border2:      rgba(148,163,184,0.18);
+  --rf-border3:      rgba(148,163,184,0.30);
+
+  /* text — six-tier scale calibrated for AA on dark slate */
+  --rf-text1:        #f5f7fa;            /* primary */
+  --rf-text2:        #cdd5e0;            /* secondary */
+  --rf-text3:        #98a3b3;            /* tertiary */
+  --rf-text4:        #6b7689;            /* muted */
+  --rf-text5:        #4a5366;            /* very muted */
+
+  /* sidebar — same surface as bg, distinguished by border only */
+  --rf-sidebar:      #0b0f17;
+  --rf-nav-active:   rgba(99,102,241,0.12);
+  --rf-nav-border:   rgba(99,102,241,0.28);
+
+  /* card / panel */
+  --rf-card:         #11161f;
+  --rf-card-border:  rgba(148,163,184,0.14);
+  --rf-card-hover:   rgba(99,102,241,0.06);
+  --rf-panel:        #0e131c;
+  --rf-panel-border: rgba(148,163,184,0.16);
+
   /* input */
-  --rf-input:        rgba(17,24,39,0.8);
-  --rf-input-border: rgba(55,65,81,0.5);
-  /* scrollbar */
-  --rf-scrollbar:    rgba(55,65,81,0.6);
-  /* modal/panel */
-  --rf-panel:        rgba(8,11,18,0.98);
-  --rf-panel-border: rgba(55,65,81,0.4);
-  /* code */
-  --rf-code-bg:      rgba(17,24,39,0.8);
+  --rf-input:        #161c27;
+  --rf-input-border: rgba(148,163,184,0.20);
+
+  /* scrollbar + code */
+  --rf-scrollbar:    rgba(148,163,184,0.30);
+  --rf-code-bg:      #0d1119;
+
+  /* semantic accents — used as foreground/border tints; pair with low-alpha bg */
+  --rf-accent:        #818cf8;           /* indigo-400 — primary action */
+  --rf-accent-strong: #6366f1;           /* indigo-500 — hover/active */
+  --rf-accent-bg:     rgba(99,102,241,0.10);
+  --rf-accent-border: rgba(99,102,241,0.30);
+
+  --rf-retrieval:        #22d3ee;        /* cyan-400 — search/graph */
+  --rf-retrieval-strong: #06b6d4;
+  --rf-retrieval-bg:     rgba(34,211,238,0.10);
+  --rf-retrieval-border: rgba(34,211,238,0.28);
+
+  --rf-insight:        #fbbf24;          /* amber-400 — insight/novelty */
+  --rf-insight-strong: #f59e0b;
+  --rf-insight-bg:     rgba(251,191,36,0.10);
+  --rf-insight-border: rgba(251,191,36,0.30);
+
+  --rf-success:        #34d399;          /* emerald-400 */
+  --rf-success-strong: #10b981;
+  --rf-success-bg:     rgba(52,211,153,0.10);
+  --rf-success-border: rgba(52,211,153,0.30);
+
+  --rf-destructive:        #fb7185;      /* rose-400 — softer than red */
+  --rf-destructive-strong: #f43f5e;
+  --rf-destructive-bg:     rgba(251,113,133,0.10);
+  --rf-destructive-border: rgba(251,113,133,0.32);
+
+  /* shadows — restrained, monochrome, never glowing */
+  --rf-shadow-sm: 0 1px 2px rgba(2,6,15,0.40);
+  --rf-shadow:    0 4px 14px rgba(2,6,15,0.45), 0 1px 2px rgba(2,6,15,0.35);
+  --rf-shadow-lg: 0 12px 32px rgba(2,6,15,0.55), 0 2px 6px rgba(2,6,15,0.40);
 }
 
 [data-theme="light"] {
-  /* backgrounds — deeper page wash so white cards elevate clearly */
-  --rf-bg:           #e8ecf6;
+  /* page surfaces — warm off-white, cards elevate cleanly without harsh white */
+  --rf-bg:           #f3f5f9;            /* page wash */
   --rf-surface:      #ffffff;
-  --rf-surface2:     #f2f4fb;
-  --rf-surface3:     #dde1f0;
-  --rf-overlay:      rgba(0,0,0,0.35);
-  /* borders — neutral blue-slate for real visibility */
-  --rf-border:       rgba(96,104,168,0.20);
-  --rf-border2:      rgba(96,104,168,0.30);
-  --rf-border3:      rgba(99,102,241,0.42);
-  /* text — strong, WCAG-compliant scale */
-  --rf-text1:        #0c0e1d;
-  --rf-text2:        #181b35;
-  --rf-text3:        #333961;
-  --rf-text4:        #4e5480;
-  --rf-text5:        #686ea0;
+  --rf-surface1:     #ffffff;
+  --rf-surface2:     #f7f9fc;            /* hover */
+  --rf-surface3:     #e9edf3;            /* active */
+  --rf-overlay:      rgba(15,23,42,0.32);
+
+  /* borders — neutral slate, subtle but readable */
+  --rf-border:       rgba(15,23,42,0.08);
+  --rf-border2:      rgba(15,23,42,0.14);
+  --rf-border3:      rgba(15,23,42,0.24);
+
+  /* text — strong, WCAG-AA compliant on warm off-white */
+  --rf-text1:        #0f172a;            /* slate-900 — primary */
+  --rf-text2:        #1e293b;            /* slate-800 — secondary */
+  --rf-text3:        #475569;            /* slate-600 — tertiary */
+  --rf-text4:        #64748b;            /* slate-500 — muted */
+  --rf-text5:        #94a3b8;            /* slate-400 — very muted */
+
   /* sidebar */
-  --rf-sidebar:      #f4f6fc;
-  --rf-nav-active:   rgba(99,102,241,0.11);
-  --rf-nav-border:   rgba(99,102,241,0.36);
-  /* card */
+  --rf-sidebar:      #ffffff;
+  --rf-nav-active:   rgba(99,102,241,0.08);
+  --rf-nav-border:   rgba(99,102,241,0.28);
+
+  /* card / panel */
   --rf-card:         #ffffff;
-  --rf-card-border:  rgba(96,104,168,0.22);
-  --rf-card-hover:   rgba(99,102,241,0.05);
+  --rf-card-border:  rgba(15,23,42,0.08);
+  --rf-card-hover:   rgba(99,102,241,0.04);
+  --rf-panel:        #ffffff;
+  --rf-panel-border: rgba(15,23,42,0.10);
+
   /* input */
   --rf-input:        #ffffff;
-  --rf-input-border: rgba(96,104,168,0.34);
-  /* scrollbar */
-  --rf-scrollbar:    rgba(99,102,241,0.24);
-  /* modal/panel */
-  --rf-panel:        #ffffff;
-  --rf-panel-border: rgba(96,104,168,0.22);
-  /* code */
-  --rf-code-bg:      #e8ecf6;
+  --rf-input-border: rgba(15,23,42,0.16);
+
+  /* scrollbar + code */
+  --rf-scrollbar:    rgba(15,23,42,0.18);
+  --rf-code-bg:      #f1f3f8;
+
+  /* semantic accents — darker shades for readability on light surfaces */
+  --rf-accent:        #4f46e5;           /* indigo-600 */
+  --rf-accent-strong: #4338ca;           /* indigo-700 */
+  --rf-accent-bg:     rgba(79,70,229,0.07);
+  --rf-accent-border: rgba(79,70,229,0.25);
+
+  --rf-retrieval:        #0891b2;        /* cyan-600 */
+  --rf-retrieval-strong: #0e7490;
+  --rf-retrieval-bg:     rgba(8,145,178,0.07);
+  --rf-retrieval-border: rgba(8,145,178,0.25);
+
+  --rf-insight:        #b45309;          /* amber-700 */
+  --rf-insight-strong: #92400e;
+  --rf-insight-bg:     rgba(180,83,9,0.07);
+  --rf-insight-border: rgba(180,83,9,0.25);
+
+  --rf-success:        #047857;          /* emerald-700 */
+  --rf-success-strong: #065f46;
+  --rf-success-bg:     rgba(4,120,87,0.07);
+  --rf-success-border: rgba(4,120,87,0.25);
+
+  --rf-destructive:        #be123c;      /* rose-700 */
+  --rf-destructive-strong: #9f1239;
+  --rf-destructive-bg:     rgba(190,18,60,0.06);
+  --rf-destructive-border: rgba(190,18,60,0.22);
+
+  /* shadows — soft, multi-layer, slate-tinted */
+  --rf-shadow-sm: 0 1px 2px rgba(15,23,42,0.04);
+  --rf-shadow:    0 1px 3px rgba(15,23,42,0.05), 0 4px 12px rgba(15,23,42,0.04);
+  --rf-shadow-lg: 0 10px 28px rgba(15,23,42,0.10), 0 2px 8px rgba(15,23,42,0.05);
 }
 
 @layer base {
@@ -124,77 +208,124 @@
   /* Smooth scroll */
   html { scroll-behavior: smooth; }
 
-  /* Selection */
-  ::selection { @apply bg-indigo-500/30 text-white; }
+  /* Selection — neutral indigo tint, readable in both themes */
+  ::selection {
+    background: var(--rf-accent-bg);
+    color: var(--rf-text1);
+  }
 }
 
 @layer components {
-  /* Glass card */
-  .glass {
-    background: rgba(17, 24, 39, 0.7);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+  /* Surface card — replaces .glass without the heavy blur. Backwards-compat
+     with existing .glass usage so we don't have to touch every file. */
+  .glass,
+  .rf-card {
+    background: var(--rf-card);
+    border: 1px solid var(--rf-card-border);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
-  /* Gradient brand text */
+  /* Brand text — solid indigo, no rainbow gradient. Kept as a class so
+     existing usages don't break, but visually scholarly now. */
   .text-gradient {
-    background: linear-gradient(135deg, #818cf8 0%, #6366f1 50%, #a78bfa 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    color: var(--rf-accent);
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    background-clip: initial;
+    -webkit-background-clip: initial;
+    font-weight: 700;
   }
 
-  /* Glow effects */
-  .glow-brand {
-    box-shadow: 0 0 20px rgba(99, 102, 241, 0.3), 0 0 40px rgba(99, 102, 241, 0.1);
-  }
-  .glow-sm { box-shadow: 0 0 10px rgba(99, 102, 241, 0.2); }
+  /* Restrained shadow utilities — no neon glow */
+  .glow-brand { box-shadow: var(--rf-shadow); }
+  .glow-sm    { box-shadow: var(--rf-shadow-sm); }
 
-  /* Card hover */
-  .card-hover {
-    @apply transition-all duration-200;
-  }
+  /* Card hover — subtle accent border, real shadow, no translate that
+     causes layout shift in dense lists */
+  .card-hover { transition: border-color 160ms ease, box-shadow 160ms ease; }
   .card-hover:hover {
-    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3), 0 4px 24px rgba(0, 0, 0, 0.4);
-    transform: translateY(-1px);
+    border-color: var(--rf-accent-border);
+    box-shadow: var(--rf-shadow);
   }
 
   /* Score bar */
   .score-bar {
-    @apply h-1.5 rounded-full bg-gray-800 overflow-hidden;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--rf-surface3);
+    overflow: hidden;
   }
   .score-fill {
-    @apply h-full rounded-full transition-all duration-700 ease-out;
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 700ms cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* Skeleton shimmer */
+  /* Skeleton shimmer — uses theme tokens so it works in both modes */
   .skeleton {
-    background: linear-gradient(90deg, #1f2937 25%, #374151 50%, #1f2937 75%);
+    background: linear-gradient(90deg,
+      var(--rf-surface2) 25%,
+      var(--rf-surface3) 50%,
+      var(--rf-surface2) 75%);
     background-size: 200% 100%;
     animation: shimmer 1.5s infinite;
   }
 
-  /* Input base */
+  /* Input base — theme-tokenized so light + dark are first-class */
   .input-base {
-    @apply w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500;
-    @apply transition-all duration-200 outline-none;
-    @apply focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20;
+    width: 100%;
+    background: var(--rf-input);
+    border: 1px solid var(--rf-input-border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--rf-text1);
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+    outline: none;
+  }
+  .input-base::placeholder { color: var(--rf-text5); }
+  .input-base:focus {
+    border-color: var(--rf-accent-strong);
+    box-shadow: 0 0 0 3px var(--rf-accent-bg);
   }
 
-  /* Button variants */
+  /* Button variants — token-driven so theme switching just works */
   .btn-primary {
-    @apply bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl;
-    @apply transition-all duration-200 active:scale-[0.98];
-    @apply disabled:opacity-50 disabled:cursor-not-allowed;
+    background: var(--rf-accent-strong);
+    color: white;
+    font-weight: 600;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    transition: background 150ms ease, transform 80ms ease;
   }
+  .btn-primary:hover { background: var(--rf-accent); }
+  .btn-primary:active:not(:disabled) { transform: scale(0.985); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
   .btn-ghost {
-    @apply text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg;
-    @apply transition-all duration-150;
+    color: var(--rf-text3);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    transition: color 150ms ease, background 150ms ease;
   }
+  .btn-ghost:hover {
+    color: var(--rf-text1);
+    background: var(--rf-surface2);
+  }
+
   .btn-outline {
-    @apply border border-gray-700 hover:border-gray-600 text-gray-300 hover:text-white rounded-xl;
-    @apply transition-all duration-150 bg-transparent hover:bg-gray-800/50;
+    color: var(--rf-text2);
+    background: transparent;
+    border: 1px solid var(--rf-border2);
+    border-radius: 10px;
+    transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+  }
+  .btn-outline:hover {
+    color: var(--rf-text1);
+    border-color: var(--rf-border3);
+    background: var(--rf-surface2);
   }
 }
 
@@ -554,6 +685,95 @@
   100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
 }
 
+/* ── ResearchFlow motion system ────────────────────────────────────────────── */
+
+@keyframes rf-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes rf-slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes rf-slide-down {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes rf-slide-in-right {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes rf-scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes rf-skeleton {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+
+/* Motion utilities — apply as className */
+.rf-fade-in       { animation: rf-fade-in       0.18s ease both; }
+.rf-slide-up      { animation: rf-slide-up      0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.rf-slide-down    { animation: rf-slide-down    0.18s ease both; }
+.rf-slide-in-right { animation: rf-slide-in-right 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.rf-scale-in      { animation: rf-scale-in      0.18s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Ghost/skeleton elements — sophisticated shimmer */
+.rf-ghost {
+  background: linear-gradient(
+    90deg,
+    var(--rf-surface2) 0%,
+    var(--rf-surface3) 40%,
+    var(--rf-surface2) 80%
+  );
+  background-size: 800px 100%;
+  animation: rf-skeleton 1.6s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+/* Ghost card — full card placeholder */
+.rf-ghost-card {
+  background: var(--rf-card);
+  border: 1px solid var(--rf-card-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  animation: rf-fade-in 0.2s ease both;
+}
+.rf-ghost-card .rf-ghost { margin-bottom: 6px; }
+
+/* Button press — subtle scale feedback */
+.rf-btn:active:not(:disabled) { transform: scale(0.96); transition: transform 60ms ease; }
+
+/* Interactive card — smooth multi-property transition */
+.rf-card-interactive {
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+  cursor: pointer;
+}
+.rf-card-interactive:hover {
+  border-color: var(--rf-accent-border);
+  box-shadow: var(--rf-shadow);
+  background: var(--rf-card-hover);
+}
+
+/* Panel slide-in from right */
+.rf-panel-enter { animation: rf-slide-in-right 0.24s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Modal overlay fade */
+.rf-overlay-enter { animation: rf-fade-in 0.16s ease both; }
+.rf-modal-enter   { animation: rf-scale-in 0.2s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Message bubble entrance */
+.rf-message-enter { animation: rf-slide-up 0.2s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Stagger helpers — set via inline style animationDelay */
+.rf-stagger > * { animation-fill-mode: both; }
+
 /* Streaming cursor */
 .streaming-cursor::after {
   content: "▌";
@@ -561,9 +781,13 @@
   animation: cursor-blink 0.8s step-end infinite;
 }
 
-/* Mermaid diagrams */
+/* Mermaid diagrams — theme-tokenized so light/dark both look right */
 .mermaid-wrapper {
-  @apply rounded-xl bg-gray-900/80 border border-gray-800 p-5 overflow-x-auto;
+  border-radius: 10px;
+  background: var(--rf-surface2);
+  border: 1px solid var(--rf-border);
+  padding: 18px;
+  overflow-x: auto;
 }
 .mermaid-wrapper svg { max-width: 100%; height: auto; }
 

@@ -154,6 +154,16 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             Parsed JSON response as a Python dict.
         """
+        # OpenAI json_object mode requires the word "json" to appear somewhere
+        # in the messages — inject a system preamble if it's missing.
+        has_json_word = any(
+            "json" in (m.get("content") or "").lower() for m in messages
+        )
+        if not has_json_word:
+            messages = [
+                {"role": "system", "content": "Return only valid JSON. No markdown, no prose."},
+                *messages,
+            ]
         result = await self.complete(
             messages,
             model,

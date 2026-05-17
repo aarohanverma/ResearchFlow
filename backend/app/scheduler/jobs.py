@@ -52,61 +52,76 @@ async def _rebuild_bookmark_index() -> None:
 
         rebuilt = 0
         for uid in user_ids:
-            async with async_session_factory() as db:
-                repo = PaperRepository(db)
-                bookmarks = await repo.get_bookmarks(uid)
-                if not bookmarks:
-                    continue
+            try:
+                async with async_session_factory() as db:
+                    repo = PaperRepository(db)
+                    bookmarks = await repo.get_bookmarks(uid)
+                    if not bookmarks:
+                        continue
 
-                bm_paper_ids = [bm.paper_id for bm in bookmarks]
+                    bm_paper_ids = [bm.paper_id for bm in bookmarks]
 
-                # Single query: find which bookmarked papers already have an abstract chunk
-                abstract_chunk_q = await db.execute(
-                    select(PaperChunk.paper_id).where(
-                        PaperChunk.paper_id.in_(bm_paper_ids),
-                        PaperChunk.section_type == "abstract",
+                    # Single query: find which bookmarked papers already have an abstract chunk
+                    abstract_chunk_q = await db.execute(
+                        select(PaperChunk.paper_id).where(
+                            PaperChunk.paper_id.in_(bm_paper_ids),
+                            PaperChunk.section_type == "abstract",
+                        )
                     )
-                )
-                already_embedded: set = {row[0] for row in abstract_chunk_q.fetchall()}
+                    already_embedded: set = {row[0] for row in abstract_chunk_q.fetchall()}
 
-                # Batch-fetch only the papers that need embedding
-                missing_ids = [pid for pid in bm_paper_ids if pid not in already_embedded]
-                if not missing_ids:
-                    continue
+                    # Batch-fetch only the papers that need embedding
+                    missing_ids = [pid for pid in bm_paper_ids if pid not in already_embedded]
+                    if not missing_ids:
+                        continue
 
-                papers_q = await db.execute(
-                    select(Paper).where(Paper.id.in_(missing_ids))
-                )
-                papers_to_embed = [p for p in papers_q.scalars() if p.abstract]
+                    papers_q = await db.execute(
+                        select(Paper).where(Paper.id.in_(missing_ids))
+                    )
+                    papers_to_embed = [p for p in papers_q.scalars() if p.abstract]
 
-                for paper in papers_to_embed:
-                    try:
-                        vectors = await embed.embed_texts(
-                            [paper.abstract], task_type="RETRIEVAL_DOCUMENT"
-                        )
-                        db.add(PaperChunk(
-                            paper_id=paper.id,
-                            chunk_index=0,
-                            section_type="abstract",
-                            content=paper.abstract,
-                            embedding=vectors[0],
-                            embedding_dim=embed.dimensions,
-                            embedding_provider=embed.provider_id,
-                        ))
-                        rebuilt += 1
-                    except Exception as exc:
-                        log.warning(
-                            "bookmark_index_rebuild: embed failed paper=%s err=%s",
-                            paper.id, exc,
-                        )
+                    for paper in papers_to_embed:
+                        try:
+                            vectors = await embed.embed_texts(
+                                [paper.abstract], task_type="RETRIEVAL_DOCUMENT"
+                            )
+                            db.add(PaperChunk(
+                                paper_id=paper.id,
+                                chunk_index=0,
+                                section_type="abstract",
+                                content=paper.abstract,
+                                embedding=vectors[0],
+                                embedding_dim=embed.dimensions,
+                                embedding_provider=embed.provider_id,
+                            ))
+                            rebuilt += 1
+                        except Exception as exc:
+                            log.warning(
+                                "bookmark_index_rebuild: embed failed paper=%s err=%s",
+                                paper.id, exc,
+                            )
 
-                await db.commit()
+                    await db.commit()
+            except Exception as exc:
+                log.warning("bookmark_index_rebuild: failed for user=%s err=%s", uid, exc)
 
         log.info("scheduler.bookmark_index_rebuild: done rebuilt=%d", rebuilt)
     except Exception as exc:
         log.error("scheduler.bookmark_index_rebuild: failed err=%s", exc)
 
 
+
+
+async def _cleanup_checkpoints() -> None:
+    """Delete LangGraph checkpoint rows older than 30 days to prevent unbounded table growth."""
+    log.info("scheduler.checkpoint_cleanup: starting")
+    try:
+        from app.db.checkpointer import get_checkpointer
+        checkpointer = await get_checkpointer()
+        removed = await checkpointer.cleanup_old_checkpoints(older_than_days=30)
+        log.info("scheduler.checkpoint_cleanup: done removed=%d thread(s)", removed)
+    except Exception as exc:
+        log.error("scheduler.checkpoint_cleanup: failed err=%s", exc)
 
 
 async def _run_clustering() -> None:
@@ -201,6 +216,18 @@ def start_scheduler() -> None:
         id="bookmark_index_rebuild_weekly",
         day_of_week="sun",
         hour=3,
+        minute=0,
+        misfire_grace_time=3600,
+    )
+
+    # Monthly LangGraph checkpoint cleanup — removes threads older than 30 days
+    # to prevent unbounded growth of the three checkpoint tables.
+    sched.add_job(
+        _cleanup_checkpoints,
+        "cron",
+        id="checkpoint_cleanup_monthly",
+        day=1,
+        hour=4,
         minute=0,
         misfire_grace_time=3600,
     )

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { useAuthStore } from "@/store/auth";
@@ -30,6 +30,7 @@ import {
   ClockIcon,
   RefreshCwIcon,
   BookOpenIcon,
+  GitMergeIcon,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
@@ -120,6 +121,7 @@ const THRESHOLDS_KEY = "genie_thresholds";
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function GeniePage() {
+  const router = useRouter();
   const { token } = useAuthStore();
   // Narrow selectors so the page doesn't re-render every time the
   // JobsPanel polls (e.g. while a podcast generates in the background).
@@ -146,7 +148,95 @@ export default function GeniePage() {
   useEffect(() => () => synthAbortRef.current?.abort(), []);
 
   const [capsules, setCapsules] = useState<IdeaCapsule[]>([]);
+  // `capsulesLoading` is true on first mount until the initial fetch resolves,
+  // and stays false on subsequent refetches (so the grid doesn't flicker into
+  // skeletons on every poll). The ghost-card grid is gated on this flag.
+  const [capsulesLoading, setCapsulesLoading] = useState(true);
   const [chatCapsule, setChatCapsule] = useState<IdeaCapsule | null>(null);
+
+  // ── Idea-combine multi-select state ────────────────────────────────────────
+  // Users tick 2–3 ideas, click Combine, the backend's combine workflow runs
+  // in the background, and we poll the resulting GenieSession until it lands
+  // on a terminal state. Then we navigate to the new hybrid capsule's page.
+  const COMBINE_MAX = 3;
+  const [combineSelected, setCombineSelected] = useState<string[]>([]);
+  const [combineBusy, setCombineBusy] = useState(false);
+  const [combineErr, setCombineErr] = useState<string | null>(null);
+  const toggleCombineSelect = useCallback((capsuleId: string) => {
+    setCombineSelected(prev => {
+      if (prev.includes(capsuleId)) return prev.filter(id => id !== capsuleId);
+      if (prev.length >= COMBINE_MAX) return prev; // hard cap — UI also disables further selection
+      return [...prev, capsuleId];
+    });
+  }, []);
+  const clearCombineSelection = useCallback(() => {
+    setCombineSelected([]);
+    setCombineErr(null);
+  }, []);
+
+  async function startCombine() {
+    if (combineBusy) return;
+    if (combineSelected.length < 2 || combineSelected.length > COMBINE_MAX) return;
+    setCombineBusy(true);
+    setCombineErr(null);
+    try {
+      const queued = await api.post<{ session_id: string; status: string; parent_ids: string[] }>(
+        "/genie/capsules/combine",
+        { capsule_ids: combineSelected },
+      );
+      if (!queued?.session_id) {
+        setCombineErr("Combine could not be queued.");
+        setCombineBusy(false);
+        return;
+      }
+      // Poll until terminal status; 2.5 s × 145 ≈ 6 min cap.
+      const sessionId = queued.session_id;
+      const POLL_MS = 2500;
+      const MAX_ATTEMPTS = 145;
+      let attempts = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let lastStatus: any = null;
+      while (attempts < MAX_ATTEMPTS) {
+        attempts += 1;
+        await new Promise<void>(resolve => setTimeout(resolve, POLL_MS));
+        try {
+          const sess = await api.get<{ status: string; capsule_id?: string | null; error?: string | null }>(
+            `/genie/sessions/${sessionId}`,
+          );
+          lastStatus = sess;
+          if (sess.status === "done" && sess.capsule_id) {
+            // Refresh capsule list so the new hybrid appears immediately on
+            // return navigation, then jump to its detail page.
+            api.get<IdeaCapsule[]>(capsulesUrl).then(setCapsules).catch(() => {});
+            router.push(`/genie/idea/${sess.capsule_id}`);
+            setCombineBusy(false);
+            setCombineSelected([]);
+            return;
+          }
+          if (sess.status === "failed" || sess.status === "done_empty" || sess.status === "cancelled") {
+            setCombineErr(
+              sess.error
+                || (sess.status === "done_empty"
+                  ? "These ideas didn't combine into a meaningful hybrid. Try a different selection."
+                  : "Combine failed. Please try again."),
+            );
+            setCombineBusy(false);
+            return;
+          }
+        } catch { /* transient — keep polling */ }
+      }
+      setCombineErr(
+        (lastStatus && typeof lastStatus.error === "string" && lastStatus.error)
+          || "Combine is taking longer than expected — check back in a moment.",
+      );
+      setCombineBusy(false);
+    } catch (e: unknown) {
+      const err = e as { status?: number; detail?: string | { message?: string }; message?: string };
+      const detail = typeof err?.detail === "string" ? err.detail : err?.detail?.message;
+      setCombineErr(detail || err?.message || "Combine request failed.");
+      setCombineBusy(false);
+    }
+  }
 
   const [autoStatus, setAutoStatus] = useState<AutoStatus | null>(null);
   const [autoBatchRunning, setAutoBatchRunning] = useState(false);
@@ -212,7 +302,11 @@ export default function GeniePage() {
     if (selectedTopics.length) qs.set("namespace_keys", selectedTopics.join(","));
     qs.set("bookmarks_only", "true");
     api.get<GenieElement[]>(`/genie/elements?${qs}`).then(setElements).catch(() => {});
-    api.get<IdeaCapsule[]>(capsulesUrl).then(setCapsules).catch(() => {});
+    setCapsulesLoading(true);
+    api.get<IdeaCapsule[]>(capsulesUrl)
+      .then(setCapsules)
+      .catch(() => {})
+      .finally(() => setCapsulesLoading(false));
     api.get<AutoStatus>("/genie/auto-status").then(setAutoStatus).catch(() => {});
     api.get<BookmarkFolder[]>("/bookmarks/folders").then(setFolders).catch(() => {});
     api.get<Bookmark[]>("/bookmarks").then(data => {
@@ -267,11 +361,13 @@ export default function GeniePage() {
     return () => { if (bgPollRef.current) clearTimeout(bgPollRef.current); };
   }, [bgJobId, bgStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Max cauldron size: 2–10 for Manual (richer context), 2–5 for Auto/Query (pairing logic cap)
-  const maxCauldron = mode === "manual" ? 10 : 5;
+  // Max cauldron size: up to 10 for all modes now that backend supports it
+  const maxCauldron = 10;
 
   function addToCauldron(el: GenieElement) {
     if (cauldron.find((c) => c.id === el.id)) return;
+    // Dedup by paper_id so the same physical paper (different namespaces) isn't added twice
+    if (el.paper_id && cauldron.find((c) => c.paper_id === el.paper_id)) return;
     if (cauldron.length >= maxCauldron) return;
     setCauldron((c) => [...c, el]);
   }
@@ -334,6 +430,7 @@ export default function GeniePage() {
     setQueryLoading(true);
     setQueryResult(null);
     setQueryError(null);
+    autoSelectedRef.current = new Set(); // reset auto-selection tracking for new query
     try {
       const qs = new URLSearchParams({
         query: queryInput.trim(),
@@ -377,6 +474,8 @@ export default function GeniePage() {
 
   // Track per-paper loading state while the element is being created on the backend
   const [creatingElementFor, setCreatingElementFor] = useState<Set<string>>(new Set());
+  // Track which paper_ids have been auto-selected for the current query result
+  const autoSelectedRef = useRef<Set<string>>(new Set());
 
   async function toggleQueryPaperInCauldron(paper: { paper_id: string; title: string }) {
     // First check the local elements library
@@ -407,13 +506,21 @@ export default function GeniePage() {
     }
   }
 
-  // Auto-select best group papers when query results arrive (bookmarked papers only — others can be manually selected)
+  // Auto-select all best_group papers when query results arrive.
+  // Bookmarked papers are added immediately; non-bookmarked ones trigger on-the-fly element creation.
   useEffect(() => {
     if (!queryResult?.best_group?.length) return;
     queryResult.best_group.forEach(paper => {
+      if (autoSelectedRef.current.has(paper.paper_id)) return;
+      autoSelectedRef.current.add(paper.paper_id);
       const existing = elements.find(e => e.paper_id === paper.paper_id);
-      if (existing && !cauldron.find(c => c.id === existing.id)) {
-        addToCauldron(existing);
+      if (existing) {
+        if (!cauldron.find(c => c.id === existing.id || (c.paper_id && c.paper_id === existing.paper_id))) {
+          addToCauldron(existing);
+        }
+      } else {
+        // Paper not bookmarked — create element on-the-fly so it joins the cauldron
+        toggleQueryPaperInCauldron(paper);
       }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -516,6 +623,47 @@ export default function GeniePage() {
     await api.patch(`/genie/capsules/${id}/status?status=saved`);
     setCapsules((cs) => cs.map((c) => c.id === id ? { ...c, status: "saved" } : c));
   }
+
+  // Deduplicate query result papers by source_url (same arXiv paper can appear in multiple namespaces).
+  // When deduping, prefer the entry that belongs to best_group, then the one already in the user's library,
+  // then the one with higher query relevance.
+  const dedupedQueryPapers = useMemo(() => {
+    if (!queryResult?.papers?.length) return [];
+    const seen = new Map<string, typeof queryResult.papers[0]>();
+    for (const p of queryResult.papers) {
+      const key = p.source_url || p.paper_id;
+      const existing = seen.get(key);
+      if (!existing) {
+        seen.set(key, p);
+        continue;
+      }
+      const pInBest = queryResult.best_group?.some(g => g.paper_id === p.paper_id) ?? false;
+      const exInBest = queryResult.best_group?.some(g => g.paper_id === existing.paper_id) ?? false;
+      const pInLib = elements.some(e => e.paper_id === p.paper_id);
+      const exInLib = elements.some(e => e.paper_id === existing.paper_id);
+      // Priority: best_group > in-library > higher relevance
+      if (
+        (pInBest && !exInBest) ||
+        (!pInBest && !exInBest && pInLib && !exInLib) ||
+        (pInBest === exInBest && pInLib === exInLib && p.query_relevance > existing.query_relevance)
+      ) {
+        seen.set(key, p);
+      }
+    }
+    return [...seen.values()].sort((a, b) => b.query_relevance - a.query_relevance);
+  }, [queryResult?.papers, queryResult?.best_group, elements]);
+
+  // Dedup the best_group display list too (same physical paper across namespaces)
+  const dedupedBestGroup = useMemo(() => {
+    if (!queryResult?.best_group?.length) return [];
+    const seen = new Set<string>();
+    return queryResult.best_group.filter(p => {
+      const key = p.source_url || p.paper_id;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [queryResult?.best_group]);
 
   const filteredElements = elements.filter((e) => {
     if (!e.label.toLowerCase().includes(elemSearch.toLowerCase())) return false;
@@ -650,15 +798,15 @@ export default function GeniePage() {
                   </p>
                 )}
 
-                {queryResult.best_group.length >= 2 && (
+                {dedupedBestGroup.length >= 2 && (
                   <div className="rounded-xl border border-violet-700/30 bg-violet-950/20 p-2.5 mb-2">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[10px] font-semibold text-violet-300">Best group · {queryResult.best_group.length} papers</span>
+                      <span className="text-[10px] font-semibold text-violet-300">Best group · {dedupedBestGroup.length} papers</span>
                       <span className="text-[9px] text-gray-600">score {Math.round(queryResult.best_group_score * 100)}%</span>
                     </div>
                     <button
-                      onClick={() => runQueryDiscover(true)}
-                      disabled={queryLoading}
+                      onClick={() => synthesize()}
+                      disabled={queryLoading || streaming || cauldron.length < 2}
                       className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-[10px] font-semibold transition-all disabled:opacity-40
                         bg-gradient-to-r from-indigo-700/80 to-violet-700/80 hover:from-indigo-600 hover:to-violet-600 text-white"
                     >
@@ -668,13 +816,13 @@ export default function GeniePage() {
                 )}
 
                 <p className="text-[9px] font-bold text-gray-600 uppercase tracking-wider px-0.5">
-                  {queryResult.papers.length} Papers Found
+                  {dedupedQueryPapers.length} Papers Found{queryResult.papers.length > dedupedQueryPapers.length ? ` (${queryResult.papers.length - dedupedQueryPapers.length} duplicates hidden)` : ""}
                 </p>
 
-                {queryResult.papers.map(paper => {
+                {dedupedQueryPapers.map(paper => {
                   const elemInLib = elements.find(e => e.paper_id === paper.paper_id);
-                  const inCauldron = !!(elemInLib && cauldron.find(c => c.id === elemInLib.id));
-                  const inBestGroup = queryResult.best_group.some(g => g.paper_id === paper.paper_id);
+                  const inCauldron = !!(elemInLib && cauldron.find(c => c.id === elemInLib.id || (c.paper_id && c.paper_id === elemInLib.paper_id)));
+                  const inBestGroup = queryResult.best_group.some(g => g.paper_id === paper.paper_id || g.source_url === paper.source_url);
                   const rel = Math.round((paper.query_relevance ?? 0) * 100);
                   const relColor = rel >= 65 ? "#34d399" : rel >= 40 ? "#fbbf24" : "#6b7280";
                   const isCreating = creatingElementFor.has(paper.paper_id);
@@ -770,7 +918,7 @@ export default function GeniePage() {
               </div>
             )}
 
-            {queryResult && queryResult.papers.length === 0 && !queryError && (
+            {queryResult && dedupedQueryPapers.length === 0 && !queryError && (
               <p className="text-[11px] text-gray-600 text-center py-6 leading-relaxed">
                 No papers found. Try a different query or refresh the feed first.
               </p>
@@ -1146,7 +1294,14 @@ export default function GeniePage() {
         {/* ── Discoveries tab ──────────────────────────────────────────── */}
         {activeTab === "discoveries" && (
           <div className="flex-1 overflow-y-auto p-6">
-            {capsules.length === 0 ? (
+            {capsulesLoading ? (
+              // Skeleton cards while the initial capsule fetch is in flight.
+              // Three rows is enough to fill the visible area on most screens
+              // without paying for a longer skeleton run than the real fetch.
+              <div className="space-y-5">
+                {[0, 1, 2].map(i => <CapsuleSkeleton key={i} delay={i * 80} />)}
+              </div>
+            ) : capsules.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-gray-700 gap-4">
                 <div className="w-16 h-16 rounded-2xl bg-gray-900 border border-white/5 flex items-center justify-center">
                   <FlaskConicalIcon size={28} className="opacity-30" />
@@ -1160,12 +1315,69 @@ export default function GeniePage() {
               </div>
             ) : (
               <div className="space-y-5">
+                {/* Combine bar — sticky helper at the top of the ideas list so
+                    the user can see selection state + action without scrolling. */}
+                <div
+                  className="sticky top-0 z-10 flex items-center gap-2 px-4 py-2.5 rounded-xl border bg-gray-950/85 backdrop-blur-sm"
+                  style={{ borderColor: combineSelected.length >= 2 ? "rgba(217,70,239,0.35)" : "rgba(255,255,255,0.06)" }}
+                >
+                  <GitMergeIcon size={14} className={combineSelected.length >= 2 ? "text-fuchsia-300" : "text-gray-500"} />
+                  <span className="text-[12px] text-gray-300">
+                    Combine ideas — select 2 or 3 to fuse into a hybrid hypothesis.
+                  </span>
+                  <span className="text-[11px] text-gray-500 font-mono">
+                    {combineSelected.length} / {COMBINE_MAX} selected
+                  </span>
+                  <div className="flex-1" />
+                  {combineSelected.length > 0 && (
+                    <button
+                      onClick={clearCombineSelection}
+                      disabled={combineBusy}
+                      className="text-[11px] text-gray-500 hover:text-gray-300 px-2 py-1 rounded disabled:opacity-40"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <button
+                    onClick={startCombine}
+                    disabled={combineBusy || combineSelected.length < 2 || combineSelected.length > COMBINE_MAX}
+                    className="text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-all"
+                    style={
+                      combineBusy
+                        ? { background: "rgba(217,70,239,0.15)", color: "#f0abfc", border: "1px solid rgba(217,70,239,0.3)", cursor: "wait" }
+                        : combineSelected.length >= 2 && combineSelected.length <= COMBINE_MAX
+                        ? { background: "linear-gradient(135deg,#a21caf,#d946ef)", color: "white", border: "1px solid transparent" }
+                        : { background: "rgba(255,255,255,0.04)", color: "var(--rf-text5)", border: "1px solid rgba(255,255,255,0.06)", cursor: "not-allowed" }
+                    }
+                    title={
+                      combineSelected.length < 2
+                        ? "Select at least 2 ideas to combine"
+                        : combineSelected.length > COMBINE_MAX
+                        ? `Maximum ${COMBINE_MAX} ideas`
+                        : "Run feasibility check + fusion synthesis"
+                    }
+                  >
+                    {combineBusy ? "Combining…" : "Combine selected"}
+                  </button>
+                </div>
+                {combineErr && (
+                  <div className="px-3 py-2 rounded-lg bg-red-950/40 border border-red-800/40 text-red-300 text-[11px]">
+                    {combineErr}
+                  </div>
+                )}
+
                 {capsules.map((capsule) => (
                   <CapsuleCard
                     key={capsule.id}
                     capsule={capsule}
                     onDelete={() => deleteCapsule(capsule.id)}
                     onChat={() => setChatCapsule(capsule)}
+                    combineSelected={combineSelected.includes(capsule.id)}
+                    combineDisabled={
+                      combineBusy ||
+                      (!combineSelected.includes(capsule.id) && combineSelected.length >= COMBINE_MAX)
+                    }
+                    onCombineToggle={() => toggleCombineSelect(capsule.id)}
                   />
                 ))}
               </div>
@@ -1393,16 +1605,60 @@ function ElaborationSectionBlock({ section, content }: { section: string; conten
   );
 }
 
+// ── Capsule skeleton (ghost loading card) ───────────────────────────────────────
+// Mirrors CapsuleCard's vertical rhythm so the transition to real content
+// doesn't cause layout shift. Staggered fade-in via `delay`.
+
+function CapsuleSkeleton({ delay = 0 }: { delay?: number }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25, delay: delay / 1000 }}
+      className="rounded-2xl border border-gray-800/60 bg-gradient-to-br from-gray-900/60 to-gray-950/40 px-6 py-5"
+    >
+      <div className="flex items-center gap-2 mb-3">
+        <div className="h-5 w-16 rounded-full bg-gray-800/70 animate-pulse" />
+        <div className="h-5 w-14 rounded-full bg-gray-800/50 animate-pulse" />
+        <div className="flex-1" />
+        <div className="h-5 w-20 rounded-md bg-gray-800/40 animate-pulse" />
+      </div>
+      <div className="h-6 w-3/4 rounded bg-gray-800/70 animate-pulse mb-2" />
+      <div className="h-4 w-2/3 rounded bg-gray-800/40 animate-pulse mb-4" />
+      <div className="space-y-2">
+        <div className="h-3 w-full rounded bg-gray-800/40 animate-pulse" />
+        <div className="h-3 w-5/6 rounded bg-gray-800/40 animate-pulse" />
+        <div className="h-3 w-4/6 rounded bg-gray-800/30 animate-pulse" />
+      </div>
+      <div className="grid grid-cols-3 gap-3 mt-5">
+        <div className="h-12 rounded-xl bg-gray-800/30 animate-pulse" />
+        <div className="h-12 rounded-xl bg-gray-800/30 animate-pulse" />
+        <div className="h-12 rounded-xl bg-gray-800/30 animate-pulse" />
+      </div>
+    </motion.div>
+  );
+}
+
+
 // ── Capsule card ───────────────────────────────────────────────────────────────
 
 function CapsuleCard({
   capsule,
   onDelete,
   onChat,
+  combineSelected = false,
+  combineDisabled = false,
+  onCombineToggle,
 }: {
   capsule: IdeaCapsule;
   onDelete: () => void;
   onChat: () => void;
+  /** True when this capsule is in the combine multi-selection. */
+  combineSelected?: boolean;
+  /** True when the user can't add this capsule (cap reached, or busy). */
+  combineDisabled?: boolean;
+  /** Toggle this capsule in/out of the combine selection. */
+  onCombineToggle?: () => void;
 }) {
   const router = useRouter();
   const [expanded, setExpanded] = useState(false);
@@ -1442,7 +1698,9 @@ function CapsuleCard({
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.97 }}
       className={`rounded-2xl border transition-all ${
-        isSaved
+        combineSelected
+          ? "border-fuchsia-500/60 bg-gradient-to-b from-fuchsia-950/30 to-gray-900/60 shadow-[0_0_0_1px_rgba(217,70,239,0.25)]"
+          : isSaved
           ? "border-emerald-700/25 bg-gradient-to-b from-emerald-950/20 to-gray-900/60"
           : "border-white/5 bg-gradient-to-b from-gray-900/80 to-gray-900/40"
       }`}
@@ -1450,6 +1708,29 @@ function CapsuleCard({
       {/* Header */}
       <div className="p-6">
         <div className="flex items-start justify-between gap-3 mb-4">
+          {/* Combine multi-select checkbox — only shown when the parent
+              page is in combine mode (onCombineToggle is provided). */}
+          {onCombineToggle && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onCombineToggle(); }}
+              disabled={combineDisabled}
+              title={
+                combineDisabled
+                  ? "Maximum 3 ideas can be combined"
+                  : combineSelected
+                  ? "Remove from combine selection"
+                  : "Select to combine with another idea"
+              }
+              className="flex-shrink-0 w-5 h-5 rounded-md border flex items-center justify-center transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              style={
+                combineSelected
+                  ? { background: "linear-gradient(135deg,#a21caf,#d946ef)", borderColor: "transparent" }
+                  : { background: "rgba(15,15,26,0.6)", borderColor: "rgba(255,255,255,0.12)" }
+              }
+            >
+              {combineSelected && <CheckIcon size={12} color="white" strokeWidth={3} />}
+            </button>
+          )}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-2 flex-wrap">
               {isSaved && (
@@ -1457,8 +1738,12 @@ function CapsuleCard({
                   ✓ Saved
                 </span>
               )}
-              {/* Mode tag — Manual / Auto / Query */}
-              {capsule.source_mode === "query" ? (
+              {/* Mode tag — Manual / Auto / Query / Combined */}
+              {capsule.source_mode === "combined" ? (
+                <span className="text-[10px] bg-fuchsia-900/40 text-fuchsia-300 border border-fuchsia-700/30 px-2 py-0.5 rounded-full font-semibold">
+                  🔗 Combined
+                </span>
+              ) : capsule.source_mode === "query" ? (
                 <span className="text-[10px] bg-violet-900/40 text-violet-300 border border-violet-700/30 px-2 py-0.5 rounded-full font-semibold">
                   🔍 Query
                 </span>
@@ -1477,6 +1762,12 @@ function CapsuleCard({
             {capsule.source_mode === "query" && capsule.source_query && (
               <p className="text-[11px] text-violet-400/70 italic mb-1 leading-relaxed">
                 &ldquo;{capsule.source_query}&rdquo;
+              </p>
+            )}
+            {/* For combined capsules, surface which two ideas were fused */}
+            {capsule.source_mode === "combined" && capsule.source_query && (
+              <p className="text-[11px] text-fuchsia-400/70 italic mb-1 leading-relaxed">
+                {capsule.source_query}
               </p>
             )}
             <p className="text-sm text-indigo-400/90 font-medium leading-relaxed mb-1">

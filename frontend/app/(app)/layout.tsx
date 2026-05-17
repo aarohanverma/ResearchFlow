@@ -9,18 +9,19 @@ import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
 import { useThemeStore } from "@/store/theme";
 import { logout } from "@/lib/api";
 import {
-  BookmarkIcon, FlaskConicalIcon, HomeIcon, LogOutIcon,
+  BookmarkIcon, FlaskConicalIcon, HomeIcon, LogOutIcon, MessageSquareIcon,
   NetworkIcon, SettingsIcon, ZapIcon, ChevronDownIcon, ChevronRightIcon,
   SunIcon, MoonIcon,
 } from "lucide-react";
 import { JobsNotification } from "@/components/jobs/JobsPanel";
 
 const NAV = [
-  { href: "/feed",      label: "Feed",     icon: HomeIcon,          desc: "Paper feed" },
-  { href: "/bookmarks", label: "Saved",    icon: BookmarkIcon,      desc: "Bookmarks" },
-  { href: "/graph",     label: "Graph",    icon: NetworkIcon,       desc: "Knowledge graph" },
-  { href: "/genie",     label: "Genie",    icon: FlaskConicalIcon,  desc: "Idea synthesizer" },
-  { href: "/settings",  label: "Settings", icon: SettingsIcon,      desc: "Preferences" },
+  { href: "/feed",      label: "Feed",      icon: HomeIcon,          desc: "Paper feed" },
+  { href: "/assistant", label: "Assistant", icon: MessageSquareIcon, desc: "Research workspace" },
+  { href: "/bookmarks", label: "Saved",     icon: BookmarkIcon,      desc: "Bookmarks" },
+  { href: "/graph",     label: "Graph",     icon: NetworkIcon,       desc: "Knowledge graph" },
+  { href: "/genie",     label: "Genie",     icon: FlaskConicalIcon,  desc: "Idea synthesizer" },
+  { href: "/settings",  label: "Settings",  icon: SettingsIcon,      desc: "Preferences" },
 ];
 
 // ─── Hierarchical namespace sidebar ──────────────────────────────────────────
@@ -130,7 +131,10 @@ function NamespaceSidebar() {
                       checked={allSelected}
                       onChange={() => {
                         if (allSelected) {
-                          useNamespaceStore.setState({ selectedTopics: [topicKeys[0]] });
+                          useNamespaceStore.setState(s => ({
+                          selectedTopics: [topicKeys[0]],
+                          topicsBySubject: { ...s.topicsBySubject, [subject.key]: [topicKeys[0]] },
+                        }));
                         } else {
                           selectAllTopics(subject.key);
                         }
@@ -139,7 +143,10 @@ function NamespaceSidebar() {
                     />
                     <button
                       onClick={() => allSelected
-                        ? useNamespaceStore.setState({ selectedTopics: [topicKeys[0]] })
+                        ? useNamespaceStore.setState(s => ({
+                          selectedTopics: [topicKeys[0]],
+                          topicsBySubject: { ...s.topicsBySubject, [subject.key]: [topicKeys[0]] },
+                        }))
                         : selectAllTopics(subject.key)
                       }
                       style={{ background: "none", border: "none", cursor: "pointer", fontSize: "9.5px", color: "var(--rf-text4)", fontWeight: 600 }}

@@ -68,6 +68,9 @@ class Paper(Base):
     # AI-generated one-liner (cached, generated lazily via Haiku)
     tldr: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # True for papers imported manually via the arXiv import endpoint
+    is_manually_imported: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
+
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -293,3 +296,27 @@ class FeedFeedback(Base):
     paper_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("papers.id", ondelete="CASCADE"), index=True)
     signal: Mapped[str] = mapped_column(String(30), nullable=False)  # like | dismiss | more_like_this
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaperNamespaceHide(Base):
+    """User-level hide for a manually-imported paper within a specific namespace.
+
+    A hidden paper is moved to the bottom of the feed and excluded from
+    search/discovery within that namespace. The hide is reversible.
+    """
+
+    __tablename__ = "paper_namespace_hides"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("papers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    namespace_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    hidden_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "paper_id", "namespace_key", name="uq_paper_hide"),
+    )

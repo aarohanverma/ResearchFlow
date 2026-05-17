@@ -3,7 +3,10 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
-import { CheckIcon, ChevronRightIcon } from "lucide-react";
+import type { User } from "@/types";
+import { useAuthStore } from "@/store/auth";
+import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
+import { CheckIcon, ChevronRightIcon, AlertCircleIcon, Loader2Icon } from "lucide-react";
 
 const STEPS = ["Subjects", "Topics", "Depth", "Notifications"];
 
@@ -60,8 +63,20 @@ const TOPICS: Record<string, TopicEntry[]> = {
   ],
 };
 
+// Map onboarding subject labels → NAMESPACE_TREE subject keys so the namespace
+// sidebar reflects exactly what the user selected during onboarding.
+const SUBJECT_LABEL_TO_KEY: Record<string, string> = {
+  "Computer Science": "cs",
+  "Physics": "physics",
+  "Mathematics": "math",
+  "Statistics": "stat",
+  "Quantitative Biology": "q-bio",
+  "Economics": "econ",
+};
+
 export default function OnboardingPage() {
   const router = useRouter();
+  const { setUser, user } = useAuthStore();
   const [step, setStep] = useState(0);
   const [selectedSubjects, setSelectedSubjects] = useState<string[]>([]);
   const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
@@ -72,11 +87,19 @@ export default function OnboardingPage() {
     notify_digest: true,
   });
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   function toggleSubject(s: string) {
-    setSelectedSubjects((prev) =>
-      prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]
-    );
+    setSelectedSubjects((prev) => {
+      const next = prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s];
+      // Drop any topic selections that belong to a now-deselected subject so
+      // the user doesn't ship a stale topic into the backend onboarding state.
+      if (!next.includes(s)) {
+        const stale = new Set((TOPICS[s] || []).map(t => t.key));
+        setSelectedNamespaces(prevNs => prevNs.filter(k => !stale.has(k)));
+      }
+      return next;
+    });
   }
 
   function toggleNamespace(key: string) {
@@ -87,6 +110,7 @@ export default function OnboardingPage() {
 
   async function finish() {
     setSubmitting(true);
+    setError(null);
     try {
       await api.post("/settings/onboarding", {
         subjects: selectedSubjects,
@@ -95,9 +119,43 @@ export default function OnboardingPage() {
         orientation,
         ...notifications,
       });
+      // Sync local stores so the sidebar reflects onboarding immediately
+      // instead of waiting for a hard refresh.
+      try {
+        const subjectKeys = selectedSubjects
+          .map(label => SUBJECT_LABEL_TO_KEY[label])
+          .filter(Boolean);
+        const primaryKey = subjectKeys[0] || "cs";
+        // Bucket selected topic keys by subject so per-subject memory persists.
+        const topicsBySubject: Record<string, string[]> = {};
+        for (const subKey of subjectKeys) {
+          const subjectTopicSet = new Set(
+            (NAMESPACE_TREE.find(s => s.key === subKey)?.topics || []).map(t => t.key)
+          );
+          const inSubject = selectedNamespaces.filter(k => subjectTopicSet.has(k));
+          if (inSubject.length) topicsBySubject[subKey] = inSubject;
+        }
+        useNamespaceStore.setState(s => ({
+          subscribedSubjects: subjectKeys.length ? subjectKeys : ["cs"],
+          activeSubject: primaryKey,
+          selectedTopics: topicsBySubject[primaryKey]
+            || (NAMESPACE_TREE.find(t => t.key === primaryKey)?.topics.slice(0, 2).map(t => t.key) ?? []),
+          topicsBySubject: { ...s.topicsBySubject, ...topicsBySubject },
+        }));
+      } catch {
+        // Non-fatal — sidebar will catch up on next page load.
+      }
+      // Refresh /me so onboarding_complete flips locally without forcing a reload.
+      try {
+        const refreshed = await api.get<User>("/auth/me");
+        setUser(refreshed);
+      } catch {
+        // Still navigate — the layout's auth guard will refetch on next nav.
+        if (user) setUser({ ...user, onboarding_complete: true } as User);
+      }
       router.push("/feed");
     } catch (err) {
-      console.error(err);
+      setError(err instanceof Error ? err.message : "Onboarding failed. Please try again.");
     } finally {
       setSubmitting(false);
     }
@@ -263,6 +321,13 @@ export default function OnboardingPage() {
             </div>
           )}
 
+          {error && (
+            <div className="mt-6 flex items-start gap-2 px-3 py-2 rounded-lg border border-red-800/50 bg-red-950/40 text-red-300 text-xs">
+              <AlertCircleIcon size={13} className="flex-shrink-0 mt-0.5" />
+              <span>{error}</span>
+            </div>
+          )}
+
           {/* Navigation */}
           <div className="flex gap-3 mt-8">
             {step > 0 && (
@@ -285,8 +350,9 @@ export default function OnboardingPage() {
               }
               className="flex-1 flex items-center justify-center gap-2 bg-brand hover:bg-indigo-600 disabled:opacity-40 text-white font-semibold py-2.5 rounded-xl transition-colors"
             >
+              {submitting && step === STEPS.length - 1 && <Loader2Icon size={14} className="animate-spin" />}
               {step === STEPS.length - 1 ? (submitting ? "Setting up…" : "Go to Feed") : "Continue"}
-              {step < STEPS.length - 1 && <ChevronRightIcon size={16} />}
+              {!submitting && step < STEPS.length - 1 && <ChevronRightIcon size={16} />}
             </button>
           </div>
         </div>

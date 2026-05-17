@@ -118,7 +118,6 @@ class AnthropicAdapter(LLMAdapter):
 
         kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens or 4096,
             "messages": user_messages,
         }
         if system:
@@ -126,9 +125,18 @@ class AnthropicAdapter(LLMAdapter):
         if temperature is not None:
             kwargs["temperature"] = temperature
 
+        # Build thinking before setting max_tokens so the budget is known.
+        # Anthropic requires max_tokens > thinking.budget_tokens; when the
+        # caller passes None (no cap) we still need a concrete integer.
         thinking = self._build_thinking(model, reasoning_effort)
         if thinking:
             kwargs["thinking"] = thinking
+            # Leave at least 4096 tokens beyond the thinking budget for the
+            # actual response text.
+            min_needed = thinking["budget_tokens"] + 4096
+            kwargs["max_tokens"] = max(max_tokens or 0, min_needed)
+        else:
+            kwargs["max_tokens"] = max_tokens or 8192
 
         start = time.monotonic()
         resp = await _call_with_retry(
@@ -171,11 +179,24 @@ class AnthropicAdapter(LLMAdapter):
         Returns:
             Parsed JSON response as a Python dict.
         """
-        result = await self.complete(
-            messages, model,
-            reasoning_effort=reasoning_effort,
-        )
-        return json.loads(result.text)
+        # Anthropic has no native JSON mode: we must prompt for it.  Inject a
+        # system preamble when the word "json" isn't already in the messages so
+        # the model knows to return raw JSON without prose or markdown fences.
+        has_json_word = any("json" in (m.get("content") or "").lower() for m in messages)
+        if not has_json_word:
+            messages = [
+                {"role": "system", "content": "Return only valid JSON. No markdown fences, no prose."},
+                *messages,
+            ]
+        result = await self.complete(messages, model, reasoning_effort=reasoning_effort)
+        text = result.text.strip()
+        # Strip markdown fences that some models emit even when asked not to.
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+        return json.loads(text)
 
     async def stream(
         self,
@@ -202,15 +223,25 @@ class AnthropicAdapter(LLMAdapter):
         system = next((m["content"] for m in messages if m["role"] == "system"), None)
         user_messages = [m for m in messages if m["role"] != "system"]
 
+        thinking = self._build_thinking(model, reasoning_effort)
+
+        # Mirror the complete() max_tokens logic: when thinking is enabled,
+        # Anthropic requires max_tokens > budget_tokens.  Using max_tokens or 8192
+        # would cause a validation error when budget_tokens (e.g. 16000) exceeds
+        # the default.
+        if thinking:
+            min_needed = thinking["budget_tokens"] + 4096
+            effective_max = max(max_tokens or 0, min_needed)
+        else:
+            effective_max = max_tokens or 8192
+
         kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens or 8192,
+            "max_tokens": effective_max,
             "messages": user_messages,
         }
         if system:
             kwargs["system"] = system
-
-        thinking = self._build_thinking(model, reasoning_effort)
         if thinking:
             kwargs["thinking"] = thinking
 

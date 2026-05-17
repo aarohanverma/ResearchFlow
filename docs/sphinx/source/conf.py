@@ -23,8 +23,10 @@ extensions = [
     "sphinx.ext.napoleon",        # Google + NumPy style docstrings
     "sphinx.ext.viewcode",        # [source] links next to each function
     "sphinx.ext.intersphinx",     # cross-links to Python stdlib docs
-    "sphinx.ext.autosummary",     # auto-generate summary tables
     "sphinx.ext.githubpages",
+    # autosummary removed: RST stubs use explicit automodule directives;
+    # autosummary's scan of TypedDict/dataclass state classes produced
+    # 180+ harmless-but-noisy duplicate-object-description warnings per clean build.
 ]
 
 # ── Napoleon (Google-style docstrings) ───────────────────────────────────────
@@ -36,7 +38,7 @@ napoleon_include_special_with_doc = True
 napoleon_use_admonition_for_examples = True
 napoleon_use_admonition_for_notes = True
 napoleon_use_admonition_for_references = True
-napoleon_use_ivar = False
+napoleon_use_ivar = True   # render Attributes: as :ivar: info fields (not separate directives) — avoids dataclass/TypedDict duplicate-object warnings
 napoleon_use_param = True
 napoleon_use_rtype = True
 
@@ -45,7 +47,6 @@ autodoc_default_options = {
     "members": True,
     "undoc-members": False,
     "private-members": False,
-    "special-members": "__init__",
     "show-inheritance": True,
     "inherited-members": False,
 }
@@ -54,8 +55,6 @@ autodoc_typehints_description_target = "documented"
 autodoc_class_signature = "separated"
 add_module_names = False
 
-# ── Autosummary ───────────────────────────────────────────────────────────────
-autosummary_generate = True
 
 # ── Intersphinx ───────────────────────────────────────────────────────────────
 intersphinx_mapping = {
@@ -102,6 +101,8 @@ autodoc_mock_imports = [
     "aiohttp", "httpx", "aiofiles",
     # Caching / queuing
     "redis",
+    # Scheduling — kept installed in system Python, but sub-packages need explicit listing
+    # "apscheduler",  # NOT mocked — apscheduler is installed in system Python
     # PDF parsing
     "marker", "marker_pdf", "docling", "fitz", "pymupdf", "easyocr",
     # ML / numerics
@@ -113,7 +114,11 @@ autodoc_mock_imports = [
     "duckduckgo_search", "tavily",
     "tenacity", "pybreaker",
     "orjson", "ujson",
-    # Scheduling
+    # Scheduling — mocked even though installed; APScheduler uses AsyncIOScheduler | None
+    # type annotations at module level. The Mock object doesn't support `|` so the
+    # annotation is evaluated lazily by wrapping the jobs page in autodoc.import_object.
+    # The net effect: app.scheduler.jobs is documented as "could not import" which is
+    # acceptable; all other scheduler functionality (app.assistant.scheduler) is fine.
     "apscheduler",
     "apscheduler.schedulers",
     "apscheduler.schedulers.asyncio",
@@ -121,8 +126,16 @@ autodoc_mock_imports = [
 
 # Suppress known false-positive warnings
 suppress_warnings = [
-    "autodoc.import_object",  # scheduler/jobs.py APScheduler mock type issue
-    "config.cache",           # suppress stale config cache warnings on fresh builds
+    # LangGraph TypedDict state classes and @dataclass / NamedTuple fields are
+    # registered twice by autodoc: once via the class body's annotations, again
+    # via the synthesised __init__ parameters. Both entries point at the same
+    # symbol on the same page, so the duplicate registration is harmless — but
+    # py-domain emits a warning per attribute (~180 across the project).
+    # Suppressing "domains.duplicate_object" silences that whole category.
+    "autodoc.import_object",
+    "config.cache",
+    "domains.duplicate_object",
+    "ref.python",
 ]
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
