@@ -364,6 +364,7 @@ class LLMPlanner:
         expertise: str = "practitioner",
         memory: dict | None = None,
         disabled_tools: set[str] | None = None,
+        research_brief: str | None = None,
     ) -> Plan:
         """Async planner — calls the LLM with adaptive compute based on query complexity."""
         # Pass namespace_key so only tools visible for this namespace are shown.
@@ -388,6 +389,7 @@ class LLMPlanner:
                 catalogue=catalogue,
                 memory=memory or {},
                 complexity=complexity,
+                research_brief=research_brief,
             )
             messages = [
                 {"role": "system", "content": _PLANNER_SYSTEM},
@@ -431,6 +433,7 @@ class LLMPlanner:
         catalogue: list[dict],
         memory: dict | None = None,
         complexity: str = "medium",
+        research_brief: str | None = None,
     ) -> str:
         recent = history[-14:] if history else []
         history_blob = "\n".join(
@@ -469,6 +472,7 @@ class LLMPlanner:
             separators=(",", ":"),
         )
         mem = memory or {}
+        short_mem = mem.get("short") or {}
         medium_mem = mem.get("medium") or {}
         long_mem = mem.get("long") or {}
 
@@ -477,17 +481,48 @@ class LLMPlanner:
                 return str(v.get("value", v))
             return str(v)
 
+        def _entry_type(v: object) -> str:
+            if isinstance(v, dict):
+                return str(v.get("type", "context"))
+            return "context"
+
+        # Conditional memory injection. Forced injection on every turn bloats
+        # the prompt and risks contaminating answers with stale data, so we
+        # only inject when at least ONE of these signals fires:
+        #   1. Any stored ``preference`` — universally useful for tone/depth.
+        #   2. Continuation cues in the user query ("the same", "as before",
+        #      "we discussed", "my", "again", "earlier", pronouns).
+        #   3. The conversation has 3+ prior turns (enough accumulated
+        #      context that the planner could actually need the memory).
+        def _has_preference(d: dict) -> bool:
+            return any(_entry_type(v) == "preference" for v in d.values())
+
+        has_pref = _has_preference(short_mem) or _has_preference(medium_mem) or _has_preference(long_mem)
+        q_low = (query or "").lower()
+        continuation_cues = (
+            "the same", "as before", "as we discussed", "you mentioned", "earlier",
+            "previously", "last time", "my preference", "my background", "again",
+            " it ", " that ", " those ", " these ", " they ",
+        )
+        has_cue = any(c in q_low for c in continuation_cues)
+        prior_turns = sum(1 for m in (history or []) if (m.get("role") == "assistant"))
+        inject_memory = bool(has_pref or has_cue or prior_turns >= 3)
+
         memory_blob = ""
-        if medium_mem or long_mem:
-            memory_blob = "\nResearch memory (use this to personalize the plan):\n"
-            if medium_mem:
-                memory_blob += "Session facts:\n" + "\n".join(
-                    f"  {k}: {_mem_val(v)}" for k, v in list(medium_mem.items())[:10]
-                ) + "\n"
-            if long_mem:
-                memory_blob += "Namespace insights:\n" + "\n".join(
-                    f"  {k}: {_mem_val(v)}" for k, v in list(long_mem.items())[:10]
-                ) + "\n"
+        if inject_memory and (short_mem or medium_mem or long_mem):
+            memory_blob = (
+                "\nResearch memory (advisory — let it shape the plan only when it "
+                "clearly applies; ignore if stale or off-topic):\n"
+            )
+            # Preferences always first regardless of tier.
+            for tier_label, tier_dict in (("chat", short_mem), ("tree", medium_mem), ("namespace", long_mem)):
+                prefs = [(k, v) for k, v in tier_dict.items() if _entry_type(v) == "preference"]
+                for k, v in prefs[:4]:
+                    memory_blob += f"  [pref/{tier_label}] {k}: {_mem_val(v)[:200]}\n"
+            for tier_label, tier_dict in (("chat", short_mem), ("tree", medium_mem), ("namespace", long_mem)):
+                others = [(k, v) for k, v in tier_dict.items() if _entry_type(v) != "preference"]
+                for k, v in others[:5]:
+                    memory_blob += f"  [{tier_label}] {k}: {_mem_val(v)[:200]}\n"
 
         # Namespace pack hint — tell the planner about domain-specific tools available
         from app.assistant.tools.namespace_packs import get_pack_description
@@ -513,6 +548,13 @@ class LLMPlanner:
                 "Synthesize everything into a coherent answer."
             ),
         }.get(complexity, "Medium complexity.")
+        brief_blob = ""
+        if research_brief:
+            brief_blob = (
+                "\nResearch brief (pre-planning intent — sharpen tool choice "
+                "around this, do not contradict it):\n"
+                + research_brief + "\n"
+            )
         return (
             f"User request: {query}\n"
             f"Query complexity: {complexity} — {depth_hint}\n"
@@ -520,6 +562,7 @@ class LLMPlanner:
             f"Topic scope: {', '.join(namespace_keys) or namespace_key}\n"
             f"User profile (soft bias): expertise={expertise}, orientation={orientation}\n"
             f"{pack_blob}"
+            f"{brief_blob}"
             f"{memory_blob}"
             f"\nConversation history (most recent last):\n{history_blob or '(no prior turns)'}\n"
             f"\nAvailable tools:\n{catalogue_blob}\n"

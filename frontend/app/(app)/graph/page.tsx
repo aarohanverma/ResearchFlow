@@ -1241,14 +1241,15 @@ export default function GraphPage() {
               style={{
                 padding: "3px 8px", borderRadius: 8, fontSize: "11px", fontWeight: 600,
                 border: topicFilter !== "all" ? "1px solid rgba(99,102,241,0.5)" : "1px solid rgba(55,65,81,0.5)",
-                background: topicFilter !== "all" ? "rgba(20,20,50,0.8)" : "rgba(17,24,39,0.6)",
-                color: topicFilter !== "all" ? "#818cf8" : "#6b7280",
+                background: topicFilter !== "all" ? "rgba(20,20,50,0.95)" : "rgba(17,24,39,0.95)",
+                color: topicFilter !== "all" ? "#c7d2fe" : "#e5e7eb",
                 cursor: "pointer", outline: "none",
+                colorScheme: "dark",
               }}
             >
-              <option value="all">All Topics</option>
+              <option value="all" style={{ background: "#0b0f1a", color: "#e5e7eb" }}>All Topics</option>
               {selectedTopics.map(ns => (
-                <option key={ns} value={ns}>{ns}</option>
+                <option key={ns} value={ns} style={{ background: "#0b0f1a", color: "#e5e7eb" }}>{ns}</option>
               ))}
             </select>
           </div>

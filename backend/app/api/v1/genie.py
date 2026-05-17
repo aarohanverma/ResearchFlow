@@ -16,7 +16,7 @@ from app.core.deps import CurrentUserID, DBSession
 from app.models.genie import ElementType, GenieElement, GenieSession, IdeaCapsule
 from app.models.paper import Paper, PaperChunk
 from app.repositories.paper import PaperRepository
-from app.schemas import GenieRequest, IdeaCapsuleResponse, SourcePaperInfo
+from app.schemas import GenieRequest, IdeaCapsuleResponse, IdeaCapsuleListItem, SourcePaperInfo
 from app.workflows.genie import run_genie, run_genie_background
 
 router = APIRouter(prefix="/genie", tags=["genie"])
@@ -1351,7 +1351,7 @@ async def query_discover(
     }
 
 
-@router.get("/capsules", response_model=list[IdeaCapsuleResponse])
+@router.get("/capsules", response_model=list[IdeaCapsuleListItem])
 async def list_capsules(
     user_id: CurrentUserID,
     db: DBSession,
@@ -1359,23 +1359,50 @@ async def list_capsules(
 ):
     """Return non-dismissed idea capsules for the current user, optionally filtered by namespace.
 
-    When ``namespace_keys`` is supplied, capsules whose seed papers are ALL from
-    outside those namespaces are hidden.  Capsules with no resolvable paper
-    namespace (concept/method seeds) are always shown so nothing is hidden incorrectly.
+    Uses the slim ``IdeaCapsuleListItem`` schema so the list payload stays
+    small even for users with dozens of capsules — heavy fields like
+    ``deep_dive_content``, ``mechanism``, ``experimental_design``,
+    ``diagrams`` and ``poc_code`` are only fetched on demand via
+    ``GET /capsules/{id}``.
+
+    Only loads the columns the list view actually shows, keeping the
+    DB-side payload small as well. When ``namespace_keys`` is supplied,
+    capsules whose seed papers are ALL from outside those namespaces are
+    hidden. Capsules with no resolvable paper namespace (concept/method
+    seeds) are always shown so nothing is hidden incorrectly.
     """
+    # Project only the columns the list view actually needs. This skips
+    # transferring the multi-kilobyte text fields (mechanism, deep_dive_content,
+    # etc.) from PostgreSQL into Python memory just to discard them in the
+    # serializer.
+    list_cols = (
+        IdeaCapsule.id,
+        IdeaCapsule.title,
+        IdeaCapsule.hypothesis,
+        IdeaCapsule.open_questions,
+        IdeaCapsule.novelty_score,
+        IdeaCapsule.feasibility_score,
+        IdeaCapsule.impact_score,
+        IdeaCapsule.status,
+        IdeaCapsule.is_scout_generated,
+        IdeaCapsule.source_mode,
+        IdeaCapsule.source_query,
+        IdeaCapsule.deep_dive_status,
+        IdeaCapsule.created_at,
+        IdeaCapsule.seed_element_ids,
+    )
     result = await db.execute(
-        select(IdeaCapsule)
+        select(*list_cols)
         .where(IdeaCapsule.user_id == user_id, IdeaCapsule.status != "dismissed")
         .order_by(IdeaCapsule.created_at.desc())
     )
-    capsules = list(result.scalars().all())
+    rows = result.all()
 
     if namespace_keys:
         allowed_ns = {k.strip() for k in namespace_keys.split(",") if k.strip()}
-        # Batch-resolve all seed element IDs → paper namespace_keys in two queries.
         all_seed_ids: list[uuid.UUID] = []
-        for cap in capsules:
-            for eid in (cap.seed_element_ids or []):
+        for row in rows:
+            for eid in (row.seed_element_ids or []):
                 try:
                     all_seed_ids.append(uuid.UUID(str(eid)))
                 except (ValueError, AttributeError):
@@ -1391,23 +1418,24 @@ async def list_capsules(
                     GenieElement.paper_id.isnot(None),
                 )
             )
-            for row in ns_rows.fetchall():
-                element_ns_map[str(row.id)] = row.namespace_key or ""
+            for r in ns_rows.fetchall():
+                element_ns_map[str(r.id)] = r.namespace_key or ""
 
-        filtered: list[IdeaCapsule] = []
-        for cap in capsules:
+        kept: list = []
+        for row in rows:
             seed_ns = {
                 element_ns_map[eid]
-                for eid in (cap.seed_element_ids or [])
+                for eid in (row.seed_element_ids or [])
                 if eid in element_ns_map and element_ns_map[eid]
             }
-            # Show if: namespace unknown (no paper seeds to check) OR
-            # at least one source paper is from a subscribed namespace.
             if not seed_ns or seed_ns & allowed_ns:
-                filtered.append(cap)
-        capsules = filtered
+                kept.append(row)
+        rows = kept
 
-    return [IdeaCapsuleResponse.model_validate(c) for c in capsules]
+    return [
+        IdeaCapsuleListItem.model_validate(row, from_attributes=True)
+        for row in rows
+    ]
 
 
 async def _resolve_source_papers(capsule: IdeaCapsule, db) -> list[SourcePaperInfo]:

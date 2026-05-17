@@ -148,7 +148,59 @@ async def search_papers(
     # Maximum effect: ±10% of the search_score — enough to nudge, never enough to dominate.
     results = await _apply_orientation_nudge(results, user_id, db)
 
+    # Cross-topic dedup: collapse rows that share an ``external_id`` into one,
+    # aggregating their namespace_keys so the client gets a single card with
+    # all relevant topic memberships (intersected with the user's scope, if any).
+    results = _dedup_results_by_external_id(results, scope=ns_list)
+
     return SearchResponse(results=results, total=len(results), query=q, mode=effective_mode)
+
+
+def _dedup_results_by_external_id(
+    rows: list[dict],
+    *,
+    scope: list[str] | None = None,
+) -> list[dict]:
+    """Collapse multi-namespace duplicates by ``external_id``.
+
+    arXiv cross-lists a single paper under several categories — the DB stores
+    a row per (external_id, namespace_key) pair. The user-facing surface
+    should show one item per logical paper with every topic tag the user
+    actually selected. This helper:
+
+    * keeps the highest-scoring row as the canonical representative;
+    * unions every duplicate's ``namespace_key`` into ``namespace_keys``;
+    * intersects with ``scope`` (the active topic selection) when provided so
+      tags outside the user's current view are hidden.
+    """
+    if not rows:
+        return rows
+    scope_set: set[str] | None = set(scope) if scope else None
+    bucket: dict[str, dict] = {}
+    membership: dict[str, set[str]] = {}
+    for r in rows:
+        ext = str(r.get("external_id") or "") or str(r.get("paper_id") or "")
+        ns = str(r.get("namespace_key") or "")
+        if not ext:
+            continue
+        prev = bucket.get(ext)
+        if prev is None or float(r.get("search_score") or 0.0) > float(prev.get("search_score") or 0.0):
+            bucket[ext] = r
+        membership.setdefault(ext, set()).add(ns) if ns else None
+    out: list[dict] = []
+    for ext, row in bucket.items():
+        seen = membership.get(ext, set())
+        if scope_set is not None:
+            visible = sorted(seen & scope_set) or [row.get("namespace_key") or ""]
+        else:
+            visible = sorted(seen)
+        # Pydantic accepts dict input; expose the aggregated field so the UI
+        # can render every relevant topic chip on a single card.
+        merged = dict(row)
+        merged["namespace_keys"] = [k for k in visible if k]
+        out.append(merged)
+    out.sort(key=lambda x: float(x.get("search_score") or 0.0), reverse=True)
+    return out
 
 
 async def _apply_orientation_nudge(

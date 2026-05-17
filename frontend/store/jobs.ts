@@ -96,6 +96,11 @@ export type AnyJob =
   | ({ kind: "arxiv_import" } & ArxivImportJob);
 
 const toastEvents = new Set<string>();
+// Tracks job keys that actually went through a "started" phase. Used to
+// suppress completion/failure toasts for jobs that were CACHED — those
+// arrive directly in a terminal status, indicating instant retrieval, not
+// real background work, so a notification would be redundant.
+const startedKeys = new Set<string>();
 
 function notifyJobEvent(key: string, title: string, status: string, summary?: string | null) {
   const event =
@@ -105,6 +110,18 @@ function notifyJobEvent(key: string, title: string, status: string, summary?: st
     status === "running" || status === "pending" || status === "queued" || status === "generating" ? "started" :
     "";
   if (!event) return;
+  if (event === "started") {
+    // Remember that this key did actual background work; never toast the
+    // "started" event itself — the user just clicked the button, so it's
+    // redundant.
+    startedKeys.add(key);
+    return;
+  }
+  // Terminal events: only toast when the job actually went through a started
+  // phase. Cached/stored content arrives directly in "completed" without a
+  // prior started event, so we silently skip it — instant retrieval doesn't
+  // need a notification.
+  if (!startedKeys.has(key)) return;
   const eventKey = `${key}:${event}`;
   if (toastEvents.has(eventKey)) return;
   toastEvents.add(eventKey);

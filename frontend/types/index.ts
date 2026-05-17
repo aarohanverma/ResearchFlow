@@ -4,6 +4,14 @@ export interface Paper {
   id: string;
   external_id: string;
   namespace_key: string;
+  /**
+   * All namespace keys this paper is registered under, intersected with the
+   * user's currently selected topics. Populated by the dedup pass in the feed/
+   * search pipelines so the card can show all the relevant topic tags rather
+   * than only the row's primary one. Falls back to ``[namespace_key]`` when the
+   * deduper hasn't been applied (single-namespace contexts).
+   */
+  namespace_keys?: string[];
   title: string;
   authors: string[];
   abstract: string;

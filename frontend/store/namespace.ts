@@ -169,6 +169,25 @@ export function subjectTopics(subjectKey: string): string[] {
   return NAMESPACE_TREE.find(s => s.key === subjectKey)?.topics.map(t => t.key) ?? [];
 }
 
+/**
+ * Lookup table for arXiv-tag → full human-readable label. Used by feed cards,
+ * RA result chips, Genie idea badges, etc. so the UI consistently shows
+ * "Artificial Intelligence" rather than the bare ``cs.AI`` code.
+ */
+export const TOPIC_LABELS: Record<string, string> = (() => {
+  const m: Record<string, string> = {};
+  for (const sub of NAMESPACE_TREE) {
+    for (const t of sub.topics) m[t.key] = t.label;
+  }
+  return m;
+})();
+
+/** Return the human-readable label for a topic key, falling back to the key itself. */
+export function topicLabelFor(key: string | null | undefined): string {
+  if (!key) return "";
+  return TOPIC_LABELS[key] || key;
+}
+
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 interface NamespaceStore {

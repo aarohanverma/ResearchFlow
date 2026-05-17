@@ -155,10 +155,12 @@ export default function GeniePage() {
   const [chatCapsule, setChatCapsule] = useState<IdeaCapsule | null>(null);
 
   // ── Idea-combine multi-select state ────────────────────────────────────────
-  // Users tick 2–3 ideas, click Combine, the backend's combine workflow runs
-  // in the background, and we poll the resulting GenieSession until it lands
-  // on a terminal state. Then we navigate to the new hybrid capsule's page.
+  // Combine is a deliberate action — the page stays clean by default and only
+  // shows per-card checkboxes when the user enters ``combineMode`` via the
+  // header toggle. This avoids the persistent-checkbox clutter that made the
+  // ideas list feel like a checkout flow.
   const COMBINE_MAX = 3;
+  const [combineMode, setCombineMode] = useState(false);
   const [combineSelected, setCombineSelected] = useState<string[]>([]);
   const [combineBusy, setCombineBusy] = useState(false);
   const [combineErr, setCombineErr] = useState<string | null>(null);
@@ -170,6 +172,11 @@ export default function GeniePage() {
     });
   }, []);
   const clearCombineSelection = useCallback(() => {
+    setCombineSelected([]);
+    setCombineErr(null);
+  }, []);
+  const exitCombineMode = useCallback(() => {
+    setCombineMode(false);
     setCombineSelected([]);
     setCombineErr(null);
   }, []);
@@ -1179,13 +1186,32 @@ export default function GeniePage() {
             </button>
           ))}
 
+          {/* Combine-mode toggle — surfaces only on the Ideas tab and only
+              when there are at least 2 ideas to combine. Off by default so
+              the page stays clean; clicking flips card UI into select mode. */}
+          {activeTab === "discoveries" && capsules.length >= 2 && (
+            <button
+              onClick={() => combineMode ? exitCombineMode() : setCombineMode(true)}
+              className={
+                "ml-auto self-center flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all " +
+                (combineMode
+                  ? "bg-fuchsia-950/60 border border-fuchsia-700/50 text-fuchsia-200"
+                  : "bg-gray-900/60 border border-gray-800 text-gray-300 hover:text-fuchsia-200 hover:border-fuchsia-700/40")
+              }
+              title={combineMode ? "Exit combine mode" : "Select 2–3 ideas to fuse"}
+            >
+              <GitMergeIcon size={12} />
+              {combineMode ? "Cancel combine" : "Combine ideas"}
+            </button>
+          )}
+
           <AnimatePresence>
             {bgJobId && bgStatus && bgStatus !== "done" && (
               <motion.div
                 initial={{ opacity: 0, x: 10 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0 }}
-                className="ml-auto self-center flex items-center gap-2 bg-indigo-950/60 border border-indigo-700/40 rounded-full px-3 py-1"
+                className={`${activeTab === "discoveries" && capsules.length >= 2 ? "" : "ml-auto"} self-center flex items-center gap-2 bg-indigo-950/60 border border-indigo-700/40 rounded-full px-3 py-1`}
               >
                 <Loader2Icon size={11} className="animate-spin text-indigo-400" />
                 <span className="text-[11px] text-indigo-300 font-medium">
@@ -1315,8 +1341,10 @@ export default function GeniePage() {
               </div>
             ) : (
               <div className="space-y-5">
-                {/* Combine bar — sticky helper at the top of the ideas list so
-                    the user can see selection state + action without scrolling. */}
+                {/* Combine bar — only shown while the user is actively in
+                    combine mode. Off-mode keeps the ideas list clean of
+                    persistent selection UI. */}
+                {combineMode && (
                 <div
                   className="sticky top-0 z-10 flex items-center gap-2 px-4 py-2.5 rounded-xl border bg-gray-950/85 backdrop-blur-sm"
                   style={{ borderColor: combineSelected.length >= 2 ? "rgba(217,70,239,0.35)" : "rgba(255,255,255,0.06)" }}
@@ -1360,7 +1388,8 @@ export default function GeniePage() {
                     {combineBusy ? "Combining…" : "Combine selected"}
                   </button>
                 </div>
-                {combineErr && (
+                )}
+                {combineMode && combineErr && (
                   <div className="px-3 py-2 rounded-lg bg-red-950/40 border border-red-800/40 text-red-300 text-[11px]">
                     {combineErr}
                   </div>
@@ -1372,12 +1401,12 @@ export default function GeniePage() {
                     capsule={capsule}
                     onDelete={() => deleteCapsule(capsule.id)}
                     onChat={() => setChatCapsule(capsule)}
-                    combineSelected={combineSelected.includes(capsule.id)}
+                    combineSelected={combineMode && combineSelected.includes(capsule.id)}
                     combineDisabled={
                       combineBusy ||
                       (!combineSelected.includes(capsule.id) && combineSelected.length >= COMBINE_MAX)
                     }
-                    onCombineToggle={() => toggleCombineSelect(capsule.id)}
+                    onCombineToggle={combineMode ? () => toggleCombineSelect(capsule.id) : undefined}
                   />
                 ))}
               </div>
@@ -1664,13 +1693,32 @@ function CapsuleCard({
   const [expanded, setExpanded] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The list endpoint returns slim capsules (no rationale/mechanism/etc.) to
+  // keep the Ideas tab snappy. When the user expands, lazily fetch the full
+  // record so the long-form sections actually render. ``detail`` falls back
+  // to the slim ``capsule`` so already-loaded fields stay visible while the
+  // fetch is in flight.
+  const [detail, setDetail] = useState<IdeaCapsule | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const viewCapsule: IdeaCapsule = (detail ?? capsule) as IdeaCapsule;
+  useEffect(() => {
+    if (!expanded) return;
+    if (detail !== null) return;
+    if (detailLoading) return;
+    setDetailLoading(true);
+    api.get<IdeaCapsule>(`/genie/capsules/${capsule.id}`)
+      .then(setDetail)
+      .catch(() => setDetail(capsule))
+      .finally(() => setDetailLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded]);
 
-  const isSaved = capsule.status === "saved";
-  const noveltyPct = Math.round(capsule.novelty_score * 100);
-  const feasPct = Math.round(capsule.feasibility_score * 100);
-  const impactPct = Math.round(capsule.impact_score * 100);
+  const isSaved = viewCapsule.status === "saved";
+  const noveltyPct = Math.round(viewCapsule.novelty_score * 100);
+  const feasPct = Math.round(viewCapsule.feasibility_score * 100);
+  const impactPct = Math.round(viewCapsule.impact_score * 100);
 
-  const openQuestions = (capsule.open_questions || "")
+  const openQuestions = (viewCapsule.open_questions || "")
     .split("\n")
     .map((q: string) => q.replace(/^[•\-\*]\s*/, "").trim())
     .filter(Boolean);
@@ -1828,43 +1876,82 @@ function CapsuleCard({
             exit={{ height: 0, opacity: 0 }}
             className="overflow-hidden border-t border-white/5"
           >
-            <div className="p-6 space-y-5">
-              {capsule.rationale && (
-                <RichSection icon={BrainIcon} label="Research Rationale" color="text-indigo-400" bg="bg-indigo-950/15" border="border-indigo-800/20">
-                  <MarkdownRenderer content={capsule.rationale} />
-                </RichSection>
+            <div className="p-5 space-y-3">
+              {detailLoading && !detail && (
+                <div className="flex items-center gap-2 text-xs text-gray-500">
+                  <Loader2Icon size={12} className="animate-spin" />
+                  Loading idea summary…
+                </div>
               )}
-              {capsule.mechanism && (
-                <RichSection icon={BrainIcon} label="Mechanism & Theory" color="text-violet-400" bg="bg-violet-950/15" border="border-violet-800/20">
-                  <MarkdownRenderer content={capsule.mechanism} />
-                </RichSection>
+              {/* Concise previews — one line per facet, not the full sections.
+                  The full sections live on the dedicated idea page; this card
+                  view is just a quick "does this idea interest me?" peek. */}
+              {viewCapsule.rationale && (
+                <CapsulePreview
+                  icon={BrainIcon}
+                  label="Why pursue this"
+                  color="text-indigo-400"
+                  text={firstSentenceOf(viewCapsule.rationale)}
+                />
               )}
-              {capsule.experimental_design && (
-                <RichSection icon={BeakerIcon} label="Experimental Design" color="text-teal-400" bg="bg-teal-950/15" border="border-teal-800/20">
-                  <MarkdownRenderer content={capsule.experimental_design} />
-                </RichSection>
+              {viewCapsule.predicted_outcome && (
+                <CapsulePreview
+                  icon={LightbulbIcon}
+                  label="Predicted outcome"
+                  color="text-emerald-400"
+                  text={firstSentenceOf(viewCapsule.predicted_outcome)}
+                />
               )}
-              {capsule.predicted_outcome && (
-                <RichSection icon={LightbulbIcon} label="Expected Outcomes" color="text-emerald-400" bg="bg-emerald-950/15" border="border-emerald-800/20">
-                  <MarkdownRenderer content={capsule.predicted_outcome} />
-                </RichSection>
+              {viewCapsule.experimental_design && (
+                <CapsulePreview
+                  icon={BeakerIcon}
+                  label="How to test"
+                  color="text-teal-400"
+                  text={firstSentenceOf(viewCapsule.experimental_design)}
+                />
               )}
-              {capsule.risks_and_limitations && (
-                <RichSection icon={AlertTriangleIcon} label="Risks & Limitations" color="text-amber-400" bg="bg-amber-950/15" border="border-amber-800/20">
-                  <MarkdownRenderer content={capsule.risks_and_limitations} />
-                </RichSection>
+              {viewCapsule.risks_and_limitations && (
+                <CapsulePreview
+                  icon={AlertTriangleIcon}
+                  label="Key risk"
+                  color="text-amber-400"
+                  text={firstSentenceOf(viewCapsule.risks_and_limitations)}
+                />
               )}
               {openQuestions.length > 0 && (
-                <RichSection icon={SparklesIcon} label="Open Questions" color="text-sky-400" bg="bg-sky-950/15" border="border-sky-800/20">
-                  <ul className="space-y-2">
-                    {openQuestions.map((q: string, i: number) => (
-                      <li key={i} className="flex items-start gap-2.5 text-sm text-gray-300 leading-relaxed">
-                        <span className="text-sky-500 mt-0.5 flex-shrink-0 font-bold text-xs">Q{i + 1}</span>
-                        {q}
-                      </li>
-                    ))}
-                  </ul>
-                </RichSection>
+                <CapsulePreview
+                  icon={SparklesIcon}
+                  label="Open question"
+                  color="text-sky-400"
+                  text={openQuestions[0]}
+                />
+              )}
+              {/* Inline CTA — single small footer line, no card chrome. */}
+              <div className="pt-1 flex items-center justify-between text-[11px] text-gray-600">
+                <span>
+                  {[
+                    viewCapsule.source_papers && viewCapsule.source_papers.length > 0 ? `${viewCapsule.source_papers.length} source paper${viewCapsule.source_papers.length === 1 ? "" : "s"}` : null,
+                    viewCapsule.diagrams && viewCapsule.diagrams.length > 0 ? `${viewCapsule.diagrams.length} diagram${viewCapsule.diagrams.length === 1 ? "" : "s"}` : null,
+                    viewCapsule.poc_code ? "PoC code" : null,
+                  ].filter(Boolean).join(" · ") || ""}
+                </span>
+                <button
+                  onClick={() => router.push(`/genie/idea/${viewCapsule.id}`)}
+                  className="text-indigo-400 hover:text-indigo-300 font-medium"
+                >
+                  Open full idea →
+                </button>
+              </div>
+              {/* Empty-section safety net — only when nothing exists. */}
+              {!detailLoading
+                && !viewCapsule.rationale
+                && !viewCapsule.predicted_outcome
+                && !viewCapsule.experimental_design
+                && !viewCapsule.risks_and_limitations
+                && openQuestions.length === 0 && (
+                <p className="text-xs text-gray-500 italic">
+                  No summary fields yet — open the full idea page to generate a Deep Dive.
+                </p>
               )}
             </div>
           </motion.div>
@@ -1900,6 +1987,50 @@ function RichSection({
       </div>
     </div>
   );
+}
+
+/** Compact one-line preview row for an idea facet. */
+function CapsulePreview({
+  icon: Icon,
+  label,
+  color,
+  text,
+}: {
+  icon: React.ElementType;
+  label: string;
+  color: string;
+  text: string;
+}) {
+  if (!text) return null;
+  return (
+    <div className="flex items-start gap-3">
+      <Icon size={13} className={`${color} mt-0.5 flex-shrink-0`} />
+      <div className="min-w-0 flex-1">
+        <p className={`text-[10px] font-bold uppercase tracking-wider ${color}`}>{label}</p>
+        <p className="text-xs text-gray-300 leading-relaxed mt-0.5 line-clamp-2">{text}</p>
+      </div>
+    </div>
+  );
+}
+
+/** Extract the first sentence (or first ~28 words) of a markdown blob —
+ * used for one-line previews on capsule cards. Strips simple markdown
+ * markers so the preview reads naturally.
+ */
+function firstSentenceOf(blob: string): string {
+  if (!blob) return "";
+  // Strip markdown emphasis, code fences, and headers cheaply.
+  const cleaned = blob
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/[`*_>#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "";
+  const m = cleaned.match(/^(.+?[.!?])(\s|$)/);
+  if (m && m[1].length >= 24) return m[1];
+  const words = cleaned.split(" ");
+  if (words.length <= 28) return cleaned;
+  return words.slice(0, 28).join(" ") + "…";
 }
 
 // ── Capsule chat overlay ───────────────────────────────────────────────────────

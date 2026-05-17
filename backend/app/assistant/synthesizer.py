@@ -108,6 +108,12 @@ _FORMAT_GUIDANCE = (
 )
 
 
+def _self_check_answer(answer: str, *, papers: list[dict], arxiv_results: list[dict]) -> list[str]:
+    """Deterministic self-check, delegating to ``reflection`` for the impl."""
+    from app.assistant.reflection import deterministic_self_check
+    return deterministic_self_check(answer, papers=papers, arxiv_results=arxiv_results)
+
+
 async def synthesize_answer(
     *,
     query: str,
@@ -121,11 +127,37 @@ async def synthesize_answer(
     complexity: str = "medium",
     actions: list[str],
     extra_results: dict | None = None,
+    memory: dict | None = None,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Return a grounded research-workspace answer or a deterministic fallback."""
     context = _build_paper_context(papers, arxiv_results)
     extra_context = _build_extra_context(extra_results or {})
+    # Conditional memory injection — only when memory is likely to matter.
+    # Forcing the memory hint into every turn risked drifting answers when
+    # the stored entries were stale or off-topic; the synthesizer now only
+    # sees memory when (a) the planner explicitly recalled it this turn, or
+    # (b) at least one preference is stored (preferences shape voice/depth
+    # and are universally relevant).
+    memory_block = ""
+    if memory:
+        mem_d = memory if isinstance(memory, dict) else {}
+        results_dict = extra_results or {}
+        explicit_recall = "memory_recall" in results_dict
+        def _has_pref(d: dict) -> bool:
+            for v in (d or {}).values():
+                if isinstance(v, dict) and v.get("type") == "preference":
+                    return True
+            return False
+        any_pref = (
+            _has_pref(mem_d.get("short") or {})
+            or _has_pref(mem_d.get("medium") or {})
+            or _has_pref(mem_d.get("long") or {})
+        )
+        if explicit_recall or any_pref:
+            memory_block = _build_memory_block(mem_d)
+    if memory_block:
+        extra_context = (memory_block + "\n\n" + extra_context).strip() if extra_context else memory_block
     fallback = _fallback_answer(query, papers, imported_count, graph_result, genie_session_id)
 
     grounded = bool(papers)
@@ -172,12 +204,114 @@ async def synthesize_answer(
                 ):
                     chunks.append(chunk)
                     await on_delta(chunk)
+                # Streaming path can't safely re-stream — return what we have.
                 return "".join(chunks).strip() or fallback
             res = await llm.complete(
                 messages, llm.reasoning_model, max_tokens=None,
                 temperature=None, reasoning_effort=r_effort,
             )
-        return res.text.strip() or fallback
+        answer = (res.text or "").strip() or fallback
+
+        # Self-reflection / red-team / convergence pipeline.
+        #
+        # Layer 1: deterministic checks (no LLM) — citation indices,
+        # truncation. Always run.
+        # Layer 2: LLM-as-judge critique — scores groundedness, completeness,
+        # memory_faithfulness, clarity. Runs on substantive turns only.
+        # Layer 3: red-team adversarial review — flags bias / weak evidence /
+        # overclaims. Runs on complex grounded answers.
+        # All three feed into the same repair preamble below.
+        # Streaming is skipped because we can't safely re-stream a corrected
+        # answer without the UI seeing the original and the repaired version.
+        from app.assistant.reflection import (
+            critique_to_issue_list,
+            has_converged,
+            llm_critique,
+            red_team_review,
+            redteam_to_issue_list,
+        )
+
+        evidence_for_judge = (context + "\n\n" + extra_context)
+        issues = _self_check_answer(answer, papers=papers, arxiv_results=arxiv_results)
+        if not issues and (grounded or complexity == "complex"):
+            try:
+                critique = await llm_critique(
+                    query=query,
+                    answer=answer,
+                    evidence_excerpt=evidence_for_judge,
+                    memory_excerpt=memory_block,
+                )
+                if critique and critique.get("should_repair"):
+                    issues = critique_to_issue_list(critique)
+                    log.info(
+                        "llm critique flagged repair (g=%.2f c=%.2f mf=%.2f)",
+                        float(critique.get("groundedness") or 0),
+                        float(critique.get("completeness") or 0),
+                        float(critique.get("memory_faithfulness") or 0),
+                    )
+            except Exception as exc:
+                log.debug("llm critique skipped: %s", exc)
+
+        # Red-team only when grounded AND complex — burning a third
+        # cheap-model pass on simple lookups is not worth the latency.
+        if grounded and complexity == "complex":
+            try:
+                redteam = await red_team_review(
+                    query=query,
+                    answer=answer,
+                    evidence_excerpt=evidence_for_judge,
+                )
+                if redteam and (redteam.get("severity") in {"medium", "high"}):
+                    rt_issues = redteam_to_issue_list(redteam)
+                    if rt_issues:
+                        issues = (issues or []) + rt_issues
+                        log.info("red-team flagged %d issue(s) at severity=%s",
+                                 len(rt_issues), redteam.get("severity"))
+            except Exception as exc:
+                log.debug("red-team review skipped: %s", exc)
+
+        if issues:
+            log.info("synth self-check found issues — repairing: %s", "; ".join(issues))
+            try:
+                repair_msg = (
+                    "Your previous draft had these issues:\n  - "
+                    + "\n  - ".join(issues)
+                    + "\n\nProduce a corrected answer. Use ONLY citation indices that "
+                    "actually exist in the evidence block. Complete every sentence. "
+                    "Do not add new claims you can't ground in the evidence."
+                )
+                repair_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                    {"role": "user", "content": repair_msg},
+                ]
+                if pure_reasoning:
+                    res2 = await llm.complete(
+                        repair_messages, llm.quality_model,
+                        max_tokens=None, temperature=0.2,
+                    )
+                else:
+                    res2 = await llm.complete(
+                        repair_messages, llm.reasoning_model,
+                        max_tokens=None, temperature=None,
+                        reasoning_effort=effort_map.get(complexity, "medium"),
+                    )
+                repaired = (res2.text or "").strip()
+                if repaired and not _self_check_answer(
+                    repaired, papers=papers, arxiv_results=arxiv_results
+                ):
+                    # Convergence guard: if the repaired draft is barely
+                    # different from the original (Jaccard ~ identical),
+                    # the repair pass didn't add value — keep the original.
+                    # When it IS materially different, accept the repair.
+                    if has_converged(before=answer, after=repaired):
+                        log.debug("repair converged with no material change — keeping original")
+                    else:
+                        answer = repaired
+            except Exception as exc:
+                log.warning("synthesizer repair pass failed: %s", exc)
+
+        return answer
     except Exception as exc:
         log.warning("assistant synthesis fallback (reasoning model): %s — retrying with quality model", exc)
         try:
@@ -202,6 +336,50 @@ async def synthesize_answer(
         except Exception as exc2:
             log.warning("assistant synthesis fallback: %s", exc2)
             return fallback
+
+
+def _build_memory_block(memory: dict) -> str:
+    """Build a short, low-trust hint string from chat/tree/namespace memory.
+
+    Memory can drift, get stale, or contain mis-typed planner writes — it
+    should *nudge* the answer (tone, preferences, prior findings worth
+    referencing) but never override grounded evidence. The block is
+    deliberately short, capped, and clearly framed as advisory so the LLM
+    treats it accordingly.
+    """
+    if not memory:
+        return ""
+    short = (memory.get("short") or {}) if isinstance(memory, dict) else {}
+    medium = (memory.get("medium") or {}) if isinstance(memory, dict) else {}
+    long_mem = (memory.get("long") or {}) if isinstance(memory, dict) else {}
+
+    def _entry(v: object) -> tuple[str, str]:
+        if isinstance(v, dict):
+            return str(v.get("type") or "context"), str(v.get("value") or "")
+        return "context", str(v or "")
+
+    lines: list[str] = []
+    # Surface preferences first across all tiers — they steer voice/depth and
+    # are the most reliable / least likely to be stale.
+    for source_label, mem_dict in (("chat", short), ("tree", medium), ("namespace", long_mem)):
+        prefs = [(k, _entry(v)) for k, v in mem_dict.items() if _entry(v)[0] == "preference"]
+        for k, (t, val) in prefs[:3]:
+            lines.append(f"  [{source_label}/{t}] {k}: {val[:240]}")
+    # Then a couple of findings/context entries as background.
+    for source_label, mem_dict in (("chat", short), ("tree", medium), ("namespace", long_mem)):
+        others = [(k, _entry(v)) for k, v in mem_dict.items() if _entry(v)[0] != "preference"]
+        for k, (t, val) in others[:2]:
+            lines.append(f"  [{source_label}/{t}] {k}: {val[:240]}")
+
+    if not lines:
+        return ""
+    # Cap raw size as a final safety net.
+    body = "\n".join(lines)[:1600]
+    return (
+        "<memory_hint trust=\"soft — may be stale, advisory only\">\n"
+        + body
+        + "\n</memory_hint>"
+    )
 
 
 def _build_extra_context(results: dict) -> str:
@@ -676,6 +854,7 @@ def _build_prompt(
         f"{_LIFECYCLE_GUIDANCE}\n\n"
         f"{_FORMAT_GUIDANCE}\n\n"
         "RESPONSE RULES:\n"
+        "• The <memory_hint> block is ADVISORY ONLY — treat it as a soft, possibly-stale hint about the user's preferences and prior context. Let it lightly shape voice/depth/framing; NEVER let it override or contradict grounded evidence; never cite or quote it.\n"
         "• ResearchFlow is arXiv-first. Prefer arXiv-sourced papers as primary evidence. Treat Wikipedia, web search, CrossRef, and Semantic Scholar as supplementary — use them to enrich or contextualise, not to replace arXiv evidence.\n"
         "• Synthesize ALL available evidence (papers, computations, attachments, web) into one coherent answer.\n"
         "• Cite inline: [1] for indexed papers, [A1] for arXiv candidates, [WA] for Wolfram Alpha, [W] for web sources.\n"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import katex from "katex";
@@ -28,7 +28,16 @@ import {
   GitMergeIcon,
 } from "lucide-react";
 import type { IdeaCapsule, DiagramSpec, GeneratedArtifact, GenerationType } from "@/types";
-import MarkdownRenderer, { sanitizeMermaidSpec, sanitizeMermaidAggressive } from "@/components/ui/MarkdownRenderer";
+import MarkdownRenderer, {
+  sanitizeMermaidSpec,
+  sanitizeMermaidAggressive,
+  DecorationsProvider,
+  decorateString,
+  useDecorations,
+} from "@/components/ui/MarkdownRenderer";
+import { useHighlightSearch, HighlightSearchToolbar } from "@/components/ui/HighlightSearch";
+import { PaperPanel } from "@/components/paper/PaperPanel";
+import type { Paper } from "@/types";
 import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useAuthStore } from "@/store/auth";
 import { api } from "@/lib/api";
@@ -220,6 +229,12 @@ function MermaidDiagram({ spec }: { spec: string }) {
 // ── Inline text renderer ──────────────────────────────────────────────────────
 
 function InlineText({ text }: { text: string }) {
+  // Decorations come from React context so the page-wide highlight + search
+  // hook reaches every span — bold, italic, code, headings, list items,
+  // callouts, table cells — without prop-drilling.
+  const dec = useDecorations();
+  const wrap = (s: string, k: string): React.ReactNode =>
+    dec ? <>{decorateString(s, dec, k)}</> : s;
   const normalised = text.replace(/\\\(([\s\S]+?)\\\)/g, (_m, e) => `$${e}$`);
   // Allow up to 600 chars and across newlines so long equations render correctly
   const parts = normalised.split(
@@ -229,17 +244,17 @@ function InlineText({ text }: { text: string }) {
     <>
       {parts.map((part, i) => {
         if (/^\*\*[^*]+\*\*$/.test(part))
-          return <strong key={i} className="font-semibold text-white">{part.slice(2, -2)}</strong>;
+          return <strong key={i} className="font-semibold text-white">{wrap(part.slice(2, -2), `b${i}`)}</strong>;
         if (/^\*[^*\n]+\*$/.test(part) && !part.startsWith("**"))
-          return <em key={i} className="italic text-gray-200">{part.slice(1, -1)}</em>;
+          return <em key={i} className="italic text-gray-200">{wrap(part.slice(1, -1), `i${i}`)}</em>;
         if (/^`[^`]+`$/.test(part))
-          return <code key={i} className="px-1.5 py-0.5 rounded-md bg-gray-800 border border-gray-700/60 text-[12px] font-mono text-violet-300 mx-0.5">{part.slice(1, -1)}</code>;
+          return <code key={i} className="px-1.5 py-0.5 rounded-md bg-gray-800 border border-gray-700/60 text-[12px] font-mono text-violet-300 mx-0.5">{wrap(part.slice(1, -1), `c${i}`)}</code>;
         if (/^\$[^$]+\$$/.test(part)) {
           try {
             return <span key={i} dangerouslySetInnerHTML={{ __html: katex.renderToString(part.slice(1, -1), { throwOnError: false }) }} className="mx-0.5" />;
           } catch { return <span key={i}>{part}</span>; }
         }
-        return part;
+        return <React.Fragment key={i}>{wrap(part, `t${i}`)}</React.Fragment>;
       })}
     </>
   );
@@ -1130,6 +1145,29 @@ export default function IdeaDeepDivePage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const deepDiveRef = useRef<HTMLDivElement>(null);
 
+  // Highlight + keyword search scoped to this idea. Mirrors the RA chat
+  // experience: select text to highlight, Ctrl+F to search, persists in
+  // localStorage so the marks survive reload and idea-switch.
+  const highlightSearch = useHighlightSearch(`idea:${id ?? "_"}`, !!id);
+
+  // Source-paper preview panel — clicking a source paper opens the same
+  // PaperPanel overlay used on the Feed so the user can read the abstract,
+  // bookmark, or jump into Study Mode without leaving this page.
+  const [previewPaper, setPreviewPaper] = useState<Paper | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  async function openSourcePaper(paperId: string) {
+    if (!paperId || previewLoading) return;
+    setPreviewLoading(true);
+    try {
+      const paper = await api.get<Paper>(`/papers/${paperId}`);
+      setPreviewPaper(paper);
+    } catch (e) {
+      console.error("openSourcePaper failed:", e);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
   // Deep dive state
   const [ddStatus, setDdStatus] = useState<DeepDiveStatus>("idle");
   const [ddText, setDdText] = useState("");
@@ -1138,12 +1176,16 @@ export default function IdeaDeepDivePage() {
   // Combine-with-another-capsule modal state.
   // ``combineOpen`` controls visibility; ``combineList`` is lazy-loaded the
   // first time the picker opens so the page doesn't pay for it upfront.
+  // ``combineSelected`` is the set of OTHER capsule ids the user picked —
+  // the current idea (``id``) is always counted in, so we cap this at 2
+  // (current + 2 others = max 3 capsules fused).
   const [combineOpen, setCombineOpen] = useState(false);
   const [combineList, setCombineList] = useState<IdeaCapsule[] | null>(null);
   const [combineLoading, setCombineLoading] = useState(false);
   const [combineSubmitting, setCombineSubmitting] = useState(false);
   const [combineError, setCombineError] = useState<string | null>(null);
   const [combineQuery, setCombineQuery] = useState("");
+  const [combineSelected, setCombineSelected] = useState<string[]>([]);
 
   // Reset deep-dive state whenever the idea id changes so stale content from a
   // previous idea never flashes while the new one is loading.
@@ -1173,7 +1215,7 @@ export default function IdeaDeepDivePage() {
           setDdStatus("done");
         } else if (data.deep_dive_status === "generating") {
           setDdStatus("streaming");
-          setDdStatusMsg("Background generation in progress…");
+          setDdStatusMsg("Deep Dive is generating in the background…");
         }
       })
       .catch(() => setStatus("error"));
@@ -1222,6 +1264,7 @@ export default function IdeaDeepDivePage() {
   async function openCombine() {
     setCombineOpen(true);
     setCombineError(null);
+    setCombineSelected([]);
     if (combineList !== null) return;
     setCombineLoading(true);
     try {
@@ -1235,6 +1278,15 @@ export default function IdeaDeepDivePage() {
     }
   }
 
+  function toggleCombineSelected(otherId: string) {
+    setCombineError(null);
+    setCombineSelected((prev) => {
+      if (prev.includes(otherId)) return prev.filter((x) => x !== otherId);
+      if (prev.length >= 2) return prev; // cap at 2 others (max 3 fused)
+      return [...prev, otherId];
+    });
+  }
+
   // Submit the combine request. The backend queues the combine and returns a
   // GenieSession id immediately (202). We then poll the session row every
   // ~2.5 s until it lands on a terminal status:
@@ -1244,14 +1296,14 @@ export default function IdeaDeepDivePage() {
   // Polling caps at 6 minutes (~145 attempts) — combine can be heavy when both
   // parents' deep dives need to be generated first, but anything longer than
   // 6 minutes is almost certainly a stuck task and we want the user to know.
-  async function submitCombine(otherId: string) {
-    if (!id || !otherId || combineSubmitting) return;
+  async function submitCombine(otherIds: string[]) {
+    if (!id || otherIds.length === 0 || combineSubmitting) return;
     setCombineSubmitting(true);
     setCombineError(null);
     try {
       const queued = await api.post<{ session_id: string; status: string; parent_ids: string[] }>(
         "/genie/capsules/combine",
-        { capsule_a_id: id, capsule_b_id: otherId },
+        { capsule_ids: [id, ...otherIds] },
       );
       if (!queued?.session_id) {
         setCombineError("Combine could not be queued.");
@@ -1319,7 +1371,7 @@ export default function IdeaDeepDivePage() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       setDdStatus("streaming");
       setDdText("");
-      setDdStatusMsg("Background generation started — results will appear when ready.");
+      setDdStatusMsg("Generating in the background — you can keep working; the Deep Dive will appear here when it's ready.");
       addDeepDiveJob({
         capsule_id: id,
         capsule_title: capsule?.title ?? "",
@@ -1330,7 +1382,7 @@ export default function IdeaDeepDivePage() {
       });
       setTimeout(() => deepDiveRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
     } catch (e) {
-      setDdStatusMsg(`Failed to start background generation: ${String(e).slice(0, 80)}`);
+      setDdStatusMsg(`Couldn't start the Deep Dive — ${String(e).slice(0, 80)}`);
     }
   }
 
@@ -1383,7 +1435,7 @@ export default function IdeaDeepDivePage() {
           {/* Header */}
           <div className="sticky top-0.5 z-10 mb-8">
             <div className="flex items-center gap-3 bg-gray-900/80 backdrop-blur-md border border-gray-800/60 rounded-2xl px-4 py-2.5 shadow-lg shadow-black/20">
-              <button onClick={() => router.push("/genie")} className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-200 transition-colors font-medium">
+              <button onClick={() => router.push("/genie?tab=discoveries")} className="flex items-center gap-2 text-xs text-gray-500 hover:text-gray-200 transition-colors font-medium">
                 <ArrowLeftIcon size={13} />Ideas
               </button>
               <div className="flex-1" />
@@ -1409,6 +1461,14 @@ export default function IdeaDeepDivePage() {
                       <><SparklesIcon size={12} />Generate Deep Dive</>
                     )}
                   </button>
+                  <button
+                    onClick={openCombine}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"
+                    title="Fuse this idea with another to produce a new hybrid hypothesis"
+                  >
+                    <GitMergeIcon size={12} />
+                    Combine with…
+                  </button>
                   {ddStatus === "done" && (
                     <button
                       onClick={() => setShowChat(v => !v)}
@@ -1418,14 +1478,6 @@ export default function IdeaDeepDivePage() {
                       {showChat ? "Close Chat" : "Ask Questions"}
                     </button>
                   )}
-                  <button
-                    onClick={openCombine}
-                    className="flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"
-                    title="Fuse this idea with another to produce a new hybrid hypothesis"
-                  >
-                    <GitMergeIcon size={12} />
-                    Combine with…
-                  </button>
                 </>
               )}
             </div>
@@ -1453,8 +1505,17 @@ export default function IdeaDeepDivePage() {
 
           {/* Content */}
           {status === "done" && capsule && (
-            <>
+            <DecorationsProvider value={highlightSearch.decorations}>
+            <div ref={highlightSearch.scrollRef}>
               <CapsuleHero capsule={capsule} />
+
+              {/* Highlight + keyword-search toolbar — anchored just under the
+                  hero so it scrolls into view above the actual content. The
+                  toolbar's empty state collapses to a small two-button strip
+                  so it never crowds the dense idea-detail layout. */}
+              <div className="mb-3">
+                <HighlightSearchToolbar toolbar={highlightSearch.toolbar} />
+              </div>
 
               {/* Media generation bar for capsule */}
               <IdeaGenerationBar capsuleId={capsule.id} ddStatus={ddStatus} />
@@ -1515,12 +1576,12 @@ export default function IdeaDeepDivePage() {
                     </div>
                     <div className="rounded-2xl border border-sky-800/30 bg-sky-950/10 divide-y divide-sky-900/30 overflow-hidden">
                       {capsule.source_papers.map((p, idx) => (
-                        <a
+                        <button
                           key={p.id}
-                          href={p.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex items-start gap-4 px-5 py-4 hover:bg-sky-900/20 transition-colors group"
+                          onClick={() => openSourcePaper(p.id)}
+                          disabled={previewLoading}
+                          className="w-full text-left flex items-start gap-4 px-5 py-4 hover:bg-sky-900/20 transition-colors group disabled:opacity-60"
+                          title="Open paper preview"
                         >
                           <span className="mt-0.5 flex-shrink-0 w-6 h-6 rounded-full bg-sky-900/60 border border-sky-700/50 flex items-center justify-center text-xs font-bold text-sky-400">
                             {idx + 1}
@@ -1534,8 +1595,12 @@ export default function IdeaDeepDivePage() {
                               {p.year ? ` · ${p.year}` : ""}
                             </p>
                           </div>
-                          <LinkIcon size={14} className="flex-shrink-0 mt-1 text-sky-600 group-hover:text-sky-400 transition-colors" />
-                        </a>
+                          {previewLoading ? (
+                            <Loader2Icon size={14} className="flex-shrink-0 mt-1 text-sky-600 animate-spin" />
+                          ) : (
+                            <LinkIcon size={14} className="flex-shrink-0 mt-1 text-sky-600 group-hover:text-sky-400 transition-colors" />
+                          )}
+                        </button>
                       ))}
                     </div>
                   </motion.div>
@@ -1650,13 +1715,26 @@ export default function IdeaDeepDivePage() {
                 )}
               </div>
               <div className="h-16" />
-            </>
+            </div>
+            </DecorationsProvider>
           )}
         </div>
       </div>
 
       <AnimatePresence>
         {showChat && id && <IdeaChatPanel capsuleId={id} onClose={() => setShowChat(false)} />}
+      </AnimatePresence>
+
+      {/* Source-paper preview overlay — same PaperPanel used on the Feed,
+          so behaviour stays consistent across the app. */}
+      <AnimatePresence>
+        {previewPaper && (
+          <PaperPanel
+            key={previewPaper.id}
+            paper={previewPaper}
+            onClose={() => setPreviewPaper(null)}
+          />
+        )}
       </AnimatePresence>
 
       <AnimatePresence>
@@ -1734,44 +1812,80 @@ export default function IdeaDeepDivePage() {
                       .filter(c => c.id !== id && (
                         !combineQuery.trim() || (c.title || "").toLowerCase().includes(combineQuery.toLowerCase().trim())
                       ))
-                      .map((c) => (
-                        <li key={c.id}>
-                          <button
-                            onClick={() => submitCombine(c.id)}
-                            disabled={combineSubmitting}
-                            className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-gray-900 transition-colors flex items-start gap-3 disabled:opacity-50 disabled:cursor-wait"
-                          >
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium text-gray-200 truncate">{c.title || "Untitled"}</p>
-                              <p className="text-xs text-gray-500 line-clamp-2 mt-0.5">{c.hypothesis || ""}</p>
-                              <div className="flex items-center gap-2 mt-1.5 text-[10px] text-gray-600">
-                                <span className="px-1.5 py-0.5 rounded bg-gray-900 border border-gray-800">
-                                  {c.source_mode || "manual"}
-                                </span>
-                                <span>novelty {(c.novelty_score ?? 0).toFixed(2)}</span>
-                                <span>·</span>
-                                <span>feasibility {(c.feasibility_score ?? 0).toFixed(2)}</span>
+                      .map((c) => {
+                        const checked = combineSelected.includes(c.id);
+                        const disabled = combineSubmitting || (!checked && combineSelected.length >= 2);
+                        return (
+                          <li key={c.id}>
+                            <button
+                              type="button"
+                              onClick={() => toggleCombineSelected(c.id)}
+                              disabled={disabled}
+                              aria-pressed={checked}
+                              className={
+                                "w-full text-left px-3 py-2.5 rounded-lg transition-colors flex items-start gap-3 " +
+                                (checked
+                                  ? "bg-violet-950/40 border border-violet-700/50"
+                                  : "border border-transparent hover:bg-gray-900") +
+                                (disabled ? " opacity-40 cursor-not-allowed" : "")
+                              }
+                            >
+                              <span
+                                aria-hidden
+                                className={
+                                  "mt-0.5 w-4 h-4 rounded border flex items-center justify-center text-[10px] flex-shrink-0 " +
+                                  (checked
+                                    ? "bg-violet-500 border-violet-400 text-white"
+                                    : "border-gray-700 bg-gray-950")
+                                }
+                              >
+                                {checked ? "✓" : ""}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-medium text-gray-200 truncate">{c.title || "Untitled"}</p>
+                                <p className="text-xs text-gray-500 line-clamp-2 mt-0.5">{c.hypothesis || ""}</p>
+                                <div className="flex items-center gap-2 mt-1.5 text-[10px] text-gray-600">
+                                  <span className="px-1.5 py-0.5 rounded bg-gray-900 border border-gray-800">
+                                    {c.source_mode || "manual"}
+                                  </span>
+                                  <span>novelty {(c.novelty_score ?? 0).toFixed(2)}</span>
+                                  <span>·</span>
+                                  <span>feasibility {(c.feasibility_score ?? 0).toFixed(2)}</span>
+                                </div>
                               </div>
-                            </div>
-                            <SparklesIcon size={12} className="text-violet-400/60 mt-1 flex-shrink-0" />
-                          </button>
-                        </li>
-                      ))}
+                              <SparklesIcon size={12} className="text-violet-400/60 mt-1 flex-shrink-0" />
+                            </button>
+                          </li>
+                        );
+                      })}
                   </ul>
                 )}
               </div>
 
-              <div className="px-6 py-3 border-t border-gray-800/60 flex items-center justify-between">
+              <div className="px-6 py-3 border-t border-gray-800/60 flex items-center justify-between gap-3">
                 <p className="text-[11px] text-gray-600">
-                  {combineSubmitting ? "Running feasibility check + fusion synthesis…" : "Click an idea to combine."}
+                  {combineSubmitting
+                    ? "Running feasibility check + fusion synthesis…"
+                    : combineSelected.length === 0
+                      ? "Select 1 or 2 ideas (max 3 total fused)."
+                      : `${combineSelected.length + 1} idea(s) selected (incl. this one).`}
                 </p>
-                <button
-                  onClick={() => !combineSubmitting && setCombineOpen(false)}
-                  disabled={combineSubmitting}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-400 hover:text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  Cancel
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => !combineSubmitting && setCombineOpen(false)}
+                    disabled={combineSubmitting}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-400 hover:text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => submitCombine(combineSelected)}
+                    disabled={combineSubmitting || combineSelected.length === 0}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {combineSubmitting ? "Combining…" : "Combine selected"}
+                  </button>
+                </div>
               </div>
             </motion.div>
           </motion.div>

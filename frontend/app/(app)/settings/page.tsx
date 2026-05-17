@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { api } from "@/lib/api";
 import { useAuthStore } from "@/store/auth";
@@ -26,7 +27,17 @@ const TABS = [
 type Tab = typeof TABS[number]["key"];
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState<Tab>("profile");
+  const searchParams = useSearchParams();
+  const initialTab: Tab = (() => {
+    const raw = (searchParams.get("tab") || "").toLowerCase();
+    return (TABS.some(t => t.key === raw) ? (raw as Tab) : "profile");
+  })();
+  const [activeTab, setActiveTab] = useState<Tab>(initialTab);
+  // Keep tab in sync with URL when user navigates back/forward.
+  useEffect(() => {
+    const raw = (searchParams.get("tab") || "").toLowerCase();
+    if (TABS.some(t => t.key === raw)) setActiveTab(raw as Tab);
+  }, [searchParams]);
 
   return (
     <div className="h-full overflow-y-auto px-8 py-8 max-w-4xl mx-auto w-full">
@@ -839,7 +850,30 @@ function UsagePanel() {
   };
 
   const totals = data?.totals;
-  const maxDayTotal = Math.max(1, ...(data?.by_day || []).map(d => d.total_tokens));
+  // Zero-fill the selected range so the chart adapts to the FROM/TO inputs
+  // and shows every day in the window — including ones with no LLM activity.
+  // Without this, days with zero usage were silently skipped, making the
+  // chart look like it didn't respond to range changes.
+  const filledByDay = useMemo(() => {
+    if (!data?.range?.from || !data?.range?.to) return data?.by_day || [];
+    const start = new Date(data.range.from + "T00:00:00Z");
+    const end = new Date(data.range.to + "T00:00:00Z");
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end < start) return data.by_day || [];
+    const map: Record<string, UsageDayRow> = {};
+    for (const d of data.by_day || []) map[d.date] = d;
+    const out: UsageDayRow[] = [];
+    const cur = new Date(start);
+    // Hard cap at 400 days so a pathological range doesn't blow the page.
+    let safety = 400;
+    while (cur <= end && safety > 0) {
+      const iso = cur.toISOString().slice(0, 10);
+      out.push(map[iso] ?? { date: iso, input_tokens: 0, output_tokens: 0, total_tokens: 0, cost_usd: 0 });
+      cur.setUTCDate(cur.getUTCDate() + 1);
+      safety -= 1;
+    }
+    return out;
+  }, [data]);
+  const maxDayTotal = Math.max(1, ...filledByDay.map(d => d.total_tokens));
 
   return (
     <div className="space-y-5">
@@ -891,16 +925,16 @@ function UsagePanel() {
             <StatCard label="LLM calls"     value={fmtNum(totals.calls)}         tone="amber" />
           </div>
 
-          {/* Per-day mini bar chart (only meaningful for multi-day ranges) */}
-          {(data?.by_day.length || 0) > 1 && (
+          {/* Per-day mini bar chart — uses the zero-filled range so every
+              day in the window shows up, even ones with no LLM activity. */}
+          {filledByDay.length > 1 && (
             <div className="bg-gray-900/40 border border-gray-800/60 rounded-xl p-4 mb-5">
               <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">Daily total</p>
-              {/* Fixed-height plot area so percentage-height bars render against
-                  a concrete reference. The label sits below the plot row, not
-                  inside it (an items-end column made percentages collapse). */}
               <div className="flex items-end gap-1.5 h-24">
-                {data!.by_day.map(d => {
-                  const h = Math.max(2, (d.total_tokens / maxDayTotal) * 100);
+                {filledByDay.map(d => {
+                  const h = d.total_tokens === 0
+                    ? 0
+                    : Math.max(2, (d.total_tokens / maxDayTotal) * 100);
                   return (
                     <div
                       key={d.date}
@@ -908,18 +942,18 @@ function UsagePanel() {
                       title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
                     >
                       <div
-                        className="w-full bg-indigo-600/50 hover:bg-indigo-500/80 rounded-t transition-colors"
-                        style={{ height: `${h}%`, minHeight: 2 }}
+                        className={`w-full ${d.total_tokens === 0 ? "bg-gray-800/30" : "bg-indigo-600/50 hover:bg-indigo-500/80"} rounded-t transition-colors`}
+                        style={{ height: `${h}%`, minHeight: d.total_tokens === 0 ? 0 : 2 }}
                       />
                     </div>
                   );
                 })}
               </div>
               <div className="flex gap-1.5 mt-1.5">
-                {data!.by_day.map(d => (
+                {filledByDay.map(d => (
                   <span
                     key={d.date}
-                    className="flex-1 text-center text-[8px] text-gray-600 font-mono"
+                    className={`flex-1 text-center text-[8px] font-mono ${d.total_tokens === 0 ? "text-gray-700" : "text-gray-600"}`}
                     title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
                   >
                     {d.date.slice(5)}

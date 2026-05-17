@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { createContext, Fragment, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { CopyIcon, CheckIcon } from "lucide-react";
 
@@ -30,12 +30,62 @@ export interface DecorationHighlight {
 export interface MarkdownDecorations {
   /** Highlights to render inside this content. */
   highlights?: DecorationHighlight[];
-  /** Lowercase trimmed search query — matched case-insensitively. */
+  /** Trimmed search query. Case sensitivity controlled by ``searchCaseSensitive``. */
   searchQuery?: string;
+  /** When true, matches must match case exactly. Defaults to false (case-insensitive). */
+  searchCaseSensitive?: boolean;
+  /**
+   * When true, search matches must be WHOLE-WORD only — "race" matches
+   * "race" but not "traces". When false (default), substring matches are
+   * allowed so "race" also highlights inside "traces".
+   */
+  searchWholeWord?: boolean;
   /** Optional stable key prefix so the parent can correlate ``data-rf-search-key`` values across messages. */
   searchKeyPrefix?: string;
+  /**
+   * When true, clicking a highlight mark removes it. False (default) keeps
+   * the marks visually present but inert — so existing highlights don't
+   * accidentally disappear when the user is just reading or selecting text
+   * for copying. Toggle this on alongside the highlighter button.
+   */
+  highlightClickToRemove?: boolean;
   /** Called when the user clicks a highlight mark to remove it. */
   onRemoveHighlight?: (id: string) => void;
+}
+
+// ── Decorations context ──────────────────────────────────────────────────────
+//
+// Pages with their own custom renderContent / InlineText (study mode, genie
+// idea dive) cannot easily plumb a ``decorations`` prop through every recursive
+// call site. Instead they wrap their content tree in ``DecorationsProvider``
+// and call ``useDecorations()`` inside their local InlineText. The context
+// pattern keeps decoration rendering universal without forcing those pages to
+// switch to the shared MarkdownRenderer entirely.
+
+const DecorationsContext = createContext<MarkdownDecorations | undefined>(undefined);
+
+export function DecorationsProvider({
+  value,
+  children,
+}: {
+  value: MarkdownDecorations | undefined;
+  children: ReactNode;
+}) {
+  return <DecorationsContext.Provider value={value}>{children}</DecorationsContext.Provider>;
+}
+
+/** Read the active decoration object (highlights + search query). */
+export function useDecorations(): MarkdownDecorations | undefined {
+  return useContext(DecorationsContext);
+}
+
+/**
+ * Public re-export of the decoration emitter so foreign InlineText
+ * implementations (study, idea dive) can apply the exact same React
+ * ``<mark>`` rendering without duplicating the match-finding logic.
+ */
+export function decorateString(s: string, dec: MarkdownDecorations | undefined, keyPrefix: string): ReactNode[] {
+  return _decorateString(s, dec, keyPrefix);
 }
 
 interface DecorationMatch {
@@ -69,19 +119,31 @@ function _findMatches(text: string, dec?: MarkdownDecorations): DecorationMatch[
     }
   }
 
-  // Search query — case-insensitive.
-  const q = (dec.searchQuery || "").trim().toLowerCase();
-  if (q) {
-    const lower = text.toLowerCase();
+  // Search query — case sensitivity + whole-word are controlled by the caller.
+  const rawQ = (dec.searchQuery || "").trim();
+  if (rawQ) {
+    const caseSensitive = !!dec.searchCaseSensitive;
+    const wholeWord = !!dec.searchWholeWord;
+    const q = caseSensitive ? rawQ : rawQ.toLowerCase();
+    const haystack = caseSensitive ? text : text.toLowerCase();
+    const isBoundary = (ch: string | undefined): boolean => {
+      if (!ch) return true;
+      // Word character set tuned to natural language: letters, digits,
+      // underscore. Everything else (spaces, punctuation, symbols) counts
+      // as a boundary — so "race." or "(race)" still match in whole-word
+      // mode but "traces" does not.
+      return !/[A-Za-z0-9_]/.test(ch);
+    };
     let cursor = 0;
     while (true) {
-      const pos = lower.indexOf(q, cursor);
+      const pos = haystack.indexOf(q, cursor);
       if (pos === -1) break;
-      matches.push({
-        start: pos,
-        end: pos + q.length,
-        kind: "search",
-      });
+      const end = pos + q.length;
+      const okBoundary = !wholeWord
+        || (isBoundary(text[pos - 1]) && isBoundary(text[end]));
+      if (okBoundary) {
+        matches.push({ start: pos, end, kind: "search" });
+      }
       cursor = pos + Math.max(1, q.length);
     }
   }
@@ -117,25 +179,25 @@ function _decorateString(
     const seg = s.slice(m.start, m.end);
     if (m.kind === "highlight") {
       const id = m.id || "";
+      const clickToRemove = !!dec?.highlightClickToRemove && !!dec?.onRemoveHighlight;
       out.push(
         <mark
           key={`${keyPrefix}-h-${i}-${id}`}
           data-rf-highlight="1"
           data-rf-highlight-id={id}
-          onClick={(e) => {
-            if (!dec?.onRemoveHighlight) return;
+          onClick={clickToRemove ? (e) => {
             e.preventDefault();
             e.stopPropagation();
-            dec.onRemoveHighlight(id);
-          }}
+            dec?.onRemoveHighlight?.(id);
+          } : undefined}
           style={{
             background: m.color || "#fef08a",
             color: "#1f2937",
             borderRadius: 2,
             padding: "0 1px",
-            cursor: "pointer",
+            cursor: clickToRemove ? "pointer" : "inherit",
           }}
-          title="Click to remove highlight"
+          title={clickToRemove ? "Click to remove highlight" : undefined}
         >
           {seg}
         </mark>
@@ -456,17 +518,24 @@ export function InlineText({
   const parts = normalised.split(
     /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\$[^$\n]{1,80}\$|\[A?\d+\])/g
   );
+  // Helper to wrap any inner string in highlight/search decoration so
+  // bold/italic/code/heading text is searchable & highlightable the same
+  // way regular paragraph text is. Without this, selecting "bold word"
+  // inside **bold word** silently dropped the highlight — that was the
+  // "doesn't work on all text" bug.
+  const dec = (s: string, k: string): ReactNode =>
+    decorations ? <>{_decorateString(s, decorations, k)}</> : s;
   return (
     <>
       {parts.map((part, i) => {
         if (/^\*\*[^*]+\*\*$/.test(part))
-          return <strong key={i} className="font-semibold text-white">{part.slice(2, -2)}</strong>;
+          return <strong key={i} className="font-semibold text-white">{dec(part.slice(2, -2), `b${i}`)}</strong>;
         if (/^\*[^*\n]+\*$/.test(part) && !part.startsWith("**"))
-          return <em key={i} className="italic text-gray-300">{part.slice(1, -1)}</em>;
+          return <em key={i} className="italic text-gray-300">{dec(part.slice(1, -1), `i${i}`)}</em>;
         if (/^`[^`]+`$/.test(part))
           return (
             <code key={i} className="px-1.5 py-0.5 rounded-md bg-gray-800 border border-gray-700/60 text-[12px] font-mono text-indigo-300 mx-0.5">
-              {part.slice(1, -1)}
+              {dec(part.slice(1, -1), `c${i}`)}
             </code>
           );
         if (/^\$[^$]+\$$/.test(part)) {
@@ -841,8 +910,10 @@ export default function MarkdownRenderer({
 }) {
   const nodes = renderMarkdown(content, onCitationClick, decorations);
   return (
-    <div className={`space-y-3 min-w-0 ${className}`}>
-      {nodes}
-    </div>
+    <DecorationsProvider value={decorations}>
+      <div className={`space-y-3 min-w-0 ${className}`}>
+        {nodes}
+      </div>
+    </DecorationsProvider>
   );
 }

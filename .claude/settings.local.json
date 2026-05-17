@@ -228,7 +228,12 @@
       "Bash(grep -nc \"^[a-z_]*$\" /home/av/Projects/ResearchFlow/backend/app/assistant/planner_llm.py)",
       "Bash(awk '/^media_generate ⚠/{print NR; exit}' /home/av/Projects/ResearchFlow/backend/app/assistant/planner_llm.py)",
       "Bash(sed -i '50,259d' /home/av/Projects/ResearchFlow/backend/app/assistant/planner_llm.py)",
-      "Bash(sed -n '45,55p' /home/av/Projects/ResearchFlow/backend/app/assistant/planner_llm.py)"
+      "Bash(sed -n '45,55p' /home/av/Projects/ResearchFlow/backend/app/assistant/planner_llm.py)",
+      "Bash(grep -n \"def list_capsules\\\\|@router\\\\.get\\(\\\\\"/capsules\\\\\"\\\\|GET.*capsules\\\\b\\\\|capsules/$\" /home/av/Projects/ResearchFlow/backend/app/api/v1/genie.py)",
+      "Bash(.venv/bin/python -m pytest -x -q)",
+      "Bash(grep -n \"max_tokens=\\\\|\\\\[:[0-9]\\\\{3,\\\\}\\\\]\\\\|content\\\\[:[0-9]\" /home/av/Projects/ResearchFlow/backend/app/workflows/genie.py /home/av/Projects/ResearchFlow/backend/app/workflows/genie_combine.py /home/av/Projects/ResearchFlow/backend/app/workflows/study.py)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(grep -n \"AnimatePresence>$\\\\|combineOpen &&\\\\|showChat && id\" /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/genie/idea/\\\\[id\\\\]/page.tsx)"
     ]
   }
 }

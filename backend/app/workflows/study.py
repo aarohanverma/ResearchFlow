@@ -798,19 +798,18 @@ async def _assemble_content(state: StudyState) -> StudyState:
         """
         from app.workflows._generation_prompts import looks_truncated_text
 
-        # Generous headroom — floor of 4000, then ×3 of requested size.
-        # Truncation is never acceptable; sections should always finish naturally.
-        budget = max(4000, tokens * 3)
-
+        # No ``max_tokens`` cap — sections should always finish naturally.
+        # The prompt itself sets the expected length; capping at the API
+        # level was the leading cause of mid-sentence truncation.
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": f"<paper>\n{content[:ctx_limit]}\n</paper>\n\n{instruction}"},
         ]
-        res = await llm.complete(messages, model, max_tokens=budget)
+        res = await llm.complete(messages, model)
         text = res.text.strip()
 
-        # If the section ends mid-sentence, ask for a clean continuation.
-        # We try once — never persist truncated output.
+        # If the section ends mid-sentence (the model itself ran out of
+        # steam), ask for a clean continuation once.
         if text and looks_truncated_text(text, min_chars=300):
             try:
                 cont = await llm.complete(
@@ -824,7 +823,6 @@ async def _assemble_content(state: StudyState) -> StudyState:
                         )},
                     ],
                     model,
-                    max_tokens=max(800, budget // 2),
                 )
                 tail = cont.text.strip()
                 if tail:
@@ -1287,7 +1285,6 @@ async def _assemble_content(state: StudyState) -> StudyState:
                 {"role": "user", "content": f"<paper>\n{structure.get('core_method', abstract)}\n</paper>"},
             ],
             model,
-            max_tokens=6000,
         )
         import re as _re
         code_text = code_res.text.strip()

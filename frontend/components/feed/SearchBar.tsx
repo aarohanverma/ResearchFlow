@@ -10,10 +10,13 @@ import { api } from "@/lib/api";
 
 export interface SearchResult {
   paper_id: string;
+  external_id?: string;
   title: string;
   abstract: string;
   authors: string[];
   namespace_key: string;
+  /** All topic memberships visible to the user (deduper output). Optional. */
+  namespace_keys?: string[];
   source_url: string;
   pdf_url: string | null;
   novelty_score: number;

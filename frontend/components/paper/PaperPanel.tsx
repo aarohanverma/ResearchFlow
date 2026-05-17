@@ -22,6 +22,7 @@ import { cleanAbstract } from "@/lib/utils";
 import { useJobsStore, type StudyJob } from "@/store/jobs";
 import { useBookmarksStore } from "@/store/bookmarks";
 import { BookmarkFolderPicker } from "@/components/bookmarks/BookmarkFolderPicker";
+import { topicLabelFor } from "@/store/namespace";
 
 interface Props {
   paper: Paper;
@@ -132,9 +133,24 @@ export function PaperPanel({ paper, onClose }: Props) {
             </button>
           ) : (
             <>
-              <span className="text-[10px] font-mono font-semibold text-gray-500 bg-gray-800 px-2 py-0.5 rounded-md border border-gray-700/40">
-                {paper.namespace_key}
-              </span>
+              {((paper.namespace_keys && paper.namespace_keys.length > 0) ? paper.namespace_keys : [paper.namespace_key]).map((nsKey) => (
+                <span
+                  key={nsKey}
+                  title={nsKey}
+                  className="text-[10px] font-semibold text-gray-500 bg-gray-800 px-2 py-0.5 rounded-md border border-gray-700/40"
+                >
+                  {topicLabelFor(nsKey)}
+                </span>
+              ))}
+              {paper.is_manually_imported && (
+                <span
+                  title="Manually imported"
+                  className="text-[10px] font-semibold px-2 py-0.5 rounded-md border inline-flex items-center gap-1"
+                  style={{ background: "rgba(99,102,241,0.10)", color: "#a5b4fc", borderColor: "rgba(99,102,241,0.30)" }}
+                >
+                  Imported
+                </span>
+              )}
             </>
           )}
         </div>
@@ -235,10 +251,10 @@ export function PaperPanel({ paper, onClose }: Props) {
           </p>
         </Section>
 
-        {/* Implications */}
+        {/* Why this matters — downstream impact, not a TL;DR rehash */}
         {paper.implications && (
           <div className="bg-indigo-950/20 border border-indigo-900/30 rounded-xl p-4">
-            <p className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mb-1.5">Implications</p>
+            <p className="text-[10px] font-semibold text-indigo-400 uppercase tracking-wider mb-1.5">Why this matters</p>
             <p className="text-sm text-gray-300 leading-relaxed">{paper.implications}</p>
           </div>
         )}

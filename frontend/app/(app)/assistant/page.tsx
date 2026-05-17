@@ -335,11 +335,15 @@ export default function AssistantPage() {
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // In-chat keyword search
+  // In-chat keyword search — state is scoped to the active session below
+  // (see effect that resets on activeId change) so an open search in session A
+  // doesn't auto-open in session B when the user switches chats.
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
   const [chatMatchCount, setChatMatchCount] = useState(0);
   const [chatMatchIdx, setChatMatchIdx] = useState(0);
+  const [chatSearchCase, setChatSearchCase] = useState(false);
+  const [chatSearchWholeWord, setChatSearchWholeWord] = useState(false);
 
   // Highlighter mode + persistent highlights (localStorage per session)
   const [highlightMode, setHighlightMode] = useState(false);
@@ -362,8 +366,18 @@ export default function AssistantPage() {
   const skipNextHighlightSaveRef = useRef(false);
   const skipNextNoteSaveRef = useRef(false);
 
-  // Load highlights + sticky notes from localStorage when session changes
+  // Load highlights + sticky notes from localStorage when session changes.
+  // Also resets in-chat keyword search so an open search in session A doesn't
+  // bleed into session B — that crossed-session leak felt broken: switching
+  // chats with the search bar open would re-run the same query over the new
+  // conversation. Per-session scoping is the right mental model.
   useEffect(() => {
+    setChatSearchOpen(false);
+    setChatSearchQuery("");
+    setChatMatchCount(0);
+    setChatMatchIdx(0);
+    setChatSearchCase(false);
+    setChatSearchWholeWord(false);
     if (!activeId) {
       setHighlights([]);
       setStickyNotes([]);
@@ -637,7 +651,7 @@ export default function AssistantPage() {
     const marks = container.querySelectorAll("mark[data-rf-search]");
     setChatMatchCount(marks.length);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatSearchQuery, session?.messages, streamingContent]);
+  }, [chatSearchQuery, chatSearchCase, chatSearchWholeWord, session?.messages, streamingContent]);
 
   // Reset the current-match index ONLY when the user types a different query,
   // never on content updates. This is what makes next/previous reliable.
@@ -663,47 +677,99 @@ export default function AssistantPage() {
   // Highlight-mode mouseup handler.
   //
   // Behaviour (matches the user's expectation):
-  //   * When highlight mode is ON:
-  //       - selecting un-highlighted text → adds a new highlight
-  //       - selecting an existing highlight's exact text → removes that highlight
-  //   * When highlight mode is OFF: no capture (selections are normal).
-  //   * Existing highlights stay rendered REGARDLESS of mode (React owns them).
+  //   * When highlight mode is ON, releasing a selection adds one
+  //     highlight PER text-node inside the selection range. Selections
+  //     spanning **bold**, citations, tables, list items, etc. each
+  //     produce their own per-segment mark — the inline elements stay
+  //     clickable because the citation/link spans aren't replaced, the
+  //     <mark> just wraps the plain text inside them.
+  //   * When highlight mode is OFF, normal text selection behaviour
+  //     takes over and click-to-remove on existing marks is disabled
+  //     (only the highlighter button toggle removes them in that mode).
+  //   * Existing highlights stay rendered REGARDLESS of mode — React owns
+  //     them through the decoration pipeline.
   useEffect(() => {
     if (!highlightMode) return;
     function handleMouseUp() {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) return;
-      const selectedText = sel.toString().trim();
-      if (selectedText.length < 2) return;
       const container = chatScrollRef.current;
       if (!container) return;
 
       const range = sel.getRangeAt(0);
-      let el: Element | null = range.commonAncestorContainer instanceof Element
-        ? range.commonAncestorContainer
-        : range.commonAncestorContainer.parentElement;
-      let msgId: string | undefined;
-      while (el && el !== container) {
-        const id = (el as HTMLElement).dataset?.messageId;
-        if (id) { msgId = id; break; }
-        el = el.parentElement;
-      }
-      if (!msgId) return;
-
-      // If the user's selection is exactly the text of an existing highlight
-      // in this message, treat it as "toggle off" instead of "add".
-      setHighlights(prev => {
-        const existing = prev.find(h => h.messageId === msgId && h.text === selectedText);
-        if (existing) {
-          return prev.filter(h => h.id !== existing.id);
+      // Pull every text node that intersects the selection. A TreeWalker
+      // is faster than recursive traversal and gives us a flat list we
+      // can iterate in document order.
+      const messageGroups = new Map<string, string[]>();
+      const walker = document.createTreeWalker(
+        container,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode(node) {
+            const text = (node.textContent || "");
+            if (!text.trim()) return NodeFilter.FILTER_REJECT;
+            if (range.intersectsNode(node)) return NodeFilter.FILTER_ACCEPT;
+            return NodeFilter.FILTER_REJECT;
+          },
+        },
+      );
+      let n: Node | null = walker.nextNode();
+      while (n) {
+        const fullText = n.textContent || "";
+        // Compute the in-node start/end relative to the range.
+        let start = 0;
+        let end = fullText.length;
+        if (n === range.startContainer) start = range.startOffset;
+        if (n === range.endContainer) end = range.endOffset;
+        const piece = fullText.slice(start, end).trim();
+        if (piece.length >= 2) {
+          // Walk up to the nearest data-message-id ancestor.
+          let el: Element | null = n.parentElement;
+          let msgId: string | undefined;
+          while (el && el !== container) {
+            const id = (el as HTMLElement).dataset?.messageId;
+            if (id) { msgId = id; break; }
+            el = el.parentElement;
+          }
+          if (msgId) {
+            const list = messageGroups.get(msgId) || [];
+            list.push(piece);
+            messageGroups.set(msgId, list);
+          }
         }
-        const hl: Highlight = {
-          id: crypto.randomUUID(),
-          messageId: msgId!,
-          text: selectedText,
-          color: "#fef08a",
-        };
-        return [...prev, hl];
+        n = walker.nextNode();
+      }
+
+      if (messageGroups.size === 0) {
+        sel.removeAllRanges();
+        return;
+      }
+
+      setHighlights(prev => {
+        let next = prev;
+        for (const [msgId, pieces] of messageGroups) {
+          for (const text of pieces) {
+            // Toggle behaviour: if an existing highlight matches exactly,
+            // re-selecting it removes it (per-segment).
+            const existing = next.find(h => h.messageId === msgId && h.text === text);
+            if (existing) {
+              next = next.filter(h => h.id !== existing.id);
+            } else {
+              next = [
+                ...next,
+                {
+                  id: (typeof crypto !== "undefined" && crypto.randomUUID)
+                    ? crypto.randomUUID()
+                    : `h-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                  messageId: msgId,
+                  text,
+                  color: "#fef08a",
+                },
+              ];
+            }
+          }
+        }
+        return next;
       });
       sel.removeAllRanges();
     }
@@ -1040,23 +1106,46 @@ export default function AssistantPage() {
               <StopCircleIcon size={12} /> Stop
             </button>
           )}
-          {/* Highlighter mode toggle */}
-          <button
-            onClick={() => setHighlightMode(m => !m)}
-            title={highlightMode ? "Highlighter on — select text to highlight (click to switch off)" : "Highlighter off — click to enable"}
-            style={{
-              background: highlightMode ? "rgba(254,240,138,0.2)" : "none",
-              border: highlightMode ? "1px solid rgba(254,240,138,0.6)" : "none",
-              borderRadius: 5, cursor: "pointer",
-              color: highlightMode ? "#ca8a04" : "var(--rf-text4)",
-              padding: "4px 6px", display: "flex", alignItems: "center",
-            }}
-          >
-            <HighlighterIcon size={13} />
-          </button>
+          {/* Highlighter + keyword search require a non-empty conversation.
+              Hiding (instead of disabling) keeps the header tidy when the
+              session has no messages yet. */}
+          {orderedMessages.length > 0 && (
+            <>
+              {/* Highlighter mode toggle */}
+              <button
+                onClick={() => setHighlightMode(m => !m)}
+                title={highlightMode ? "Highlighter on — select text to highlight (click to switch off)" : "Highlighter off — click to enable"}
+                style={{
+                  background: highlightMode ? "rgba(254,240,138,0.2)" : "none",
+                  border: highlightMode ? "1px solid rgba(254,240,138,0.6)" : "none",
+                  borderRadius: 5, cursor: "pointer",
+                  color: highlightMode ? "#ca8a04" : "var(--rf-text4)",
+                  padding: "4px 6px", display: "flex", alignItems: "center",
+                }}
+              >
+                <HighlighterIcon size={13} />
+              </button>
+
+              {/* In-chat keyword search */}
+              <button
+                onClick={() => { setChatSearchOpen(o => !o); if (!chatSearchOpen) setTimeout(() => searchInputRef.current?.focus(), 30); }}
+                title="Search conversation (Ctrl+F)"
+                style={{
+                  background: chatSearchOpen ? "var(--rf-nav-active)" : "none",
+                  border: chatSearchOpen ? "1px solid var(--rf-nav-border)" : "none",
+                  borderRadius: 5, cursor: "pointer", color: "var(--rf-text4)",
+                  padding: "4px 6px", display: "flex", alignItems: "center",
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                </svg>
+              </button>
+            </>
+          )}
 
           {/* Export session */}
-          {session && (
+          {session && orderedMessages.length > 0 && (
             <button
               onClick={exportSession}
               title="Export session as Markdown"
@@ -1068,22 +1157,6 @@ export default function AssistantPage() {
               <DownloadIcon size={13} />
             </button>
           )}
-
-          {/* In-chat keyword search */}
-          <button
-            onClick={() => { setChatSearchOpen(o => !o); if (!chatSearchOpen) setTimeout(() => searchInputRef.current?.focus(), 30); }}
-            title="Search conversation (Ctrl+F)"
-            style={{
-              background: chatSearchOpen ? "var(--rf-nav-active)" : "none",
-              border: chatSearchOpen ? "1px solid var(--rf-nav-border)" : "none",
-              borderRadius: 5, cursor: "pointer", color: "var(--rf-text4)",
-              padding: "4px 6px", display: "flex", alignItems: "center",
-            }}
-          >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
-            </svg>
-          </button>
         </header>
 
         {/* In-chat search bar */}
@@ -1115,6 +1188,32 @@ export default function AssistantPage() {
                 {chatMatchCount === 0 ? "no matches" : `${chatMatchIdx + 1} / ${chatMatchCount}`}
               </span>
             )}
+            <button
+              onClick={() => setChatSearchCase(c => !c)}
+              title={chatSearchCase ? "Case sensitive — click for case-insensitive" : "Case insensitive — click for case-sensitive"}
+              aria-pressed={chatSearchCase}
+              style={{
+                background: chatSearchCase ? "var(--rf-nav-active)" : "none",
+                border: chatSearchCase ? "1px solid var(--rf-nav-border)" : "1px solid transparent",
+                cursor: "pointer", color: chatSearchCase ? "var(--rf-text1)" : "var(--rf-text4)",
+                padding: "1px 6px", borderRadius: 4, fontSize: "10px", fontWeight: 700,
+                fontFamily: "ui-monospace, monospace",
+              }}
+            >Aa</button>
+            <button
+              onClick={() => setChatSearchWholeWord(w => !w)}
+              title={chatSearchWholeWord
+                ? "Exact match (whole word only) — click for partial / substring matches"
+                : "Partial match (substring) — click for exact whole-word matches"}
+              aria-pressed={chatSearchWholeWord}
+              style={{
+                background: chatSearchWholeWord ? "var(--rf-nav-active)" : "none",
+                border: chatSearchWholeWord ? "1px solid var(--rf-nav-border)" : "1px solid transparent",
+                cursor: "pointer", color: chatSearchWholeWord ? "var(--rf-text1)" : "var(--rf-text4)",
+                padding: "1px 6px", borderRadius: 4, fontSize: "10px", fontWeight: 700,
+                fontFamily: "ui-monospace, monospace",
+              }}
+            >\b</button>
             <button onClick={() => chatSearchNavigate(-1)} disabled={chatMatchCount === 0}
               style={{ background: "none", border: "none", cursor: "pointer", color: "var(--rf-text4)", padding: "2px 4px" }}
               title="Previous (Shift+Enter)">↑</button>
@@ -1148,6 +1247,13 @@ export default function AssistantPage() {
               onStart={(text) => { setInput(text); inputRef.current?.focus(); }}
             />
           )}
+          {session?.parent_session_id && (
+            <BranchContextBanner
+              session={session}
+              parentSession={sessions.find(s => s.id === session.parent_session_id) ?? null}
+              onOpenParent={(pid) => { setActiveId(pid); router.replace(`/assistant?session=${pid}`); }}
+            />
+          )}
           <ChatErrorBoundary>
             {orderedMessages.map(msg => (
               <MessageBlock
@@ -1167,6 +1273,9 @@ export default function AssistantPage() {
                 onDeleteNote={deleteStickyNote}
                 highlightsForMessage={highlightsByMessage[msg.id] || []}
                 searchQuery={chatSearchQuery}
+                searchCaseSensitive={chatSearchCase}
+                searchWholeWord={chatSearchWholeWord}
+                highlightModeActive={highlightMode}
                 onRemoveHighlight={onRemoveHighlight}
               />
             ))}
@@ -1484,10 +1593,48 @@ function SessionList({
     );
   }
 
+  // Resizable session panel — drag the right edge between MIN and MAX. The
+  // chosen width is persisted to localStorage so it survives reloads, and
+  // word-wrap is allowed in titles so wider widths actually pay off (the
+  // old single-line truncation defeated the point of a wider panel).
+  const MIN_W = 200;
+  const MAX_W = 480;
+  const DEFAULT_W = 240;
+  const [panelWidth, setPanelWidth] = useState<number>(DEFAULT_W);
+  useEffect(() => {
+    try {
+      const stored = parseInt(localStorage.getItem("rf-session-panel-w") || "", 10);
+      if (!Number.isNaN(stored) && stored >= MIN_W && stored <= MAX_W) setPanelWidth(stored);
+    } catch {}
+  }, []);
+  const dragStateRef = useRef<{ startX: number; startW: number } | null>(null);
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    dragStateRef.current = { startX: e.clientX, startW: panelWidth };
+    e.preventDefault();
+    function onMove(ev: MouseEvent) {
+      const s = dragStateRef.current;
+      if (!s) return;
+      const next = Math.min(MAX_W, Math.max(MIN_W, s.startW + (ev.clientX - s.startX)));
+      setPanelWidth(next);
+    }
+    function onUp() {
+      const s = dragStateRef.current;
+      if (s) {
+        try { localStorage.setItem("rf-session-panel-w", String(panelWidth)); } catch {}
+      }
+      dragStateRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [panelWidth]);
+
   return (
     <aside style={{
-      width: 240, flexShrink: 0, borderRight: "1px solid var(--rf-border)",
+      width: panelWidth, flexShrink: 0, borderRight: "1px solid var(--rf-border)",
       display: "flex", flexDirection: "column", background: "var(--rf-surface1)",
+      position: "relative",
     }}>
       <div style={{
         padding: "12px 12px 8px",
@@ -1551,6 +1698,17 @@ function SessionList({
           </button>
         </div>
       )}
+      {/* Drag handle on the right edge — 6px-wide hit area on top of a 1px
+          visual ridge so the user has somewhere to grab without the strip
+          competing with the panel border for clicks. */}
+      <div
+        onMouseDown={onDragStart}
+        title="Drag to resize"
+        style={{
+          position: "absolute", top: 0, right: -3, width: 6, height: "100%",
+          cursor: "col-resize", zIndex: 5,
+        }}
+      />
     </aside>
   );
 }
@@ -1643,8 +1801,14 @@ function SessionRow({
           <GitBranchIcon size={9} style={{ flexShrink: 0, color: "#a78bfa" }} />
         )}
         <div style={{
-          fontSize: "11.5px", fontWeight: 600,
-          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1,
+          fontSize: "11.5px", fontWeight: 600, flex: 1,
+          // Allow titles to wrap to additional lines instead of truncating;
+          // long-running investigations have long auto-titles that the
+          // previous single-line truncation rendered as "Advancements in
+          // Mechanistic I…". The session-panel resize handle lets the user
+          // widen the column when they need more horizontal room.
+          wordBreak: "break-word", overflowWrap: "anywhere",
+          lineHeight: 1.3,
         }}>
           {session.title}
         </div>
@@ -1902,7 +2066,7 @@ function ContextRail({
       </SectionLabel>
       {attachments.length === 0 && (
         <p style={{ fontSize: "10.5px", color: "var(--rf-text5)" }}>
-          Drop a note or paste a URL via the paperclip in the composer.
+          Attach a note or URL using the paperclip in the composer to ground the next turn.
         </p>
       )}
       {attachments.map(a => (
@@ -2007,9 +2171,10 @@ function Composer({
       )}
       <div style={{
         position: "relative",
-        display: "flex", gap: 8, alignItems: "flex-end",
+        display: "flex", gap: 8, alignItems: "center",
         background: "var(--rf-surface2)", borderRadius: 10,
         padding: "8px 10px", border: "1px solid var(--rf-border)",
+        minHeight: 56,
       }}>
         <button
           onClick={() => setShowAttach(s => !s)}
@@ -2017,6 +2182,7 @@ function Composer({
           style={{
             padding: 6, borderRadius: 6, background: "none", border: "none",
             color: "var(--rf-text4)", cursor: "pointer", flexShrink: 0,
+            alignSelf: "center",
           }}
         >
           <PaperclipIcon size={14} />
@@ -2029,11 +2195,16 @@ function Composer({
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSubmit(); }
           }}
           placeholder="Ask, explore, or describe what you want to investigate…"
-          rows={2}
+          rows={1}
           style={{
             flex: 1, background: "transparent", border: "none", outline: "none",
             fontSize: "12.5px", color: "var(--rf-text1)", resize: "none",
             fontFamily: "inherit", lineHeight: 1.5,
+            // Cap initial height to match a single line so the placeholder
+            // sits centered with the paperclip + send buttons; auto-grow on
+            // input is handled by the existing onInput in JobsPanel.
+            maxHeight: 160, overflowY: "auto",
+            padding: "4px 0",
           }}
         />
         <button
@@ -2062,7 +2233,7 @@ function Composer({
         )}
       </div>
       <p style={{ fontSize: "9.5px", color: "var(--rf-text5)", margin: "6px 4px 0", textAlign: "center" }}>
-        Composes Deep Search · arXiv MCP · Genie · Web · Compare · Bookmarks. Heavy work runs in the background.
+        Orchestrates deep search, arXiv ingestion, idea synthesis, web context, paper comparison, and your bookmarks. Long-running work continues in the background while you keep typing.
       </p>
     </footer>
   );
@@ -2226,7 +2397,7 @@ function MessageBlock({
   msg, steps, tasks, onSuggestionClick, onBranch, onCancel, onOpenPaper,
   liveJobData, streamingContent,
   stickyNotes = [], onAddNote, onUpdateNote, onDeleteNote,
-  highlightsForMessage, searchQuery, onRemoveHighlight,
+  highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, highlightModeActive, onRemoveHighlight,
 }: {
   msg: AssistantMessage;
   steps: AssistantStep[];
@@ -2245,6 +2416,12 @@ function MessageBlock({
   highlightsForMessage?: Highlight[];
   /** Current chat-search query — drives the search ``<mark>`` rendering. */
   searchQuery?: string;
+  /** When true, search matches require exact case. */
+  searchCaseSensitive?: boolean;
+  /** When true, search matches must be whole-word (exact). */
+  searchWholeWord?: boolean;
+  /** Highlighter button toggle — when true, marks become removable on click. */
+  highlightModeActive?: boolean;
   /** Called when the user clicks a highlight mark to remove it. */
   onRemoveHighlight?: (id: string) => void;
 }) {
@@ -2305,6 +2482,9 @@ function MessageBlock({
             streamingText={streamingContent[msg.id]}
             highlightsForMessage={highlightsForMessage}
             searchQuery={searchQuery}
+            searchCaseSensitive={searchCaseSensitive}
+            searchWholeWord={searchWholeWord}
+            highlightModeActive={highlightModeActive}
             onRemoveHighlight={onRemoveHighlight}
           />
           <div style={{ marginTop: 8, display: "flex", justifyContent: "flex-end", gap: 4 }}>
@@ -2483,7 +2663,7 @@ function ThinkingDots() {
 
 function MessageBody({
   msg, isInflight = false, onSuggestionClick, onOpenPaper, streamingText,
-  highlightsForMessage, searchQuery, onRemoveHighlight,
+  highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, highlightModeActive, onRemoveHighlight,
 }: {
   msg: AssistantMessage;
   isInflight?: boolean;
@@ -2492,6 +2672,9 @@ function MessageBody({
   streamingText?: string;
   highlightsForMessage?: Highlight[];
   searchQuery?: string;
+  searchCaseSensitive?: boolean;
+  searchWholeWord?: boolean;
+  highlightModeActive?: boolean;
   onRemoveHighlight?: (id: string) => void;
 }) {
   // Build the decoration object passed to MarkdownRenderer. The renderer
@@ -2500,9 +2683,12 @@ function MessageBody({
   const decorations = useMemo(() => ({
     highlights: (highlightsForMessage || []).map(h => ({ id: h.id, text: h.text, color: h.color })),
     searchQuery: searchQuery || "",
+    searchCaseSensitive: !!searchCaseSensitive,
+    searchWholeWord: !!searchWholeWord,
     searchKeyPrefix: msg.id,
+    highlightClickToRemove: !!highlightModeActive,
     onRemoveHighlight,
-  }), [highlightsForMessage, searchQuery, msg.id, onRemoveHighlight]);
+  }), [highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, msg.id, highlightModeActive, onRemoveHighlight]);
   const blocks = (msg.payload?.blocks as Block[] | undefined) || [];
 
   // Build a 1-based index map for citations: {1: paper_id, A1: paper_id}
@@ -3346,6 +3532,67 @@ function _seedsForNamespace(ns: string): string[] {
   const prefix = ns.split(".")[0];
   const match = Object.entries(_NS_SEEDS).find(([k]) => k.split(".")[0] === prefix);
   return match ? match[1] : _DEFAULT_SEEDS;
+}
+
+/** Compact banner shown at the top of branched sessions — a quiet
+ * reminder of where the branch was forked from, with a one-click jump back
+ * to the parent session. The backend separately seeds the LLM with a full
+ * parent-context summary (see app.assistant.branch_context); this UI is
+ * purely for the human reading the chat.
+ */
+function BranchContextBanner({
+  session,
+  parentSession,
+  onOpenParent,
+}: {
+  session: AssistantSession;
+  parentSession: SessionSummary | null;
+  onOpenParent: (parentId: string) => void;
+}) {
+  const parentTitle = parentSession?.title ?? "parent session";
+  const parentSummary = parentSession?.summary || "";
+  const parentId = session.parent_session_id;
+  if (!parentId) return null;
+  return (
+    <div
+      style={{
+        margin: "0 0 14px",
+        padding: "10px 14px",
+        borderRadius: 10,
+        background: "linear-gradient(135deg, rgba(124,58,237,0.07), rgba(99,102,241,0.05))",
+        border: "1px solid rgba(167,139,250,0.22)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <GitBranchIcon size={12} style={{ color: "#a78bfa", flexShrink: 0 }} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <p style={{ fontSize: "10px", fontWeight: 700, color: "#c4b5fd", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0 }}>
+            Branched from
+          </p>
+          <button
+            onClick={() => onOpenParent(parentId)}
+            title="Open parent session"
+            style={{
+              background: "none", border: "none", padding: 0, cursor: "pointer",
+              fontSize: "12px", fontWeight: 600, color: "var(--rf-text1)",
+              textAlign: "left", whiteSpace: "nowrap", overflow: "hidden",
+              textOverflow: "ellipsis", maxWidth: "100%",
+            }}
+          >
+            {parentTitle}
+          </button>
+        </div>
+      </div>
+      {parentSummary && (
+        <p style={{
+          fontSize: "11px", color: "var(--rf-text4)",
+          margin: "6px 0 0", lineHeight: 1.5,
+        }}>
+          {parentSummary.length > 220 ? parentSummary.slice(0, 220).trimEnd() + "…" : parentSummary}
+        </p>
+      )}
+    </div>
+  );
 }
 
 function EmptyState({ namespaceKey, onStart }: { namespaceKey: string; onStart: (text: string) => void }) {

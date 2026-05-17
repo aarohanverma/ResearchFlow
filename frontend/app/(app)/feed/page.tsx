@@ -28,12 +28,14 @@ interface SuggestedResponse { suggestions: SuggestedResult[]; based_on: string[]
 
 function searchResultToPaper(r: SearchResult): Paper {
   return {
-    id: r.paper_id, external_id: r.paper_id, namespace_key: r.namespace_key,
+    id: r.paper_id, external_id: r.external_id ?? r.paper_id, namespace_key: r.namespace_key,
+    namespace_keys: r.namespace_keys && r.namespace_keys.length > 0 ? r.namespace_keys : [r.namespace_key],
     title: r.title, authors: r.authors, abstract: r.abstract, source_url: r.source_url,
     pdf_url: r.pdf_url, published_at: r.published_at,
     key_concepts: r.key_concepts ?? [], methods_used: r.methods_used ?? [],
     implications: r.implications ?? null, novelty_score: r.novelty_score,
     relevance_score: r.relevance_score, is_breakthrough: r.is_breakthrough,
+    is_manually_imported: r.is_manually_imported,
     tldr: r.tldr ?? null, ingested_at: r.ingested_at ?? "",
   };
 }
@@ -45,7 +47,9 @@ function searchResultToPaper(r: SearchResult): Paper {
 function RelatedPapersPanel({ paper, onSelectPaper }: { paper: Paper; onSelectPaper: (p: Paper) => void }) {
   const [related, setRelated] = useState<SuggestedResult[]>([]);
   const [loading, setLoading] = useState(true);
-  const [collapsed, setCollapsed] = useState(false);
+  // Collapsed by default — the user opted into the paper preview, not a
+  // sidebar of tangentially-related work. They can expand on demand.
+  const [collapsed, setCollapsed] = useState(true);
   const { add, remove, isBookmarked, initialize } = useBookmarksStore();
   const { selectedTopics } = useNamespaceStore();
   const prevKey = useRef<string>("");
@@ -64,6 +68,13 @@ function RelatedPapersPanel({ paper, onSelectPaper }: { paper: Paper; onSelectPa
       .catch(() => setRelated([]))
       .finally(() => setLoading(false));
   }, [paper.id, selectedTopics]);
+
+  // Hide the panel entirely when the backend returned no related papers —
+  // an empty rail is just noise. Keep the panel mounted while we're still
+  // loading so the user knows something is happening.
+  if (!loading && related.length === 0) {
+    return null;
+  }
 
   async function toggleBm(e: React.MouseEvent, r: SuggestedResult) {
     e.stopPropagation();
@@ -488,17 +499,45 @@ export default function FeedPage() {
       );
       // Discard if a newer load has already started
       if (seq !== loadFeedSeqRef.current) return;
-      const allPapers: FeedItem[] = [];
-      const seen = new Set<string>();
+      // Cross-topic dedup: arXiv cross-lists the same paper under multiple
+      // categories (cs.AI, cs.LG, cs.NE …), so the per-namespace fetch returns
+      // distinct Paper rows for what is logically a single paper. Group by
+      // ``external_id`` so the user sees one card with all the matching topic
+      // tags from their selection, not three near-identical entries.
+      const byExternal = new Map<string, FeedItem & { _topics: Set<string> }>();
+      const selectedSet = new Set(selectedTopics);
       for (const r of results) {
-        if (r.status === "fulfilled") {
-          for (const item of r.value.papers) {
-            if (!seen.has(item.paper.id)) { seen.add(item.paper.id); allPapers.push(item); }
+        if (r.status !== "fulfilled") continue;
+        for (const item of r.value.papers) {
+          const ext = item.paper.external_id || item.paper.id;
+          const existing = byExternal.get(ext);
+          if (existing) {
+            existing._topics.add(item.paper.namespace_key);
+            // Keep the higher score so the merged card ranks correctly.
+            if (item.score > existing.score) {
+              existing.score = item.score;
+              existing.why_tag = item.why_tag;
+            }
+          } else {
+            byExternal.set(ext, {
+              ...item,
+              _topics: new Set<string>([item.paper.namespace_key]),
+            });
           }
         }
       }
-      allPapers.sort((a, b) => b.score - a.score);
-      setFeed(allPapers.slice(0, 60));
+      const merged: FeedItem[] = Array.from(byExternal.values()).map(({ _topics, ...rest }) => ({
+        ...rest,
+        paper: {
+          ...rest.paper,
+          // Intersect the paper's known topics with the user's current
+          // selection so the card surfaces only relevant tags. Always
+          // include the row's own namespace_key as a fallback.
+          namespace_keys: Array.from(_topics).filter(k => selectedSet.has(k)).sort(),
+        },
+      }));
+      merged.sort((a, b) => b.score - a.score);
+      setFeed(merged.slice(0, 60));
     } catch (e) {
       if (seq === loadFeedSeqRef.current) console.error("loadFeed error:", e);
     } finally {

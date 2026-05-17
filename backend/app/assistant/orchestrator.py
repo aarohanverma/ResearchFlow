@@ -191,8 +191,19 @@ class Orchestrator:
                      "content": m.content}
                     for m in (session.messages or [])[-8:]
                 ]
-                medium_memory = getattr(session, "_medium_memory", {})
+                short_memory = getattr(session, "_short_memory", {})
+                tree_memory = getattr(session, "_tree_memory", {})
                 ns_memory = getattr(session, "_ns_memory", {})
+                # Carry memory across to _finalize_turn so the synthesizer
+                # prompt can pick it up without re-loading the session.
+                try:
+                    task._assistant_memory = {  # type: ignore[attr-defined]
+                        "short": short_memory,
+                        "medium": tree_memory,
+                        "long": ns_memory,
+                    }
+                except Exception:
+                    pass
 
                 # Determine which optional tools are unavailable due to missing keys.
                 disabled_tools: set[str] = set()
@@ -223,12 +234,42 @@ class Orchestrator:
                 query=query,
                 namespace_key=primary_ns,
                 history=history,
-                memory=medium_memory,
+                memory={**tree_memory, **short_memory},
             )
 
             # Compute complexity for adaptive model routing in planner + synthesizer.
             from app.assistant.planner_llm import _assess_query_complexity
             query_complexity = _assess_query_complexity(query, history)
+
+            # ── Research Brief Agent ─────────────────────────────────────
+            # For substantive turns, crystallise the user's intent into a
+            # structured brief that the planner consumes alongside the
+            # rewritten query. Trivial greetings skip this pass entirely.
+            research_brief: dict | None = None
+            brief_text = ""
+            if query_complexity in ("medium", "complex"):
+                try:
+                    from app.assistant.research_brief import (
+                        compose_research_brief,
+                        format_for_planner,
+                    )
+                    branch_seed = ""
+                    if session.parent_session_id:
+                        try:
+                            seed_state = dict(session.state or {})
+                            branch_seed = (seed_state.get("branch_seed_summary") or {}).get("text") or ""
+                        except Exception:
+                            branch_seed = ""
+                    research_brief = await compose_research_brief(
+                        user_query=query,
+                        namespace_key=primary_ns,
+                        history=history,
+                        memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
+                        branch_seed_summary=branch_seed or None,
+                    )
+                    brief_text = format_for_planner(research_brief or {})
+                except Exception:
+                    log.debug("research brief composition skipped")
 
             # LLM planner with heuristic fallback. ``aplan`` never raises —
             # it falls through to the heuristic on any LLM/parse failure.
@@ -240,8 +281,9 @@ class Orchestrator:
                     history=history,
                     orientation=orientation,
                     expertise=expertise,
-                    memory={"medium": medium_memory, "long": ns_memory},
+                    memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
                     disabled_tools=disabled_tools,
+                    research_brief=brief_text or None,
                 )
             else:
                 plan = self._planner.plan(
@@ -365,19 +407,74 @@ class Orchestrator:
             if _is_completed_msg(m)
         ]
 
+        # ── Branch context: parent → branch (no context loss) ────────────
+        # When this session is a branch, prepend a COMPRESSED parent-context
+        # summary as a system message so the branch's planner + synthesizer
+        # know everything the parent established up to the fork point. Walks
+        # the FULL hierarchy — if this branch is itself nested inside another
+        # branch, we collect summaries from every ancestor up to the root.
         if session.parent_session_id:
             try:
-                parent = await repo.get_session(task.user_id, session.parent_session_id)
-                if parent and parent.messages:
-                    parent_msgs = [
-                        {"role": m.role.value if hasattr(m.role, "value") else str(m.role),
-                         "content": m.content}
-                        for m in parent.messages
-                        if (m.role.value if hasattr(m.role, "value") else str(m.role)) != "system"
-                    ][-6:]
-                    all_completed = parent_msgs + all_completed
+                from app.assistant.branch_context import ensure_branch_seed_summary
+                hierarchy_summaries: list[tuple[str, str]] = []
+                cur_session = session
+                seen_ids: set = set()
+                for _ in range(20):
+                    if cur_session.parent_session_id is None or cur_session.id in seen_ids:
+                        break
+                    seen_ids.add(cur_session.id)
+                    text = await ensure_branch_seed_summary(
+                        session_id=cur_session.id,
+                        user_id=task.user_id,
+                    )
+                    if text:
+                        try:
+                            parent_for_label = await repo.get_session(
+                                task.user_id, cur_session.parent_session_id
+                            )
+                            label = parent_for_label.title if parent_for_label else "parent"
+                        except Exception:
+                            label = "parent"
+                        hierarchy_summaries.append((label, text))
+                    nxt = await repo.get_session(task.user_id, cur_session.parent_session_id)
+                    if nxt is None:
+                        break
+                    cur_session = nxt
+                if hierarchy_summaries:
+                    # Outermost ancestor first so the model sees coarse-to-fine
+                    # context — the immediate parent appears last.
+                    blocks: list[str] = []
+                    for label, text in reversed(hierarchy_summaries):
+                        blocks.append(
+                            f"[Parent session — {label}]\n{text}"
+                        )
+                    seed_msg = {
+                        "role": "system",
+                        "content": (
+                            "Branch context (compressed from ancestor sessions — "
+                            "preserve every named entity, paper, method, and "
+                            "open question):\n\n" + "\n\n".join(blocks)
+                        ),
+                    }
+                    all_completed = [seed_msg] + all_completed
             except Exception:
-                log.debug("branch context load failed for parent_session=%s", session.parent_session_id)
+                log.debug(
+                    "branch seed summary load failed parent_session=%s",
+                    session.parent_session_id,
+                )
+
+        # ── Branch context: parent ← branches ───────────────────────────
+        # If this session has branches that have reported back, prepend a
+        # short "branch progress" block as a system message so parent turns
+        # can reference what each branch has explored without re-reading
+        # their full transcripts.
+        try:
+            from app.assistant.branch_context import build_parent_branch_block
+            branch_block = build_parent_branch_block(session)
+            if branch_block:
+                all_completed = [{"role": "system", "content": branch_block}] + all_completed
+        except Exception:
+            pass
 
         # Rolling history: if the conversation exceeds the threshold, compress
         # older turns into a cached summary stored in session.state so it's
@@ -390,24 +487,49 @@ class Orchestrator:
             namespace_key=primary_ns,
         )
 
-        # Collect memory from session state — injected into planner prompt.
-        medium_memory = dict(session_state.get("memory") or {})
+        # ── Tiered memory load ────────────────────────────────────────────
+        # short  → this chat only           (session.state["chat_memory"])
+        # medium → entire session tree      (root_session.state["tree_memory"])
+        # long   → namespace-wide           (session.state["ns_memory"])
+        short_memory = dict(session_state.get("chat_memory") or {})
         ns_memory = dict(session_state.get("ns_memory") or {})
+
+        # Find the tree-root for medium memory. For a non-branch session the
+        # session is its own root, so this is cheap.
+        root_session = session
         if session.parent_session_id:
             try:
-                parent = await repo.get_session(task.user_id, session.parent_session_id)
-                if parent:
-                    pstate = dict(parent.state or {})
-                    # Merge parent medium memory (child takes precedence on conflicts).
-                    medium_memory = {**dict(pstate.get("memory") or {}), **medium_memory}
-                    if not ns_memory:
-                        ns_memory = dict(pstate.get("ns_memory") or {})
+                seen: set = set()
+                cur = session
+                for _ in range(20):
+                    if cur.parent_session_id is None or cur.parent_session_id in seen:
+                        break
+                    seen.add(cur.id)
+                    nxt = await repo.get_session(task.user_id, cur.parent_session_id)
+                    if nxt is None:
+                        break
+                    cur = nxt
+                root_session = cur
             except Exception:
-                pass
+                root_session = session
+        root_state = dict(root_session.state or {}) if root_session is not None else {}
+        tree_memory = dict(root_state.get("tree_memory") or {})
+        # Backwards-compat: read legacy ``memory`` writes off the root too.
+        for k, v in dict(root_state.get("memory") or {}).items():
+            tree_memory.setdefault(k, v)
+        # Fall back to root's ns_memory when current session hasn't been
+        # seeded yet (e.g. branch sessions).
+        if not ns_memory and root_state:
+            ns_memory = dict(root_state.get("ns_memory") or {})
 
         session._orchestrator_history = own_msgs  # type: ignore[attr-defined]
-        session._medium_memory = medium_memory  # type: ignore[attr-defined]
+        # Legacy-named attributes kept for back-compat with code that still
+        # reads ``_medium_memory``; both point to the tree memory now.
+        session._short_memory = short_memory  # type: ignore[attr-defined]
+        session._medium_memory = tree_memory  # type: ignore[attr-defined]
+        session._tree_memory = tree_memory  # type: ignore[attr-defined]
         session._ns_memory = ns_memory  # type: ignore[attr-defined]
+        session._root_session_id = root_session.id if root_session else session.id  # type: ignore[attr-defined]
         return task, session, query, namespace_keys, primary_ns, orientation, expertise
 
     async def _build_rolling_history(
@@ -505,13 +627,16 @@ class Orchestrator:
                 "Write in plain, dense prose. No headers, no bullets. Max 600 words. "
                 "Prioritize named entities and specific references over general topic labels."
             )
+            # No ``max_tokens`` cap — we instruct the model to stay within
+            # 600 words in the prompt. Hard-capping at the API level was
+            # cutting summaries mid-sentence, which is contextual loss for
+            # the rolling history that subsequent turns rely on.
             result = await llm.complete(
                 [
                     {"role": "system", "content": system},
                     {"role": "user", "content": f"Namespace: {namespace_key}\n\nConversation:\n{conv_text}"},
                 ],
                 llm.cheap_model,
-                max_tokens=900,
                 temperature=0.0,
             )
             return (result.text or "").strip()
@@ -903,6 +1028,32 @@ class Orchestrator:
                 results=results, query=query, task=task, job_id=job_id,
             )
 
+        # ── Improvisation guard ───────────────────────────────────────────
+        # Coverage guard tries arXiv; if that still didn't help, fall back to
+        # one cheap web_search so the synthesizer has at least lightly-vetted
+        # leads. Only runs when retrieval was non-trivial-but-thin.
+        if (
+            not is_pure_reasoning
+            and len(self._papers_from_results(results)) < 1
+            and "web_search" not in results
+        ):
+            try:
+                from app.assistant.reflection import improvise_after_thin_results
+                extra = await improvise_after_thin_results(
+                    query=query,
+                    namespace_key=task.namespace_key or "",
+                    namespace_keys=[task.namespace_key] if task.namespace_key else [],
+                    user_id=task.user_id,
+                    results=results,
+                )
+                if extra:
+                    merged = dict(results)
+                    merged.update(extra)
+                    results = merged
+                    plan.actions.append("Improvised: surfaced web context for thin corpus")
+            except Exception:
+                log.debug("improvisation fallback skipped")
+
         await self._append_progress(job_id, plan.actions, "Synthesizing answer",
                                     _STAGE_PROGRESS["synthesizing"])
         papers = self._papers_from_results(results)
@@ -925,6 +1076,12 @@ class Orchestrator:
         async def _on_delta(chunk: str) -> None:
             self._publish(job_id, "message_delta", {"message_id": message_id, "delta": chunk})
 
+        # Plumb session + namespace memory into the synthesizer so user
+        # preferences / accumulated findings can lightly shape the final
+        # answer without requiring the planner to schedule ``memory_recall``
+        # every turn. The memory views are stashed on the task object's
+        # session by ``_load_context`` and forwarded through ``run_turn``.
+        memory_view = getattr(task, "_assistant_memory", None) or {}
         answer = await synthesize_answer(
             query=query,
             papers=papers,
@@ -937,6 +1094,7 @@ class Orchestrator:
             actions=plan.actions,
             extra_results=results,
             complexity=complexity,
+            memory=memory_view,
             on_delta=_on_delta,
         )
 
@@ -1060,6 +1218,81 @@ class Orchestrator:
             t.add_done_callback(lambda _t: (_log_task_exc(_t, "interest_updater"), self._post_turn_tasks.discard(_t)))
         except Exception:
             log.exception("failed to schedule interest profile update job=%s", job_id)
+
+        # Fire-and-forget branch progress summary — when this turn ran inside
+        # a branch session, push a fresh "what this branch is exploring"
+        # summary onto the PARENT's state so the parent sees what each of its
+        # branches is up to without needing to read every branch message.
+        # Walks the full ancestor chain so deeply-nested branches update
+        # every parent on the path to the root.
+        try:
+            from app.assistant.branch_context import (
+                prune_session_state,
+                update_branch_progress_summary,
+            )
+
+            async def _update_chain() -> None:
+                # Walk up: this session, its parent, its grandparent, ...
+                # Each call summarises the *immediate* branch session into its
+                # direct parent's state, so cascading produces a correct nested
+                # view: parent sees the latest branch; grandparent sees both
+                # the branch AND the parent's roll-up (parent will already be
+                # summarised when its own turns run).
+                from app.db.session import async_session_factory as _sf
+                from app.repositories.assistant import AssistantRepository as _Repo
+                async with _sf() as _db:
+                    _repo = _Repo(_db)
+                    cur = await _repo.get_session(task.user_id, task.session_id)
+                    hops = 0
+                    seen: set = set()
+                    while cur and cur.parent_session_id and hops < 20 and cur.id not in seen:
+                        seen.add(cur.id)
+                        await update_branch_progress_summary(
+                            branch_session_id=cur.id,
+                            user_id=task.user_id,
+                        )
+                        # Tidy this node's state while we're walking the chain.
+                        await prune_session_state(
+                            session_id=cur.id,
+                            user_id=task.user_id,
+                        )
+                        cur = await _repo.get_session(task.user_id, cur.parent_session_id)
+                        hops += 1
+                # Always prune the current session even if it has no parent.
+                await prune_session_state(
+                    session_id=task.session_id,
+                    user_id=task.user_id,
+                )
+
+            t = asyncio.create_task(_update_chain(), name=f"ra:branch_summary:{job_id}")
+            self._post_turn_tasks.add(t)
+            t.add_done_callback(lambda _t: (_log_task_exc(_t, "branch_summary"), self._post_turn_tasks.discard(_t)))
+        except Exception:
+            log.exception("failed to schedule branch progress summary job=%s", job_id)
+
+        # Fire-and-forget auto-memory consolidation — extracts genuinely new
+        # findings / preferences from the user's latest turn and the
+        # synthesized answer, writing them into the appropriate memory tier.
+        # Skips trivially short turns to avoid burning model spend on
+        # greetings. The pass uses the cheap model and is bounded.
+        try:
+            from app.assistant.auto_memory import consolidate_after_turn
+
+            if len(query.strip()) >= 12:
+                t = asyncio.create_task(
+                    consolidate_after_turn(
+                        session_id=task.session_id,
+                        user_id=task.user_id,
+                        user_query=query,
+                        assistant_answer=answer,
+                        namespace_key=task.namespace_key or "",
+                    ),
+                    name=f"ra:automem:{job_id}",
+                )
+                self._post_turn_tasks.add(t)
+                t.add_done_callback(lambda _t: (_log_task_exc(_t, "auto_memory"), self._post_turn_tasks.discard(_t)))
+        except Exception:
+            log.exception("failed to schedule auto-memory consolidation job=%s", job_id)
 
         self._publish(job_id, "message_completed", {
             "message_id": str(task.assistant_message_id),

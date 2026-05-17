@@ -429,12 +429,19 @@ async def _node_load(state: CombineState) -> CombineState:
 # ── Node: namespace_check ─────────────────────────────────────────────────────
 
 async def _node_namespace_check(state: CombineState) -> CombineState:
-    """Verify the parents share a primary namespace family OR all have papers.
+    """Collect each parent's namespace; auto-index source papers when missing.
 
-    All parents must have indexed source papers (else there's no grounding
-    signal). They don't have to share the same namespace family — that's left
-    to the feasibility judge — but a complete absence of namespace signal is a
-    hard reject.
+    Grounding is required for a meaningful fusion. Earlier this node
+    hard-rejected combines when no parent had indexed source papers — but
+    that punished perfectly valid query-mode ideas. The right behaviour is
+    to *backfill* the missing grounding: for each parent with no indexed
+    papers, run an arXiv import using the capsule's ``source_query``
+    (falling back to a query derived from title + hypothesis), then refresh
+    its ``citation_paper_ids`` from the freshly-imported papers.
+
+    The feasibility judge downstream still does the topical compatibility
+    check — this node only ensures every parent has at least some indexed
+    grounding so the fusion has substance to draw on.
     """
     capsules: list[IdeaCapsule] = state.get("capsules") or []
     if not capsules:
@@ -456,20 +463,61 @@ async def _node_namespace_check(state: CombineState) -> CombineState:
             ns_keys = [r[0] for r in rows.fetchall() if r[0]]
         return _primary_namespace(ns_keys)
 
-    namespaces: list[str] = []
-    for cap in capsules:
-        namespaces.append(await _ns_for(cap))
+    namespaces: list[str] = [await _ns_for(cap) for cap in capsules]
+
+    # Backfill grounding for any parent missing indexed papers.
+    user_id_str = state.get("user_id") or ""
+    for idx, cap in enumerate(capsules):
+        if namespaces[idx]:
+            continue  # already grounded
+        q_seed = (cap.source_query or "").strip()
+        if not q_seed:
+            # Synthesize a search query from title + hypothesis (truncate to
+            # ~200 chars so the search-engine query stays effective).
+            blob = " ".join(filter(None, [cap.title or "", (cap.hypothesis or "")[:200]]))
+            q_seed = blob.strip()
+        if not q_seed:
+            continue
+        try:
+            from app.services.arxiv_import import ArxivImportService
+
+            # Prefer the namespace already inferred from the OTHER parents so
+            # backfilled papers land in the same feed bucket the fusion will
+            # use. Fall back to the first non-empty namespace, then to a
+            # generic "cs.AI" default if nothing is known yet.
+            target_ns = next((n for n in namespaces if n), "") or "cs.AI"
+            imported_ids: list[str] = []
+            async with async_session_factory() as db:
+                svc = ArxivImportService(db)
+                new_papers, _skipped, _raw = await svc.import_search_results(
+                    q_seed,
+                    namespace_key=target_ns,
+                    namespace_keys=None,
+                    max_results=6,
+                )
+                await db.commit()
+                imported_ids = [str(p.id) for p in new_papers]
+            if imported_ids:
+                async with async_session_factory() as db:
+                    row = await db.execute(
+                        select(IdeaCapsule).where(IdeaCapsule.id == cap.id)
+                    )
+                    row_cap = row.scalar_one_or_none()
+                    if row_cap is not None:
+                        existing = list(row_cap.citation_paper_ids or [])
+                        merged = list(dict.fromkeys(existing + [str(pid) for pid in imported_ids]))
+                        row_cap.citation_paper_ids = merged
+                        await db.commit()
+                        # Reflect on the in-memory capsule too.
+                        cap.citation_paper_ids = merged
+                namespaces[idx] = await _ns_for(cap)
+        except Exception as exc:
+            log.warning(
+                "genie_combine: paper backfill failed for capsule=%s err=%s",
+                cap.id, exc,
+            )
+
     state["namespaces"] = namespaces
-
-    if all(not ns for ns in namespaces):
-        state["namespace_ok"] = False
-        state.setdefault("error_metadata", {})["namespace"] = (
-            "None of the parent capsules have indexed source papers — cannot "
-            "verify namespace compatibility. Add source papers to at least "
-            "one parent first."
-        )
-        return state
-
     state["namespace_ok"] = True
     return state
 

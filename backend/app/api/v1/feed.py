@@ -265,7 +265,11 @@ async def get_related_papers(
         ns_list = [k.strip() for k in namespace_keys.split(",") if k.strip()]
 
     search_repo = SearchRepository(db)
-    MIN_SIM = 0.35  # minimum cosine similarity for related papers (lowered for better recall)
+    # Tightened relevance threshold — 0.35 surfaced loosely-related work, which
+    # diluted the panel into noise. 0.50 keeps only genuinely similar papers
+    # (same sub-area / same problem), and we still fall through to the keyword
+    # path below if the cosine pool is empty so we never silently disappear.
+    MIN_SIM = 0.50
 
     # Prefer the paper's own stored embedding chunk for exact similarity
     chunk_q = await db.execute(

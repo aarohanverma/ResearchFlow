@@ -564,7 +564,10 @@ async def _hypothesize(state: GenieState) -> GenieState:
                     "content": (
                         f"Seed elements: {[c['source'] for c in chunks]}\n"
                         f"Bridge concepts: {bridge_text}\n\n"
-                        f"Context (first 6000 chars):\n{context_text[:6000]}"
+                        # Generous context budget so we don't lose chunk
+                        # evidence, but still bounded so the cheap-model
+                        # prompt doesn't go superlinear on outlier inputs.
+                        f"Context:\n{context_text[:24000]}"
                     ),
                 },
             ],
@@ -637,7 +640,6 @@ async def _hypothesize(state: GenieState) -> GenieState:
             )},
         ],
         llm.quality_model,
-        max_tokens=3000,
         response_format={"type": "json_object"},
     )
 
@@ -864,7 +866,6 @@ async def _elaborate(state: GenieState) -> GenieState:
         ],
         llm.reasoning_model,
         reasoning_effort="high",
-        max_tokens=6000,
         response_format={"type": "json_object"},
     )
 
@@ -1769,7 +1770,6 @@ async def run_deep_dive(capsule_id: str, user_id: str) -> AsyncIterator[str]:
                 {"role": "user", "content": final_user},
             ],
             OpenAIAdapter.reasoning_model,
-            max_tokens=20000,
         ):
             judge_chunks.append(chunk)
             yield f"data: {json.dumps({'chunk': chunk})}\n\n"

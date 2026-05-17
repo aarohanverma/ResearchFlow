@@ -91,29 +91,34 @@ class ScoringService:
         hot = hot_subtopics or []
         cold = cold_subtopics or []
 
-        # Pure SQL score computation — fast, no LLM
+        # Hot/cold boosts perturb the base score by at most ±0.20. Over-fetch
+        # by ~3x so the post-boost re-sort can still surface a hot-tagged
+        # paper that started a few rungs below the unboosted top-K — but
+        # never pull the whole namespace into Python memory just to score+sort.
+        fetch_n = max(limit * 3, 60)
+
+        from sqlalchemy import desc as _desc
+
+        base_expr = (Paper.novelty_score * ow) + (Paper.relevance_score * (1 - ow))
         result = await self._db.execute(
-            select(Paper).where(Paper.namespace_key == namespace_key)
+            select(Paper)
+            .where(Paper.namespace_key == namespace_key)
+            .order_by(_desc(base_expr))
+            .limit(fetch_n)
         )
         papers = list(result.scalars())
 
-        # Pre-compute concept sets once for O(1) per-paper lookup
         hot_set = set(hot)
         cold_set = set(cold)
 
         scored: list[dict] = []
         for p in papers:
             score = p.novelty_score * ow + p.relevance_score * (1 - ow)
-
-            # Concept-based affinity/penalty: check whether any of the paper's
-            # key_concepts overlap with the user's hot or cold concept lists
-            # (populated from liked/dismissed paper concepts via /feed/feedback).
             paper_concepts = set(p.key_concepts or [])
             if hot_set and paper_concepts & hot_set:
                 score += 0.20
             if cold_set and paper_concepts & cold_set:
                 score -= 0.15
-
             scored.append({
                 "paper": p,
                 "score": min(1.0, max(0.0, score)),

@@ -10,7 +10,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # config.py lives at backend/app/core/config.py → project root is 4 levels up
 _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-_ENV_FILE = _PROJECT_ROOT / ".env.local"
+# Accept .env.local (preferred for local dev) and .env (preferred for prod /
+# deploys) so keys land in Settings whichever convention the operator uses.
+# Later entries win, so .env.local overrides .env when both exist.
+_ENV_FILES = [
+    str(_PROJECT_ROOT / ".env"),
+    str(_PROJECT_ROOT / ".env.local"),
+]
 
 
 class Settings(BaseSettings):
@@ -22,7 +28,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=str(_ENV_FILE),
+        env_file=_ENV_FILES,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

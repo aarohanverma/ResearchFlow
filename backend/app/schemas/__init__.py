@@ -65,6 +65,10 @@ class PaperResponse(BaseModel):
     id: UUID
     external_id: str
     namespace_key: str
+    # All topic memberships visible to the user, populated by dedup passes.
+    # When unset, the client treats the row's primary namespace_key as the
+    # sole membership.
+    namespace_keys: list[str] | None = None
     title: str
     authors: list[str]
     abstract: str
@@ -242,6 +246,34 @@ class IdeaCapsuleResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class IdeaCapsuleListItem(BaseModel):
+    """Slim capsule summary for list views.
+
+    Drops the heavy long-form fields (mechanism, predicted_outcome,
+    experimental_design, anti_finding, risks_and_limitations, diagrams,
+    poc_code, deep_dive_content) which are only needed on the detail page.
+    Removing them slashes the /capsules payload size by 10-50x for users
+    with many ideas — the Genie Ideas list goes from "skeleton shimmers
+    for two seconds" to "instant".
+    """
+
+    id: UUID
+    title: str
+    hypothesis: str
+    open_questions: str | None = None
+    novelty_score: float
+    feasibility_score: float
+    impact_score: float
+    status: str
+    is_scout_generated: bool = False
+    source_mode: str = "manual"
+    source_query: str | None = None
+    deep_dive_status: str = "none"
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 class ProviderSettingsRequest(BaseModel):
@@ -270,10 +302,15 @@ class SearchResultItem(BaseModel):
     """A single result item in a hybrid search response."""
 
     paper_id: UUID
+    external_id: str | None = None
     title: str
     abstract: str | None = None
     authors: list[str]
     namespace_key: str
+    # All topic memberships matched by the user's current scope. Populated by
+    # the dedup pass in the search endpoint so the UI can render all relevant
+    # topic tags on a single card.
+    namespace_keys: list[str] | None = None
     source_url: str
     pdf_url: str | None
     novelty_score: float

@@ -171,6 +171,18 @@ class AssistantRepository:
             return False
         session.title = clean
         session.updated_at = datetime.now(timezone.utc)
+        # Mark the title as user-edited so the auto-refresh job stops touching
+        # it. The metadata refresh checks ``state.title_user_edited`` and
+        # leaves the title alone when it is true.
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+            state = dict(session.state or {})
+            state["title_user_edited"] = True
+            state.pop("auto_title", None)
+            session.state = state
+            flag_modified(session, "state")
+        except Exception:
+            pass
         await self._db.flush()
         return True
 

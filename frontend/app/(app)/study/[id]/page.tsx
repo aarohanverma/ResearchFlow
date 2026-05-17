@@ -1,7 +1,12 @@
 "use client";
 
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import MarkdownRenderer, {
+  DecorationsProvider,
+  decorateString,
+  useDecorations,
+} from "@/components/ui/MarkdownRenderer";
+import { useHighlightSearch, HighlightSearchToolbar } from "@/components/ui/HighlightSearch";
 import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
@@ -140,6 +145,12 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
 // ── Inline text with bold, italic, code, and inline math ──────────────────────
 
 function InlineText({ text }: { text: string }) {
+  // Highlights and the keyword-search query reach us via React context, so
+  // bold/italic/code/headings/list items all become highlightable + searchable
+  // without prop-drilling through the half-dozen renderer call sites.
+  const dec = useDecorations();
+  const wrap = (s: string, k: string): React.ReactNode =>
+    dec ? <>{decorateString(s, dec, k)}</> : s;
   // Normalise \(...\) → $...$  before splitting
   const normalised = text.replace(/\\\(([\s\S]+?)\\\)/g, (_m, e) => `$${e}$`);
   const parts = normalised.split(
@@ -151,13 +162,13 @@ function InlineText({ text }: { text: string }) {
         if (/^\*\*[^*]+\*\*$/.test(part))
           return (
             <strong key={i} className="font-semibold text-white">
-              {part.slice(2, -2)}
+              {wrap(part.slice(2, -2), `b${i}`)}
             </strong>
           );
         if (/^\*[^*\n]+\*$/.test(part) && !part.startsWith("**"))
           return (
             <em key={i} className="italic text-gray-200">
-              {part.slice(1, -1)}
+              {wrap(part.slice(1, -1), `i${i}`)}
             </em>
           );
         if (/^`[^`]+`$/.test(part))
@@ -166,7 +177,7 @@ function InlineText({ text }: { text: string }) {
               key={i}
               className="px-1.5 py-0.5 rounded-md bg-gray-800 border border-gray-700/60 text-[12px] font-mono text-indigo-300 mx-0.5"
             >
-              {part.slice(1, -1)}
+              {wrap(part.slice(1, -1), `c${i}`)}
             </code>
           );
         if (/^\$[^$]+\$$/.test(part)) {
@@ -186,7 +197,7 @@ function InlineText({ text }: { text: string }) {
             return <span key={i}>{part}</span>;
           }
         }
-        return part;
+        return <React.Fragment key={i}>{wrap(part, `t${i}`)}</React.Fragment>;
       })}
     </>
   );
@@ -556,6 +567,16 @@ function PaperHero({ paper }: { paper: Paper }) {
         </div>
       )}
 
+      {/* Why this matters — downstream impact, distinct from the TL;DR.
+          Same field surfaced on the Feed quickview so the Study Mode page
+          stays consistent with the rest of the app. */}
+      {paper.implications && (
+        <div className="rounded-2xl bg-indigo-950/20 border border-indigo-900/30 px-5 py-4 mb-4">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-indigo-400 mb-1.5">Why this matters</p>
+          <p className="text-sm text-gray-300 leading-relaxed">{paper.implications}</p>
+        </div>
+      )}
+
       {/* Abstract */}
       <div className="rounded-2xl bg-gray-900/40 border border-gray-800/50 px-5 py-4 mb-5">
         <p className="text-[10px] font-bold uppercase tracking-widest text-gray-600 mb-2.5">Abstract</p>
@@ -617,13 +638,19 @@ function PaperHero({ paper }: { paper: Paper }) {
 
 // ── Loading animation ─────────────────────────────────────────────────────────
 
+// Loader steps mapped to the backend StudyWorkflow nodes (see
+// backend/app/workflows/study.py) — fetch_and_parse → extract_structure →
+// generate_diagrams → assemble_content → find_related → save_summary. Wording
+// is intentionally domain-agnostic so the same loader feels right whether the
+// user is studying a CS paper, an astrophysics preprint, a clinical trial
+// write-up, or a math survey.
 const STUDY_STEPS = [
-  { label: "Fetching paper content",  icon: "📄", desc: "Downloading and parsing the PDF" },
-  { label: "Extracting structure",    icon: "🔍", desc: "Identifying sections and key components" },
-  { label: "Analyzing methodology",  icon: "🧪", desc: "Understanding algorithms and methods" },
-  { label: "Generating study guide",  icon: "✍️",  desc: "Writing detailed explanations" },
-  { label: "Rendering diagrams",      icon: "🖼",  desc: "Creating architecture visualizations" },
-  { label: "Finding related papers",  icon: "🔗", desc: "Searching the knowledge graph" },
+  { label: "Fetching paper",          icon: "📄", desc: "Downloading the source and pulling its full text" },
+  { label: "Extracting structure",    icon: "🔍", desc: "Indexing sections, key terms, and core results" },
+  { label: "Drafting visuals",        icon: "🖼",  desc: "Generating diagrams that match the paper's content" },
+  { label: "Composing walkthrough",   icon: "✍️",  desc: "Writing the level-tailored explanation section by section" },
+  { label: "Linking related work",    icon: "🔗", desc: "Surfacing neighbour papers from your knowledge graph" },
+  { label: "Finalising your guide",   icon: "✨", desc: "Polishing prose, citations, and figure bindings" },
 ];
 
 function StudyLoadingAnimation() {
@@ -1785,6 +1812,12 @@ function StudyContent() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Highlight + keyword search scoped to this paper + level. Persists per
+  // (paperId, level) so switching expertise levels keeps each level's marks
+  // isolated — reading the same paper at "practitioner" vs "expert" depth
+  // produces different highlights.
+  const highlightSearch = useHighlightSearch(`study:${id ?? "_"}:${level}`, !!id);
+
   function onScroll() {
     const el = scrollRef.current;
     if (!el) return;
@@ -1977,14 +2010,29 @@ function StudyContent() {
             <StudyLoadingAnimation />
           )}
 
-          {/* Sections */}
-          <div className="space-y-8">
-            <AnimatePresence initial={false}>
-              {sections.map((section, i) => (
-                <StudySectionBlock key={i} section={section} index={i} />
-              ))}
-            </AnimatePresence>
-          </div>
+          {/* Highlight + keyword-search toolbar — only meaningful once
+              there's actual content rendered, so it stays hidden during
+              loading and on the empty error state. */}
+          {sections.length > 0 && (
+            <div className="mb-4">
+              <HighlightSearchToolbar toolbar={highlightSearch.toolbar} />
+            </div>
+          )}
+
+          {/* Sections — wrapped in the decorations provider so InlineText
+              (which reads from React context) emits highlight + search marks
+              throughout every paragraph, heading, list item, table cell, and
+              callout. The hook's scrollRef anchors mouseup-to-highlight to
+              the section subtree. */}
+          <DecorationsProvider value={highlightSearch.decorations}>
+            <div ref={highlightSearch.scrollRef} className="space-y-8">
+              <AnimatePresence initial={false}>
+                {sections.map((section, i) => (
+                  <StudySectionBlock key={i} section={section} index={i} />
+                ))}
+              </AnimatePresence>
+            </div>
+          </DecorationsProvider>
 
           {/* Error state */}
           {status === "error" && (

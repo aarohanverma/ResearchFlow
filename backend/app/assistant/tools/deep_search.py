@@ -51,7 +51,11 @@ class DeepSearchTool:
     output_schema = DeepSearchOutput
 
     async def run(self, ctx: ToolContext, params: DeepSearchInput) -> ToolResult:
-        from app.api.v1.search import _apply_orientation_nudge, _run_deep_search
+        from app.api.v1.search import (
+            _apply_orientation_nudge,
+            _dedup_results_by_external_id,
+            _run_deep_search,
+        )
 
         await ctx.emit_progress(15, "Running hybrid retrieval")
         ns_keys = params.namespace_keys or ctx.namespace_keys or [ctx.namespace_key]
@@ -68,6 +72,10 @@ class DeepSearchTool:
         raw = [r.model_dump(mode="json") if hasattr(r, "model_dump") else dict(r) for r in rows]
         await ctx.emit_progress(75, "Applying orientation nudge")
         raw = await _apply_orientation_nudge(raw, ctx.user_id, ctx.db, preserve_order=True)
+        # Collapse multi-topic duplicates so the synthesizer sees one entry
+        # per logical paper (with aggregated topic memberships) instead of
+        # three near-identical rows for cross-listed arXiv papers.
+        raw = _dedup_results_by_external_id(raw, scope=ns_keys)
         papers = [_normalize(r) for r in raw[: params.limit]]
 
         await ctx.emit_progress(100, f"Retrieved {len(papers)} papers")
@@ -86,6 +94,7 @@ def _normalize(row: dict) -> dict:
         "abstract": row.get("abstract") or "",
         "authors": row.get("authors") or [],
         "namespace_key": row.get("namespace_key") or "",
+        "namespace_keys": row.get("namespace_keys") or [row.get("namespace_key") or ""],
         "source_url": row.get("source_url") or "",
         "pdf_url": row.get("pdf_url"),
         "published_at": row.get("published_at"),

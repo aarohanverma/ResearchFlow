@@ -2,11 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { BookmarkIcon, ExternalLinkIcon, EyeOffIcon, EyeIcon } from "lucide-react";
+import { BookmarkIcon, ExternalLinkIcon, EyeOffIcon, EyeIcon, UploadIcon } from "lucide-react";
 import type { FeedItem } from "@/types";
 import { cleanAbstract } from "@/lib/utils";
 import { useBookmarksStore } from "@/store/bookmarks";
 import { BookmarkFolderPicker } from "@/components/bookmarks/BookmarkFolderPicker";
+import { topicLabelFor } from "@/store/namespace";
 
 interface Props {
   item: FeedItem;
@@ -65,13 +66,31 @@ export function PaperCard({ item, isSelected, onClick, onFeedback, isHidden, onH
         filter: isHidden ? "saturate(0.5)" : undefined,
       }}
     >
-      {/* Top row */}
+      {/* Top row — show one chip per relevant topic (intersection of paper's
+          memberships and the user's selected topics) with the full topic
+          label. Falls back to the row's own namespace_key. Also surfaces a
+          subtle "Imported" badge when the paper landed via manual import. */}
       <div className="flex items-start justify-between gap-3 mb-3">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-md border"
-            style={{ background: "var(--rf-surface3)", color: "var(--rf-text4)", borderColor: "var(--rf-border2)" }}>
-            {paper.namespace_key}
-          </span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {((paper.namespace_keys && paper.namespace_keys.length > 0) ? paper.namespace_keys : [paper.namespace_key]).map((nsKey) => (
+            <span
+              key={nsKey}
+              title={nsKey}
+              className="text-[10px] font-semibold px-2 py-0.5 rounded-md border"
+              style={{ background: "var(--rf-surface3)", color: "var(--rf-text4)", borderColor: "var(--rf-border2)" }}
+            >
+              {topicLabelFor(nsKey)}
+            </span>
+          ))}
+          {paper.is_manually_imported && (
+            <span
+              title="Manually imported"
+              className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-md border"
+              style={{ background: "rgba(99,102,241,0.10)", color: "#a5b4fc", borderColor: "rgba(99,102,241,0.30)" }}
+            >
+              <UploadIcon size={9} />Imported
+            </span>
+          )}
         </div>
       </div>
 

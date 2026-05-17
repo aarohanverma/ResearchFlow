@@ -218,7 +218,21 @@ class ApiKeysRequest(BaseModel):
 
 @router.get("/api-keys")
 async def get_api_keys(user_id: CurrentUserID, db: DBSession):
-    """Return masked API key status — which keys are set from env vs user override."""
+    """Return masked API key status — which keys are set from env vs user override.
+
+    Reads keys from every plausible source on each call so the UI never
+    shows a stale "not set" for a deployment that exported its env vars
+    after the Python process started:
+
+      1. The cached ``Settings`` singleton (.env / .env.local at boot).
+      2. A fresh ``Settings()`` instance — picks up env vars exported
+         AFTER the process began (e.g. `export OPENAI_API_KEY=… ; uvicorn`
+         where the export happened in the same shell session).
+      3. Direct ``os.environ`` lookup as a final fallback.
+    """
+    import os
+
+    from app.core.config import Settings as _SettingsCls
     from app.core.config import settings as _cfg
 
     repo = UserRepository(db)
@@ -230,11 +244,32 @@ async def get_api_keys(user_id: CurrentUserID, db: DBSession):
         visible = val[:4]
         return visible + "•" * min(len(val) - 4, 24)
 
+    # Build a fresh Settings instance so newly-exported env vars get picked
+    # up without restarting the process. Falls back silently on validation
+    # error.
+    try:
+        live_cfg = _SettingsCls()
+    except Exception:
+        live_cfg = _cfg
+
+    def _resolve(*candidates: str | None) -> str:
+        for c in candidates:
+            if c:
+                return c
+        return ""
+
+    def _from_env(*names: str) -> str:
+        for n in names:
+            v = os.environ.get(n)
+            if v:
+                return v
+        return ""
+
     env_keys = {
-        "openai":    _cfg.openai_api_key,
-        "anthropic": _cfg.anthropic_api_key,
-        "google":    _cfg.google_api_key,
-        "wolfram":   _cfg.wolfram_alpha_app_id,
+        "openai":    _resolve(_cfg.openai_api_key,    live_cfg.openai_api_key,    _from_env("OPENAI_API_KEY")),
+        "anthropic": _resolve(_cfg.anthropic_api_key, live_cfg.anthropic_api_key, _from_env("ANTHROPIC_API_KEY", "CLAUDE_API_KEY")),
+        "google":    _resolve(_cfg.google_api_key,    live_cfg.google_api_key,    _from_env("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY")),
+        "wolfram":   _resolve(_cfg.wolfram_alpha_app_id, live_cfg.wolfram_alpha_app_id, _from_env("WOLFRAM_ALPHA_APP_ID", "WOLFRAM_APP_ID")),
     }
     user_keys = {
         "openai":    ps.encrypted_openai_key    if ps else None,
@@ -522,8 +557,12 @@ async def get_token_usage(
             for d, i, o, c in by_day_rows
         ],
         "by_workflow": [
+            # Empty workflow label means a background pass that didn't tag its
+            # context (e.g. legacy news-ingest jobs). Calling it "Unknown" was
+            # confusing; "Background" is honest and matches what these rows
+            # actually represent.
             {
-                "workflow":      wf or "(unknown)",
+                "workflow":      wf or "Background",
                 "input_tokens":  int(i or 0),
                 "output_tokens": int(o or 0),
                 "total_tokens":  int((i or 0) + (o or 0)),
