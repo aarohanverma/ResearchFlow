@@ -297,6 +297,263 @@ def has_converged(*, before: str, after: str, min_delta: float = 0.05) -> bool:
     return (1.0 - similarity) < min_delta
 
 
+# ─── Evidence-gap extraction ────────────────────────────────────────────────
+
+
+_GAP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "gaps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "string",
+                        "description": (
+                            "The specific claim or topic in the draft that "
+                            "lacks support or coverage."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "A focused retrieval query that, if answered, "
+                            "would close the gap."
+                        ),
+                    },
+                    "source_hint": {
+                        "type": "string",
+                        "enum": ["papers", "web", "either"],
+                        "description": (
+                            "Where the missing evidence likely lives: "
+                            "'papers' for arXiv-style scholarly material, "
+                            "'web' for current-events / industry / docs, "
+                            "'either' when unclear."
+                        ),
+                    },
+                },
+                "required": ["claim", "query"],
+            },
+            "maxItems": 2,
+        }
+    },
+    "required": ["gaps"],
+}
+
+
+async def extract_evidence_gaps(
+    *,
+    query: str,
+    answer: str,
+    issues: list[str],
+    evidence_excerpt: str,
+) -> list[dict[str, str]]:
+    """Turn critique/red-team issue strings into actionable retrieval gaps.
+
+    Returns a list of ``{claim, query, source_hint}`` dicts (max 2). On
+    any failure returns an empty list — caller falls back to rewording-
+    only repair. We deliberately cap at 2 so the worst case is two extra
+    retrieval calls per turn.
+    """
+    if not issues:
+        return []
+    try:
+        from app.adapters.llm import get_llm_adapter
+        llm = get_llm_adapter()
+
+        system = (
+            "You convert reviewer issues about a research-assistant draft "
+            "into concrete RETRIEVAL gaps that, if filled, would close the "
+            "issues. Each gap is a tight focused search query that a "
+            "downstream retrieval tool can run.\n\n"
+            "Rules:\n"
+            "  • Only return a gap when more evidence (paper or web) would "
+            "    materially help. If an issue is purely stylistic (voice, "
+            "    structure, truncation), do not return a gap for it.\n"
+            "  • Each query must be a self-contained, search-engine-style "
+            "    phrase — not a question.\n"
+            "  • Pick the right source_hint: 'papers' for scholarly content, "
+            "    'web' for industry / news / docs / benchmarks, 'either' "
+            "    only when genuinely unclear.\n"
+            "  • Hard cap of 2 gaps. Pick the highest-leverage ones.\n"
+            "  • Return strict JSON matching the schema."
+        )
+        user_msg = (
+            f"USER QUERY:\n{query[:4000]}\n\n"
+            f"ASSISTANT DRAFT:\n{answer[:12000]}\n\n"
+            f"EVIDENCE ALREADY AVAILABLE:\n{evidence_excerpt[:6000]}\n\n"
+            f"REVIEWER ISSUES:\n"
+            + "\n".join(f"  - {s}" for s in issues)
+        )
+        raw = await llm.complete_structured(
+            [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user_msg},
+            ],
+            llm.cheap_model,
+            _GAP_SCHEMA,
+        )
+        if not isinstance(raw, dict):
+            return []
+        gaps_in = raw.get("gaps") or []
+        out: list[dict[str, str]] = []
+        for g in gaps_in[:2]:
+            if not isinstance(g, dict):
+                continue
+            claim = str(g.get("claim") or "").strip()
+            q = str(g.get("query") or "").strip()
+            if not q:
+                continue
+            hint = str(g.get("source_hint") or "either").strip()
+            if hint not in {"papers", "web", "either"}:
+                hint = "either"
+            out.append({"claim": claim[:200], "query": q[:200], "source_hint": hint})
+        return out
+    except Exception as exc:
+        log.debug("extract_evidence_gaps failed: %s", exc)
+        return []
+
+
+async def fetch_gap_evidence(
+    *,
+    user_id,
+    namespace_key: str,
+    namespace_keys: list[str],
+    gap: dict[str, str],
+) -> dict | None:
+    """Run one focused retrieval call against the gap.
+
+    Returns a small dict describing the fresh evidence we found, suitable
+    for splicing into the synthesizer's extra_context block. ``None`` on
+    failure so the caller can move on.
+    """
+    try:
+        hint = gap.get("source_hint", "either")
+        if hint == "web":
+            return await _fetch_web(user_id, namespace_key, namespace_keys, gap["query"])
+        if hint == "papers":
+            return await _fetch_papers(user_id, namespace_key, namespace_keys, gap["query"])
+        # 'either' — try papers first; if that comes back empty, try web.
+        result = await _fetch_papers(user_id, namespace_key, namespace_keys, gap["query"])
+        if result:
+            return result
+        return await _fetch_web(user_id, namespace_key, namespace_keys, gap["query"])
+    except Exception as exc:
+        log.debug("fetch_gap_evidence failed (gap=%s): %s", gap.get("query"), exc)
+        return None
+
+
+async def _make_ctx(user_id, namespace_key: str, namespace_keys: list[str], db):
+    """Construct a minimal ToolContext for one-off tool calls inside repair."""
+    from uuid import UUID
+    from app.assistant.tools.base import ToolContext
+
+    async def _np(_pct: int, _msg: str) -> None:
+        pass
+
+    async def _nc() -> bool:
+        return False
+
+    return ToolContext(
+        user_id=user_id,
+        session_id=UUID(int=0),
+        namespace_key=namespace_key or "",
+        namespace_keys=namespace_keys or ([namespace_key] if namespace_key else []),
+        orientation="both",
+        expertise_level="practitioner",
+        job_id="ra:repair_requery",
+        parent_message_id=UUID(int=0),
+        db=db,
+        emit_progress=_np,
+        should_cancel=_nc,
+    )
+
+
+async def _fetch_papers(user_id, namespace_key, namespace_keys, query: str) -> dict | None:
+    """Targeted paper retrieval. Caller treats output as advisory evidence."""
+    try:
+        from app.assistant.tools.deep_search import DeepSearchInput, DeepSearchTool
+        from app.db.session import async_session_factory
+        async with async_session_factory() as db:
+            ctx = await _make_ctx(user_id, namespace_key, namespace_keys, db)
+            tool = DeepSearchTool()
+            params = DeepSearchInput(
+                query=query,
+                namespace_keys=namespace_keys or [],
+                limit=4,
+                include_arxiv_mcp=True,
+                arxiv_max_results=3,
+            )
+            res = await tool.run(ctx, params)
+            papers = list(res.output.get("papers") or [])
+            if not papers:
+                return None
+            return {"kind": "papers", "query": query, "papers": papers[:5]}
+    except Exception as exc:
+        log.debug("repair re-query papers failed: %s", exc)
+        return None
+
+
+async def _fetch_web(user_id, namespace_key, namespace_keys, query: str) -> dict | None:
+    """Targeted web retrieval — used for industry, news, benchmark gaps."""
+    try:
+        from app.assistant.tools.web_search import WebSearchInput, WebSearchTool
+        from app.db.session import async_session_factory
+        async with async_session_factory() as db:
+            ctx = await _make_ctx(user_id, namespace_key, namespace_keys, db)
+            tool = WebSearchTool()
+            try:
+                params = tool.input_schema(query=query, max_results=4)
+            except Exception:
+                params = WebSearchInput(query=query, max_results=4)
+            res = await tool.run(ctx, params)
+            results = list(res.output.get("results") or [])
+            if not results:
+                return None
+            return {"kind": "web", "query": query, "results": results[:5]}
+    except Exception as exc:
+        log.debug("repair re-query web failed: %s", exc)
+        return None
+
+
+def render_gap_evidence(gap_evidence: list[dict]) -> str:
+    """Render gap-evidence blocks as an XML-tagged appendix for the synth prompt."""
+    if not gap_evidence:
+        return ""
+    parts: list[str] = []
+    for block in gap_evidence:
+        if not isinstance(block, dict):
+            continue
+        if block.get("kind") == "papers":
+            paper_lines: list[str] = []
+            for i, p in enumerate(block.get("papers") or [], start=1):
+                title = (p.get("title") or "").strip()
+                authors = ", ".join((p.get("authors") or [])[:3])
+                tldr = (p.get("tldr") or p.get("abstract") or "")[:400]
+                paper_lines.append(
+                    f"  [{i}] {title}\n      Authors: {authors}\n      {tldr}"
+                )
+            parts.append(
+                f"<gap_evidence kind=\"papers\" query=\"{block.get('query', '')[:120]}\">\n"
+                + "\n".join(paper_lines)
+                + "\n</gap_evidence>"
+            )
+        elif block.get("kind") == "web":
+            web_lines: list[str] = []
+            for r in (block.get("results") or [])[:5]:
+                title = (r.get("title") or "").strip()
+                url = (r.get("url") or "").strip()
+                snippet = (r.get("snippet") or "")[:400]
+                web_lines.append(f"  - {title} — {snippet} ({url})")
+            parts.append(
+                f"<gap_evidence kind=\"web\" query=\"{block.get('query', '')[:120]}\">\n"
+                + "\n".join(web_lines)
+                + "\n</gap_evidence>"
+            )
+    return "\n\n".join(parts)
+
+
 def critique_to_issue_list(critique: dict[str, Any]) -> list[str]:
     """Flatten an LLM critique dict into the same issue-string list shape
     the deterministic check uses, so the synthesizer's existing repair

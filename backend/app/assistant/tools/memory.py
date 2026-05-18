@@ -438,6 +438,47 @@ class MemoryRecallTool:
             medium_items = sorted(medium.items(), key=_sort_key, reverse=True)[:30]
             long_items = sorted(long_mem.items(), key=_sort_key, reverse=True)[:30]
 
+            # Semantic blend: when the caller supplied a meaningful query,
+            # re-rank tree + namespace memory by embedding cosine similarity
+            # to the query, then fuse with the recency ordering above via
+            # reciprocal rank fusion. Falls back transparently to the
+            # recency-only result when the embedder is unavailable.
+            sem_query = (params.query or "").strip()
+            if sem_query and len(sem_query) >= 6:
+                try:
+                    from app.assistant.semantic_memory import (
+                        blend_with_recency,
+                        semantically_rank,
+                    )
+                    sem_medium = await semantically_rank(
+                        query=sem_query,
+                        entries=medium,
+                        session_id=ctx.session_id,
+                        top_k=30,
+                    )
+                    fused_medium = blend_with_recency(
+                        sem_medium,
+                        medium_items,
+                        top_k=30,
+                    )
+                    if fused_medium:
+                        medium_items = [(k, v) for k, v, _ in fused_medium]
+                    sem_long = await semantically_rank(
+                        query=sem_query,
+                        entries=long_mem,
+                        session_id=ctx.session_id,
+                        top_k=30,
+                    )
+                    fused_long = blend_with_recency(
+                        sem_long,
+                        long_items,
+                        top_k=30,
+                    )
+                    if fused_long:
+                        long_items = [(k, v) for k, v, _ in fused_long]
+                except Exception as exc:
+                    log.debug("semantic recall blend skipped: %s", exc)
+
             def _fmt(item: tuple[str, object]) -> dict:
                 k, v = item
                 t = _entry_type(v)

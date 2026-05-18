@@ -24,121 +24,76 @@ log = logging.getLogger(__name__)
 
 _PLANNER_SYSTEM = """You are the planner for ResearchFlow's Research Assistant (RA).
 
-Your job: given the user's query, conversation history, and memory, produce a sharply reasoned, multi-step tool plan. You are a fully agentic research system — always build a real execution plan with at least 1–2 tools. Enrich even simple queries with retrieval, context, and synthesis. Do not shortcut to "pure reasoning" except for pure greetings/acknowledgments.
+You read the user's query, conversation history, memory, and inferred-intent
+signals, and produce a sharply reasoned tool plan. You are a research-grade
+agent — choose the minimum sufficient set of tools that will actually move
+the answer forward. Heavy plans on light queries waste latency; light plans
+on deep queries miss evidence.
 
-ResearchFlow has a slight preference for arXiv as a primary source. For CS/AI/ML/Physics/Math queries, arXiv tools are often the best first step. However, you MUST also use domain-specific and enrichment tools when they are clearly better suited (PubMed for biomedical, INSPIRE HEP for particle physics, NASA ADS for astrophysics, FRED for economics, OEIS for math sequences, etc.). ArXiv is a preference, not a hard constraint — always use the right tool for the job.
+Treat the tool catalogue (provided dynamically in the user message) as
+authoritative. Each tool's ``summary`` field tells you what it does, when
+to use it, and any side effects. There is no fixed intent→tool recipe in
+this prompt because the space of research goals is open-ended; instead,
+reason about the user's actual goal and pick tools whose summaries match.
 
-════════════════════════════════════════
-TOOL CATALOGUE
-════════════════════════════════════════
-
-The full tool catalogue — name, one-paragraph WHAT/WHEN summary, JSON input
-schema, cost class, and side-effect flag — is provided dynamically as
-``Available tools`` in the user message. Each tool's ``summary`` is the
-authoritative reference for that tool's behaviour. Two policies stay inline
-because they apply across tools:
+Two HARD invariants stay inline because they apply across tools:
 
   1. ``genie_synthesize`` and ``media_generate`` are HUMAN-IN-THE-LOOP (see
      policies near the end of this prompt).
-  2. ``graph_build`` is forbidden from RA plans entirely — the knowledge
-     graph is owned by the dedicated /graph page.
-
-(The verbose per-tool prose that used to live here has been removed — it
-duplicated the dynamic catalogue and burned ~1.5k tokens per planner call
-for no marginal accuracy gain.)
+  2. ``graph_build`` is forbidden from RA plans — the knowledge graph is
+     owned by the dedicated /graph page.
 
 
 ════════════════════════════════════════
-DECISION QUICK-REFERENCE
+TOOL SELECTION — PRINCIPLES, NOT A RECIPE
 ════════════════════════════════════════
 
-TOOL SELECTION PRINCIPLES:
-─────────────────────────────────────────────────────────────────────────────
+Read these as soft heuristics for tool selection, never as a fixed routing
+table. The actual choice should follow the user's specific working intent.
 
-INTENT → TOOL MAPPING (read this list first; pick the tool that BEST matches the user's intent):
+• Start with the cheapest tool that could plausibly satisfy the goal.
+  For "explain X" that's usually ``concept_explain`` or ``wikipedia``; for
+  "what's been done on X" it's ``deep_search``; for "what's brand new on X"
+  it's ``frontier_scan``. Cost class matters.
 
-  Intent: "explain a concept / theory / how something works"
-    → concept_explain (single concept) or literature_survey (full landscape)
+• Domain coverage beats arXiv coverage in their respective domains:
+    - biomedical / clinical → ``pubmed``, ``clinicaltrials``
+    - particle / HEP / quantum → ``inspire_hep``
+    - astronomy / astrophysics → ``nasa_ads``
+    - economics / finance series → ``fred``
+    - integer sequences → ``oeis``
+    - security CVE → ``nvd_cve``
+    - implementation / code / models → ``github_search``,
+      ``huggingface_search``, ``papers_with_code``
+    - DOI lookup / OA PDF → ``crossref``, ``unpaywall``
+  arXiv tools remain a useful fallback in those domains.
 
-  Intent: "find papers / discover work on X"
-    → deep_search (corpus + arXiv MCP, default first step)
-    → arxiv_import when corpus is thin or specific landmark papers needed
-    → frontier_scan when the user wants what's NEW (last few weeks)
+• Heavy / side-effect tools (``arxiv_import``, ``paper_import``,
+  ``genie_*``, ``media_generate``) run only when the user clearly asked
+  or retrieval already produced specific targets — never speculatively.
 
-  Intent: "I know which paper(s) I want — ingest these"
-    → paper_import (specific IDs / URLs / pasted citations, max 10)
+• Cache-first tools (``study_paper``, ``genie_deep_dive``) return
+  instantly on a cache hit. Pick them confidently when the intent matches.
 
-  Intent: "give me a guided walkthrough of THIS paper"
-    → study_paper (full Study Mode walkthrough, cached by expertise level)
+• Memory tools: ``memory_recall`` only when continuity / prior context
+  is genuinely needed; ``memory_write`` only when a substantive fact is
+  worth persisting; ``memory_delete`` only on explicit forget requests.
 
-  Intent: "answer a specific question about ONE paper"
-    → paper_qa (RAG over that paper's chunks)
+• Pure greetings / acknowledgments / off-topic → empty ``steps`` array.
 
-  Intent: "compare these papers / methods / models"
-    → compare_papers (structured side-by-side table)
+• ``genie_combine`` needs ≥ 2 previously-saved capsules; chain with
+  ``genie_read`` first when you don't know the parent IDs.
 
-  Intent: "what should I cite for claim X"
-    → citation_finder
-
-  Intent: "draft a related-work / intro / methodology section"
-    → draft_section
-
-  Intent: "summarise the landscape / state of the art"
-    → literature_survey (multi-section structured survey)
-
-  Intent: "explore an existing Genie idea further"
-    → genie_deep_dive (full Deep Dive article, generates one if missing)
-
-  Intent: "what ideas have I generated / show my hypotheses"
-    → genie_read (lightweight capsule list)
-
-  Intent: "synthesise a NEW idea from PAPERS" — strictly HITL, see policy below
-    → genie_synthesize
-
-  Intent: "combine / fuse / merge my saved ideas"
-    → genie_combine (2 or 3 capsule ids → new hybrid capsule; runs feasibility judge first)
-
-  Intent: "what's connected to X in the knowledge graph"
-    → graph_query (only when a graph has been built — check context)
-
-  Intent: "search the web / news / blog posts"
-    → web_search (low-trust, label external in synthesis)
-    → wikipedia for encyclopaedic background
-
-  Intent: "compute / solve / evaluate a math expression"
-    → wolfram_alpha
-
-  Intent: "produce a podcast / slide deck for paper or capsule"
-    → media_generate
-
-  Intent: user referenced an UPLOADED file or URL
-    → parse_context (read its content into the synthesizer)
-
-  Intent: domain-specific search
-    → pubmed (biomedical) · inspire_hep (HEP/nuclear/quantum) · nasa_ads (astro)
-    → fred (economics) · clinicaltrials (medicine) · nvd_cve (security) · oeis (math)
-    → github_search / huggingface_search / papers_with_code (code / models / benchmarks)
-    → crossref / unpaywall (DOI / open-access PDFs) · research_trends (publication trends)
-    → citation_finder (find papers to cite for a claim) · latex_parse (parse a LaTeX source URL)
-
-  Memory tools:
-    → memory_recall — only when continuity / prior context is needed
-    → memory_write — only when a substantive fact is worth persisting
-    → memory_delete — only when the user explicitly asks to forget something
-
-  Pure greeting / acknowledgment / off-topic:
-    → empty steps (no tools).
+When you have an explicit ``Research brief`` or ``Inferred working intent``
+block above the conversation history, treat those as STRONG hints about
+the user's goal — they were composed exactly to sharpen your choice. They
+are still hints, not commands; deviate when the evidence justifies it.
 
 DISCIPLINE:
-• PICK MINIMUM SUFFICIENT SET. Two well-chosen tools beat six speculative ones.
-• Don't bundle tools "just in case". Every step costs latency + tokens.
-• If two intents are both possible, sequence them: heavier retrieval first, then concept_explain / draft / compare on top of the retrieved corpus.
-• Domain hint: when the namespace is q-bio/q-bio.*, START with pubmed; for astro-ph, START with nasa_ads; for hep-*, START with inspire_hep; for econ/q-fin, START with fred. arXiv tools remain fallback in those domains.
-• Side-effect tools (`arxiv_import`, `paper_import`, `genie_*`, `media_generate`) run when the user clearly asked OR when retrieval has yielded specific targets — never speculatively.
-• `study_paper` and `genie_deep_dive` are cache-first: re-asking the same paper at the same expertise level returns instantly. Pick them confidently when the intent matches.
-• `genie_combine` requires AT LEAST TWO previously-saved capsules. Do not invoke it from an empty session — chain with `genie_read` first if you need to discover the parent ids.
-
-Always reason about which combination of tools best serves the specific query — do not follow a fixed recipe.
+• Minimum sufficient set. Two well-chosen tools beat six speculative ones.
+• Don't bundle "just in case". Every step costs latency + tokens.
+• Heavier retrieval first; analysis/synthesis/comparison on top of it.
+• Run independent lookups in parallel (``parallel: true``).
 
 ════════════════════════════════════════
 MEMORY MANAGEMENT POLICY
@@ -365,6 +320,7 @@ class LLMPlanner:
         memory: dict | None = None,
         disabled_tools: set[str] | None = None,
         research_brief: str | None = None,
+        intent_hint: str | None = None,
     ) -> Plan:
         """Async planner — calls the LLM with adaptive compute based on query complexity."""
         # Pass namespace_key so only tools visible for this namespace are shown.
@@ -390,6 +346,7 @@ class LLMPlanner:
                 memory=memory or {},
                 complexity=complexity,
                 research_brief=research_brief,
+                intent_hint=intent_hint,
             )
             messages = [
                 {"role": "system", "content": _PLANNER_SYSTEM},
@@ -434,6 +391,7 @@ class LLMPlanner:
         memory: dict | None = None,
         complexity: str = "medium",
         research_brief: str | None = None,
+        intent_hint: str | None = None,
     ) -> str:
         recent = history[-14:] if history else []
         history_blob = "\n".join(
@@ -555,6 +513,13 @@ class LLMPlanner:
                 "around this, do not contradict it):\n"
                 + research_brief + "\n"
             )
+        intent_blob = ""
+        if intent_hint:
+            intent_blob = (
+                "\nInferred working intent (advisory — let it sharpen tool "
+                "selection only when it clearly applies):\n"
+                + intent_hint + "\n"
+            )
         return (
             f"User request: {query}\n"
             f"Query complexity: {complexity} — {depth_hint}\n"
@@ -562,6 +527,7 @@ class LLMPlanner:
             f"Topic scope: {', '.join(namespace_keys) or namespace_key}\n"
             f"User profile (soft bias): expertise={expertise}, orientation={orientation}\n"
             f"{pack_blob}"
+            f"{intent_blob}"
             f"{brief_blob}"
             f"{memory_blob}"
             f"\nConversation history (most recent last):\n{history_blob or '(no prior turns)'}\n"

@@ -237,17 +237,108 @@ class Orchestrator:
                 memory={**tree_memory, **short_memory},
             )
 
-            # Compute complexity for adaptive model routing in planner + synthesizer.
+            # ── Intent inference (advisory) ──────────────────────────────
+            # A cheap-model pass that reads the query in context and returns
+            # soft signals: complexity hint, useful capability families,
+            # user posture, response-shape hints, optional clarification.
+            # Every consumer treats this as a NUDGE — falls back gracefully.
+            try:
+                from app.assistant.intent import infer_intent, render_intent_hint
+                intent = await infer_intent(
+                    query=query,
+                    history=history,
+                    memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
+                    namespace_key=primary_ns,
+                    user_expertise=expertise,
+                    user_orientation=orientation,
+                )
+                intent_hint_text = render_intent_hint(intent)
+            except Exception:
+                log.debug("intent inference failed; proceeding without")
+                intent = None
+                intent_hint_text = ""
+
+            # ── Active clarification gate ────────────────────────────────
+            # When the inferer flagged genuine ambiguity AND nothing in
+            # memory or history disambiguates, surface ONE clarifying
+            # question and stop the heavy pipeline. Cheap, optional,
+            # biased toward proceeding.
+            try:
+                from app.assistant.clarify import (
+                    render_clarification_message,
+                    should_ask,
+                )
+                clarification_needed = should_ask(
+                    intent=intent,
+                    query=query,
+                    history=history,
+                    memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
+                )
+            except Exception:
+                clarification_needed = False
+            if clarification_needed and intent is not None:
+                try:
+                    msg_body = render_clarification_message(intent)
+                    await self._finalize_clarification(job_id, task, msg_body, intent)
+                    # Telemetry — fire-and-forget.
+                    try:
+                        from app.assistant.telemetry import record_turn_outcome
+                        await record_turn_outcome(
+                            session_id=task.session_id,
+                            user_id=task.user_id,
+                            intent_label=intent.label,
+                            intent_confidence=intent.confidence,
+                            complexity=intent.complexity,
+                            tool_sequence=[],
+                            clarification_asked=True,
+                            repair_fired=False,
+                            redteam_severity=None,
+                            duration_ms=0,
+                            citation_count=0,
+                            grounded_paper_count=0,
+                        )
+                    except Exception:
+                        pass
+                    return
+                except Exception:
+                    log.debug("clarification finaliser failed; proceeding to plan instead")
+
+            # ── Complexity-routed pipeline ───────────────────────────────
+            # Use the intent's complexity hint when available; fall back to
+            # the legacy heuristic otherwise. Three tiers drive downstream
+            # decisions:
+            #   trivial → no Research Brief, no critique, no red-team,
+            #             skip improvisation. Fast path.
+            #   single  → no Research Brief, single plan-execute-synth
+            #             cycle, deterministic check only on synth.
+            #   deep    → full pre-planning brief, critique, red-team,
+            #             gap-driven re-querying, convergence-checked
+            #             repair.
             from app.assistant.planner_llm import _assess_query_complexity
-            query_complexity = _assess_query_complexity(query, history)
+            intent_complexity = (intent.complexity if intent else "") or ""
+            heuristic_complexity = _assess_query_complexity(query, history)
+            tier_map_intent = {"trivial": "trivial", "single": "single", "deep": "deep"}
+            tier_map_heur = {"simple": "single", "medium": "single", "complex": "deep"}
+            depth_tier = (
+                tier_map_intent.get(intent_complexity)
+                or tier_map_heur.get(heuristic_complexity, "single")
+            )
+            # Map the depth tier back to the model-routing label the
+            # synthesizer already understands.
+            query_complexity = {
+                "trivial": "simple",
+                "single":  "medium",
+                "deep":    "complex",
+            }[depth_tier]
+            skip_reflection = depth_tier in {"trivial", "single"}
 
             # ── Research Brief Agent ─────────────────────────────────────
-            # For substantive turns, crystallise the user's intent into a
+            # For deep turns, crystallise the user's intent into a
             # structured brief that the planner consumes alongside the
-            # rewritten query. Trivial greetings skip this pass entirely.
+            # rewritten query. Trivial / single tiers skip this pass.
             research_brief: dict | None = None
             brief_text = ""
-            if query_complexity in ("medium", "complex"):
+            if depth_tier == "deep":
                 try:
                     from app.assistant.research_brief import (
                         compose_research_brief,
@@ -284,11 +375,46 @@ class Orchestrator:
                     memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
                     disabled_tools=disabled_tools,
                     research_brief=brief_text or None,
+                    intent_hint=intent_hint_text or None,
                 )
             else:
                 plan = self._planner.plan(
                     query=rewritten_query, namespace_key=primary_ns, namespace_keys=namespace_keys,
                 )
+
+            # ── Compose response shape (advisory) ────────────────────────
+            # A small dict describing voice / depth / structure / lens
+            # the synthesizer can splice as soft prompt guidance. Best-
+            # effort; falls back to a conservative default.
+            try:
+                from app.assistant.persona import (
+                    compose_response_shape,
+                    render_shape_hint,
+                )
+                response_shape = await compose_response_shape(
+                    query=query,
+                    intent=intent,
+                    history=history,
+                    user_expertise=expertise,
+                    user_orientation=orientation,
+                    memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
+                )
+                shape_hint_text = render_shape_hint(response_shape)
+            except Exception:
+                response_shape = None
+                shape_hint_text = ""
+
+            # Carry advisory blocks + depth tier across to _finalize_turn.
+            try:
+                task._intent_hint_text = intent_hint_text  # type: ignore[attr-defined]
+                task._shape_hint_text = shape_hint_text    # type: ignore[attr-defined]
+                task._depth_tier = depth_tier              # type: ignore[attr-defined]
+                task._skip_reflection = skip_reflection    # type: ignore[attr-defined]
+                task._intent_label = (intent.label if intent else "")  # type: ignore[attr-defined]
+                task._intent_confidence = (intent.confidence if intent else 0.5)  # type: ignore[attr-defined]
+                task._turn_started_at = datetime.now(timezone.utc)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
             pure_reasoning = len(plan.steps) == 0
             self._publish(job_id, "plan_committed", {
@@ -1082,6 +1208,9 @@ class Orchestrator:
         # every turn. The memory views are stashed on the task object's
         # session by ``_load_context`` and forwarded through ``run_turn``.
         memory_view = getattr(task, "_assistant_memory", None) or {}
+        intent_hint = getattr(task, "_intent_hint_text", "") or ""
+        shape_hint = getattr(task, "_shape_hint_text", "") or ""
+        skip_reflection = bool(getattr(task, "_skip_reflection", False))
         answer = await synthesize_answer(
             query=query,
             papers=papers,
@@ -1095,6 +1224,12 @@ class Orchestrator:
             extra_results=results,
             complexity=complexity,
             memory=memory_view,
+            intent_hint=intent_hint,
+            shape_hint=shape_hint,
+            namespace_key=task.namespace_key or "",
+            namespace_keys=[task.namespace_key] if task.namespace_key else [],
+            user_id=task.user_id,
+            skip_reflection=skip_reflection,
             on_delta=_on_delta,
         )
 
@@ -1293,6 +1428,44 @@ class Orchestrator:
                 t.add_done_callback(lambda _t: (_log_task_exc(_t, "auto_memory"), self._post_turn_tasks.discard(_t)))
         except Exception:
             log.exception("failed to schedule auto-memory consolidation job=%s", job_id)
+
+        # ── Outcome telemetry ──────────────────────────────────────────────
+        # Append a small record summarising this turn for future policy
+        # learning + quality dashboards. Pure DB write, fire-and-forget.
+        try:
+            from app.assistant.telemetry import record_turn_outcome
+
+            tool_sequence = [s.tool for s in plan.steps]
+            started_at = getattr(task, "_turn_started_at", None)
+            duration_ms = 0
+            if started_at:
+                try:
+                    duration_ms = int(
+                        (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
+                    )
+                except Exception:
+                    duration_ms = 0
+            t = asyncio.create_task(
+                record_turn_outcome(
+                    session_id=task.session_id,
+                    user_id=task.user_id,
+                    intent_label=getattr(task, "_intent_label", "") or "",
+                    intent_confidence=float(getattr(task, "_intent_confidence", 0.5) or 0.5),
+                    complexity=getattr(task, "_depth_tier", complexity),
+                    tool_sequence=tool_sequence,
+                    clarification_asked=False,
+                    repair_fired=False,
+                    redteam_severity=None,
+                    duration_ms=duration_ms,
+                    citation_count=len(citations),
+                    grounded_paper_count=len(papers),
+                ),
+                name=f"ra:telemetry:{job_id}",
+            )
+            self._post_turn_tasks.add(t)
+            t.add_done_callback(lambda _t: (_log_task_exc(_t, "telemetry"), self._post_turn_tasks.discard(_t)))
+        except Exception:
+            log.debug("telemetry post-turn schedule failed job=%s", job_id)
 
         self._publish(job_id, "message_completed", {
             "message_id": str(task.assistant_message_id),
@@ -1572,6 +1745,59 @@ class Orchestrator:
         return collected[:12]
 
     # ── Off-topic short-circuit ──────────────────────────────────────────
+
+    async def _finalize_clarification(
+        self,
+        job_id: str,
+        task: AssistantTask,
+        body: str,
+        intent: Any,
+    ) -> None:
+        """Persist a single clarifying-question message and end the turn.
+
+        Used when the intent inferer reports genuine ambiguity that one
+        short question would resolve. Avoids the cost of plan-execute-synth
+        on a query whose target the agent doesn't actually understand yet.
+        """
+        async with async_session_factory() as db:
+            repo = AssistantRepository(db)
+            if task.assistant_message_id:
+                await repo.update_message(
+                    task.assistant_message_id,
+                    content=body,
+                    payload={
+                        "status": "completed",
+                        "blocks": [{"kind": "text", "content": body}],
+                        "clarification": True,
+                        "intent_label": getattr(intent, "label", ""),
+                    },
+                    message_type="clarification",
+                )
+            await repo.update_task(
+                job_id,
+                status=AssistantTaskStatus.completed,
+                progress={
+                    "stage": "completed",
+                    "percent": 100,
+                    "summary": "Clarifying question asked",
+                },
+                result={"clarification": True},
+                completed=True,
+            )
+            await db.commit()
+        await get_job_store().update(job_id, {
+            "status": "completed",
+            "summary": "Clarifying question asked",
+        })
+        self._publish(job_id, "message_completed", {
+            "message_id": str(task.assistant_message_id) if task.assistant_message_id else "",
+            "clarification": True,
+        })
+        self._publish(job_id, "task_completed", {"summary": "Clarifying question asked"})
+        try:
+            self._bus.close(job_id)
+        except Exception:
+            pass
 
     async def _finalize_off_topic(self, job_id: str, task: AssistantTask, query: str) -> None:
         """Persist a polite redirect message and complete the task without running any tools."""

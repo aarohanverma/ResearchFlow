@@ -128,6 +128,12 @@ async def synthesize_answer(
     actions: list[str],
     extra_results: dict | None = None,
     memory: dict | None = None,
+    intent_hint: str = "",
+    shape_hint: str = "",
+    namespace_key: str = "",
+    namespace_keys: list[str] | None = None,
+    user_id: Any | None = None,
+    skip_reflection: bool = False,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Return a grounded research-workspace answer or a deterministic fallback."""
@@ -158,6 +164,13 @@ async def synthesize_answer(
             memory_block = _build_memory_block(mem_d)
     if memory_block:
         extra_context = (memory_block + "\n\n" + extra_context).strip() if extra_context else memory_block
+    # Splice the inferred intent + response shape as soft advisory blocks.
+    # Both are advisory — the synthesizer is free to deviate when the
+    # content benefits.
+    if intent_hint:
+        extra_context = (intent_hint + "\n\n" + extra_context).strip() if extra_context else intent_hint
+    if shape_hint:
+        extra_context = (shape_hint + "\n\n" + extra_context).strip() if extra_context else shape_hint
     fallback = _fallback_answer(query, papers, imported_count, graph_result, genie_session_id)
 
     grounded = bool(papers)
@@ -225,15 +238,21 @@ async def synthesize_answer(
         # answer without the UI seeing the original and the repaired version.
         from app.assistant.reflection import (
             critique_to_issue_list,
+            extract_evidence_gaps,
+            fetch_gap_evidence,
             has_converged,
             llm_critique,
             red_team_review,
             redteam_to_issue_list,
+            render_gap_evidence,
         )
 
         evidence_for_judge = (context + "\n\n" + extra_context)
         issues = _self_check_answer(answer, papers=papers, arxiv_results=arxiv_results)
-        if not issues and (grounded or complexity == "complex"):
+        # Skip every reflection layer when the caller flagged this as a
+        # trivial / single-cycle turn that doesn't earn the extra latency.
+        run_reflection = (not skip_reflection)
+        if run_reflection and not issues and (grounded or complexity == "complex"):
             try:
                 critique = await llm_critique(
                     query=query,
@@ -254,7 +273,7 @@ async def synthesize_answer(
 
         # Red-team only when grounded AND complex — burning a third
         # cheap-model pass on simple lookups is not worth the latency.
-        if grounded and complexity == "complex":
+        if run_reflection and grounded and complexity == "complex":
             try:
                 redteam = await red_team_review(
                     query=query,
@@ -270,21 +289,79 @@ async def synthesize_answer(
             except Exception as exc:
                 log.debug("red-team review skipped: %s", exc)
 
-        if issues:
+        if run_reflection and issues:
             log.info("synth self-check found issues — repairing: %s", "; ".join(issues))
             try:
-                repair_msg = (
-                    "Your previous draft had these issues:\n  - "
-                    + "\n  - ".join(issues)
-                    + "\n\nProduce a corrected answer. Use ONLY citation indices that "
-                    "actually exist in the evidence block. Complete every sentence. "
-                    "Do not add new claims you can't ground in the evidence."
-                )
-                repair_messages = [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": answer},
-                    {"role": "user", "content": repair_msg},
-                ]
+                # ── Gap-driven re-querying (deep cycle only) ─────────────
+                # When the issues describe evidential gaps and we have the
+                # tooling to chase them, fire 1–2 targeted retrievals first,
+                # splice the new material into the prompt, and let the
+                # model write a NEW answer with stronger grounding before
+                # the rewording-only repair runs as a fallback.
+                gap_evidence: list[dict] = []
+                if user_id is not None and complexity == "complex" and not pure_reasoning:
+                    try:
+                        gaps = await extract_evidence_gaps(
+                            query=query,
+                            answer=answer,
+                            issues=issues,
+                            evidence_excerpt=evidence_for_judge,
+                        )
+                        for gap in gaps:
+                            block = await fetch_gap_evidence(
+                                user_id=user_id,
+                                namespace_key=namespace_key,
+                                namespace_keys=namespace_keys or [],
+                                gap=gap,
+                            )
+                            if block:
+                                gap_evidence.append(block)
+                    except Exception as exc:
+                        log.debug("gap re-querying skipped: %s", exc)
+
+                if gap_evidence:
+                    log.info("synth repair: re-querying surfaced %d new evidence block(s)", len(gap_evidence))
+                    fresh_block = render_gap_evidence(gap_evidence)
+                    augmented_extra = (
+                        (extra_context + "\n\n" if extra_context else "")
+                        + "── Additional evidence from gap re-querying ──\n"
+                        + fresh_block
+                    )
+                    augmented_prompt = _build_prompt(
+                        query=query, context=context, extra_context=augmented_extra,
+                        actions=actions, imported_count=imported_count,
+                        graph_result=graph_result, genie_session_id=genie_session_id,
+                        orientation=orientation, expertise=expertise,
+                        grounded=grounded, pure_reasoning=pure_reasoning,
+                    )
+                    repair_msg = (
+                        "Your previous draft had these issues:\n  - "
+                        + "\n  - ".join(issues)
+                        + "\n\nFresh evidence has been added below the original evidence "
+                        "block — under '── Additional evidence from gap re-querying ──'. "
+                        "Use it to write a CORRECTED answer that closes the gaps. "
+                        "Cite only what exists in the merged evidence. Complete every "
+                        "sentence. Do not invent claims beyond the evidence."
+                    )
+                    repair_messages = [
+                        {"role": "user", "content": augmented_prompt},
+                        {"role": "assistant", "content": answer},
+                        {"role": "user", "content": repair_msg},
+                    ]
+                else:
+                    repair_msg = (
+                        "Your previous draft had these issues:\n  - "
+                        + "\n  - ".join(issues)
+                        + "\n\nProduce a corrected answer. Use ONLY citation indices that "
+                        "actually exist in the evidence block. Complete every sentence. "
+                        "Do not add new claims you can't ground in the evidence."
+                    )
+                    repair_messages = [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": answer},
+                        {"role": "user", "content": repair_msg},
+                    ]
+
                 if pure_reasoning:
                     res2 = await llm.complete(
                         repair_messages, llm.quality_model,
@@ -300,11 +377,13 @@ async def synthesize_answer(
                 if repaired and not _self_check_answer(
                     repaired, papers=papers, arxiv_results=arxiv_results
                 ):
-                    # Convergence guard: if the repaired draft is barely
-                    # different from the original (Jaccard ~ identical),
-                    # the repair pass didn't add value — keep the original.
-                    # When it IS materially different, accept the repair.
-                    if has_converged(before=answer, after=repaired):
+                    # Convergence guard: when the repaired draft is barely
+                    # different from the original (Jaccard ~ identical) AND
+                    # we did NOT re-query (no genuinely new evidence), the
+                    # repair didn't add value — keep the original. When new
+                    # evidence was added, always accept the repair so the
+                    # extra citations make it through.
+                    if not gap_evidence and has_converged(before=answer, after=repaired):
                         log.debug("repair converged with no material change — keeping original")
                     else:
                         answer = repaired
