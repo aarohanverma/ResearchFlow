@@ -163,25 +163,69 @@ def _normalize_key(raw: str) -> str:
     return s[:120] or "memory"
 
 
-async def _resolve_root_session(db, session_id):
-    """Walk ``parent_session_id`` pointers to the root of the branch tree.
+async def _resolve_root_session_id(db, session_id):
+    """Return the root session UUID via a single recursive CTE.
 
-    Bounded at 20 hops as a cycle guard — a real branch tree is rarely more
-    than 3-4 levels deep, so 20 is a generous safety net.
+    Replaces the per-hop ``db.get(...)`` walk so root resolution stays
+    O(1) DB roundtrips regardless of how deeply branches are nested.
+    The CTE is bounded to 20 levels as a cycle guard.
+
+    Returns:
+        The root ``UUID`` if the chain resolves, else ``session_id`` so
+        callers can treat a missing row as "self is root" without an
+        extra null check.
     """
-    seen: set = set()
-    current = await db.get(AssistantSession, session_id)
-    if current is None:
+    from sqlalchemy import text as _text
+    try:
+        result = await db.execute(
+            _text(
+                """
+                WITH RECURSIVE chain(id, parent_session_id, depth) AS (
+                    SELECT id, parent_session_id, 0
+                    FROM assistant_sessions WHERE id = :start
+                    UNION ALL
+                    SELECT a.id, a.parent_session_id, c.depth + 1
+                    FROM assistant_sessions a
+                    JOIN chain c ON a.id = c.parent_session_id
+                    WHERE c.depth < 20
+                )
+                SELECT id FROM chain ORDER BY depth DESC LIMIT 1
+                """
+            ),
+            {"start": session_id},
+        )
+        row = result.first()
+        return row[0] if row else session_id
+    except Exception:
+        # Fall back to the original walk on any error (e.g. stub DB in tests).
+        seen: set = set()
+        current = await db.get(AssistantSession, session_id)
+        if current is None:
+            return session_id
+        for _ in range(20):
+            if current.parent_session_id is None or current.parent_session_id in seen:
+                return current.id
+            seen.add(current.id)
+            nxt = await db.get(AssistantSession, current.parent_session_id)
+            if nxt is None:
+                return current.id
+            current = nxt
+        return current.id
+
+
+async def _resolve_root_session(db, session_id):
+    """Return the root ``AssistantSession`` ORM row via :func:`_resolve_root_session_id`.
+
+    Kept as a thin convenience for callers that need the full row (e.g.
+    they're about to mutate state). New code should prefer
+    :func:`_resolve_root_session_id` when only the UUID is needed — it
+    avoids the second SELECT and the message/task selectinloads that
+    come with a full row fetch.
+    """
+    rid = await _resolve_root_session_id(db, session_id)
+    if rid is None:
         return None
-    for _ in range(20):
-        if current.parent_session_id is None or current.parent_session_id in seen:
-            return current
-        seen.add(current.id)
-        nxt = await db.get(AssistantSession, current.parent_session_id)
-        if nxt is None:
-            return current
-        current = nxt
-    return current
+    return await db.get(AssistantSession, rid)
 
 
 def _evict_to_cap(mem: dict, cap: int) -> dict:
@@ -282,25 +326,45 @@ class MemoryWriteTool:
     output_schema = MemoryWriteOutput
 
     async def run(self, ctx: ToolContext, params: MemoryWriteInput) -> ToolResult:
+        from app.assistant.state_lock import session_state_lock
+
         mem_type = params.memory_type if params.memory_type in _VALID_TYPES else "context"
         norm_key = _normalize_key(params.key)
         tier = _SCOPE_ALIASES.get(params.scope, "medium")
         bucket = _SCOPE_TO_BUCKET[tier]
         await ctx.emit_progress(30, f"Storing {tier}-tier [{mem_type}] memory: {norm_key!r}")
         try:
-            async with ctx.db.begin_nested():
-                # ``short`` and ``long`` write to the current session. ``medium``
-                # always writes to the ROOT of the session tree so the whole
-                # tree (parent + every branch) sees the same store.
-                current = await ctx.db.get(AssistantSession, ctx.session_id)
-                if current is None:
+            # ``short`` and ``long`` write to the current session. ``medium``
+            # always writes to the ROOT of the session tree so the whole
+            # tree (parent + every branch) sees the same store.
+            #
+            # We resolve the target BEFORE acquiring the lock so we know
+            # which session lock to take (the target's), then re-fetch the
+            # row inside the lock and re-read its state. Skipping the
+            # in-lock refresh let sibling-branch ``memory_write`` calls
+            # silently overwrite each other when both touched the same
+            # root's ``tree_memory`` simultaneously.
+            target_id = (
+                await _resolve_root_session_id(ctx.db, ctx.session_id)
+                if tier == "medium"
+                else ctx.session_id
+            )
+            if target_id is None:
+                target_id = ctx.session_id
+
+            async with session_state_lock(target_id), ctx.db.begin_nested():
+                # Re-fetch target inside the lock.
+                target = await ctx.db.get(AssistantSession, target_id)
+                if target is None:
                     return ToolResult(
                         output={"stored": False, "scope": tier, "key": norm_key, "memory_type": mem_type},
                         summary="session not found",
                     )
-                target = await _resolve_root_session(ctx.db, ctx.session_id) if tier == "medium" else current
-                if target is None:
-                    target = current
+                await ctx.db.refresh(target)
+                current = (
+                    target if target.id == ctx.session_id
+                    else await ctx.db.get(AssistantSession, ctx.session_id)
+                ) or target
 
                 state = dict(target.state or {})
                 mem = dict(state.get(bucket) or {})
@@ -365,9 +429,11 @@ class MemoryRecallOutput(BaseModel):
     short: dict = {}
     medium: dict
     long: dict
+    branches: dict = {}
     total_short: int = 0
     total_medium: int
     total_long: int
+    total_branches: int = 0
 
 
 class MemoryRecallTool:
@@ -391,6 +457,7 @@ class MemoryRecallTool:
 
     async def run(self, ctx: ToolContext, params: MemoryRecallInput) -> ToolResult:
         await ctx.emit_progress(50, "Recalling research memory")
+        branches_out: dict = {}
         try:
             row = await ctx.db.get(AssistantSession, ctx.session_id)
             state = dict(row.state or {}) if row else {}
@@ -400,6 +467,45 @@ class MemoryRecallTool:
             root = await _resolve_root_session(ctx.db, ctx.session_id) if row else None
             root_state = dict(root.state or {}) if root else {}
             medium = dict(root_state.get("tree_memory") or {})
+
+            # ── Branch progress ──────────────────────────────────────────
+            # Expose what each branch of this session (parent view) — or each
+            # sibling branch (branch view) — has explored. Without this the
+            # planner cannot answer questions like "what did we find in the
+            # branched chats?": memory_recall would return 0/0/0 even when
+            # the parent's state already carries fresh branch summaries.
+            self_branches = dict(state.get("branch_summaries") or {})
+            parent_branches: dict = {}
+            if row and row.parent_session_id:
+                parent = await ctx.db.get(AssistantSession, row.parent_session_id)
+                if parent is not None:
+                    pstate = dict(parent.state or {})
+                    parent_branches = {
+                        bid: e for bid, e in (pstate.get("branch_summaries") or {}).items()
+                        if bid != str(ctx.session_id)  # exclude self
+                    }
+            # Merge: self branches first (this node's direct children), then
+            # sibling branches from the parent. Caller filter by ``query``
+            # still applies so the planner can scope by topic.
+            merged: dict = {}
+            merged.update(self_branches)
+            for bid, e in parent_branches.items():
+                merged.setdefault(bid, e)
+
+            q_branches = (params.query or "").lower()
+            for bid, entry in merged.items():
+                summary = (entry.get("summary") or "").strip()
+                title = (entry.get("title") or "Branch").strip()
+                if not summary:
+                    continue
+                if q_branches and q_branches not in summary.lower() and q_branches not in title.lower():
+                    continue
+                branches_out[bid] = {
+                    "title": title,
+                    "summary": summary,
+                    "updated_at": entry.get("updated_at"),
+                    "last_message_id": entry.get("last_message_id"),
+                }
             # Backwards compat: pick up legacy ``memory`` writes from before
             # the tree-memory migration. Treat them as tree-tier so they
             # surface to the planner; never write back to the legacy key.
@@ -502,17 +608,21 @@ class MemoryRecallTool:
 
         await ctx.emit_progress(
             100,
-            f"Recalled {len(short_out)} chat + {len(medium_out)} tree + {len(long_out)} namespace memories",
+            f"Recalled {len(short_out)} chat + {len(medium_out)} tree + "
+            f"{len(long_out)} namespace + {len(branches_out)} branch memories",
         )
         return ToolResult(
             output={
                 "short": short_out, "medium": medium_out, "long": long_out,
+                "branches": branches_out,
                 "total_short": len(short_out),
                 "total_medium": len(medium_out),
                 "total_long": len(long_out),
+                "total_branches": len(branches_out),
             },
             summary=(
-                f"{len(short_out)} chat · {len(medium_out)} tree · {len(long_out)} namespace memories"
+                f"{len(short_out)} chat · {len(medium_out)} tree · "
+                f"{len(long_out)} namespace · {len(branches_out)} branches"
             ),
         )
 

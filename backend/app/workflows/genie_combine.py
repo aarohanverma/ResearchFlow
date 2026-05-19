@@ -194,11 +194,11 @@ FORMATTING — the renderer supports full GitHub-flavored markdown:
 Return ONLY a JSON object with this exact shape:
 {
   "title": "concise specific title (≤ 100 chars)",
-  "statement": "the falsifiable hypothesis in one paragraph",
-  "rationale": "why this fusion is non-trivial — grounded in all parents",
-  "mechanism": "step-by-step causal mechanism in 4-8 sentences",
-  "predicted_outcome": "what we expect to observe and why",
-  "experimental_design": "concrete protocol — controls, metrics, baselines, ablations, deliverables",
+  "statement": "ONE plain-prose sentence stating the falsifiable claim. ≤ 30 words. NO markdown (no **bold**, no `code`, no italics). This is the TL;DR shown on idea cards — keep it tight. Detail goes into mechanism/predicted_outcome/experimental_design, NOT here.",
+  "rationale": "why this fusion is non-trivial — grounded in all parents (full markdown allowed here)",
+  "mechanism": "step-by-step causal mechanism in 4-8 sentences (markdown allowed)",
+  "predicted_outcome": "what we expect to observe and why (markdown allowed)",
+  "experimental_design": "concrete protocol — controls, metrics, baselines, ablations, deliverables (markdown allowed)",
   "anti_finding": "the single result that would falsify this hypothesis",
   "risks_and_limitations": "1-2 paragraphs naming ≥ 3 specific threats",
   "open_questions": ["question 1", "question 2", "question 3"],
@@ -421,6 +421,61 @@ async def _node_load(state: CombineState) -> CombineState:
             "One or more capsules not found (or not owned by this user)."
         )
         return state
+
+    # Ancestor cycle guard: a combined capsule must never be combined again
+    # with any capsule in its own ancestry. Otherwise the same parent idea
+    # would compound in subsequent fusions and we'd lose novelty quickly.
+    # We walk each chosen capsule's ``seed_element_ids`` recursively through
+    # GenieElement → IdeaCapsule links to build its ancestor set, then reject
+    # if any pair (a, b) has a ∈ ancestors(b) or b ∈ ancestors(a).
+    chosen_ids = {c.id for c in capsules if c is not None}
+    async with async_session_factory() as db:
+        ancestors: dict[UUID, set[UUID]] = {}
+        for cap in capsules:
+            if cap is None:
+                continue
+            visited: set[UUID] = set()
+            frontier = list(cap.seed_element_ids or [])
+            hops = 0
+            while frontier and hops < 24:
+                hops += 1
+                try:
+                    elem_ids = [UUID(str(e)) for e in frontier]
+                except Exception:
+                    break
+                rows = await db.execute(
+                    select(GenieElement.idea_capsule_id).where(
+                        GenieElement.id.in_(elem_ids),
+                        GenieElement.idea_capsule_id.isnot(None),
+                    )
+                )
+                parent_cap_ids = [r[0] for r in rows.fetchall() if r[0]]
+                new_frontier: list[str] = []
+                for pcid in parent_cap_ids:
+                    if pcid in visited:
+                        continue
+                    visited.add(pcid)
+                    seed_rows = await db.execute(
+                        select(IdeaCapsule.seed_element_ids).where(IdeaCapsule.id == pcid)
+                    )
+                    seed_row = seed_rows.first()
+                    if seed_row and seed_row[0]:
+                        new_frontier.extend(seed_row[0])
+                frontier = new_frontier
+            ancestors[cap.id] = visited
+
+    for cap in capsules:
+        if cap is None:
+            continue
+        overlap = chosen_ids & ancestors.get(cap.id, set())
+        if overlap:
+            offending = ", ".join(str(x) for x in overlap)
+            state.setdefault("error_metadata", {})["load"] = (
+                f"Cannot combine a capsule with its own ancestor (capsule "
+                f"{cap.id} descends from: {offending}). Pick a non-ancestor "
+                f"capsule instead."
+            )
+            return state
 
     state["capsules"] = capsules
     return state
@@ -1031,6 +1086,23 @@ async def _node_persist(state: CombineState) -> CombineState:
 
         parent_titles = " × ".join((c.title or "?")[:60] for c in capsules)
 
+        # Stamp the combined capsule with the dominant parent namespace so
+        # the Ideas list can filter by namespace correctly. Without this,
+        # combined capsules whose seeds are other capsules (no Paper FK)
+        # cannot be resolved to a namespace at list time and leak across
+        # every namespace view.
+        parent_namespaces: list[str] = []
+        for cap in capsules:
+            ns = (getattr(cap, "namespace_key", None) or "").strip()
+            if ns:
+                parent_namespaces.append(ns)
+        if not parent_namespaces:
+            parent_namespaces = [n for n in (state.get("namespaces") or []) if n]
+        combined_ns: str | None = None
+        if parent_namespaces:
+            from collections import Counter
+            combined_ns = Counter(parent_namespaces).most_common(1)[0][0]
+
         new_capsule = IdeaCapsule(
             user_id=user_id,
             title=str(fused.get("title", "Hybrid Hypothesis"))[:240],
@@ -1053,6 +1125,7 @@ async def _node_persist(state: CombineState) -> CombineState:
             is_scout_generated=False,
             source_mode="combined",
             source_query=f"Combined: {parent_titles}",
+            namespace_key=combined_ns,
             status="draft",
         )
         db.add(new_capsule)

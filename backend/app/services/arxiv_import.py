@@ -154,17 +154,31 @@ class ArxivImportService:
     async def _embed_abstracts(self, papers: list[Paper]) -> None:
         try:
             from app.adapters.embedding import get_embedding_adapter
+            from app.services.semantic_chunker import chunk_section
+
             embed = get_embedding_adapter()
-            texts = [p.abstract or p.title for p in papers]
+            # Boundary-aware sub-chunking: most abstracts are short and emit
+            # a single chunk, but long abstracts (4–5 paragraphs, sometimes
+            # 3000+ chars from arXiv preprints) get split on paragraph /
+            # sentence boundaries so retrieval doesn't blur multiple ideas
+            # into one averaged embedding.
+            flat_chunks: list[tuple[Paper, int, str]] = []
+            for paper in papers:
+                raw = paper.abstract or paper.title or ""
+                for idx, sc in enumerate(chunk_section(raw, "abstract")):
+                    flat_chunks.append((paper, idx, sc.content))
+            if not flat_chunks:
+                return
+            texts = [c[2] for c in flat_chunks]
             vectors = await embed.embed_texts(texts, task_type="RETRIEVAL_DOCUMENT")
-            for paper, vec in zip(papers, vectors):
+            for (paper, idx, content), vec in zip(flat_chunks, vectors):
                 if not vec:
                     continue
                 self._db.add(PaperChunk(
                     paper_id=paper.id,
-                    chunk_index=0,
+                    chunk_index=idx,
                     section_type="abstract",
-                    content=paper.abstract or paper.title,
+                    content=content,
                     embedding=vec,
                     embedding_dim=embed.dimensions,
                     embedding_provider=embed.provider_id,
@@ -175,6 +189,19 @@ class ArxivImportService:
             await self._db.rollback()
 
     async def _index_graph(self, papers: list[Paper]) -> None:
+        # Hard-gated on the global graph_enabled flag — if the admin has
+        # turned the graph off, we silently skip indexing. Imports still
+        # succeed and embeddings still happen; only the knowledge-graph
+        # write is suppressed.
+        try:
+            from app.services.admin_settings import get_app_settings
+            settings_snapshot = await get_app_settings(self._db)
+            if not bool(settings_snapshot.get("graph_enabled", False)):
+                log.debug("arxiv_import: graph indexing skipped (feature disabled)")
+                return
+        except Exception:
+            return  # fail-closed when we can't check the flag
+
         try:
             svc = GraphService(self._db)
             for paper in papers:

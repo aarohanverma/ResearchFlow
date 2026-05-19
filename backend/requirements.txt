@@ -46,15 +46,20 @@ email-validator==2.2.0
 # Default parser: Marker (PDF_PARSER=marker). Runtime fallback chain:
 #   <chosen> → Marker (always in chain) → Gemini Vision → minimal placeholder
 #
-# Docling is opt-in (PDF_PARSER=docling). It provides richer section hierarchy,
-# tables, equations, and figures but pulls in PyTorch + EasyOCR which can spike
-# RAM by ~2 GB on first parse — unsuitable for small VMs without explicit opt-in.
-# Docling is NOT auto-added to the fallback chain to prevent silent OOM crashes.
+# Docling + EasyOCR are NOT in this base requirements file anymore — they
+# pull in PyTorch + OpenCV (~2 GB image bloat) and were only used when the
+# operator explicitly set ``PDF_PARSER=docling``. The parser still works:
+# the ``docling_parser`` adapter handles ``ImportError`` and surfaces a
+# clear "install docling to use this parser" message.
 #
-# On CPU-only hosts install the slimmer CPU torch wheel before pip-installing:
-#   pip install docling --extra-index-url https://download.pytorch.org/whl/cpu
-docling==2.93.0            # opt-in parser (PDF_PARSER=docling) — rich structured output
-easyocr==1.7.2             # CPU/GPU OCR backend for Docling — handles scanned PDFs
+# To re-enable docling on a host that needs it:
+#     pip install docling==2.93.0 easyocr==1.7.2 \
+#         --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Marker (the default) still pulls in torch via Surya — that's the
+# dominant size in this image. Replacing it requires switching the
+# default parser to Gemini Vision (no local model needed) — a runtime
+# behavior change, so it is intentionally NOT done here.
 marker-pdf==0.3.10         # DEFAULT parser — strong on two-column academic layouts, memory-safe
 pymupdf==1.27.2.3          # required by GeminiVisionFallback for page rendering
 

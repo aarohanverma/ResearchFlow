@@ -105,6 +105,8 @@ export interface IdeaCapsule {
   deep_dive_status?: string;
   created_at: string;
   source_papers?: SourcePaperInfo[];
+  namespace_key?: string | null;
+  parent_capsule_ids?: string[];
 }
 
 export interface DiagramSpec {
@@ -128,6 +130,7 @@ export interface User {
   expertise_level: "newcomer" | "practitioner" | "expert";
   orientation: "research" | "production" | "both";
   onboarding_complete: boolean;
+  is_admin?: boolean;
 }
 
 export interface BookmarkFolder {

@@ -17,7 +17,7 @@ import {
   CheckCircle2Icon, ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, CircleDashedIcon,
   DownloadIcon, Edit3Icon, ExternalLinkIcon, FileTextIcon, GitBranchIcon, GlobeIcon,
   HighlighterIcon, Loader2Icon, MessageSquareIcon, NetworkIcon, PaperclipIcon, PanelLeftIcon,
-  PlusIcon, SendIcon, SparklesIcon, StickyNoteIcon, StopCircleIcon, Trash2Icon,
+  PencilIcon, PlusIcon, RefreshCwIcon, SendIcon, SparklesIcon, StickyNoteIcon, StopCircleIcon, Trash2Icon,
   XCircleIcon, XIcon, BookmarkIcon, BookOpenIcon,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -915,6 +915,24 @@ export default function AssistantPage() {
     }
   }
 
+  // Edit a user turn (when ``newContent`` is set) or regenerate an assistant
+  // reply (when ``newContent`` is null). Truncates everything after the
+  // chosen message and queues a fresh turn — ChatGPT-style "retry" UX.
+  async function replayMessage(messageId: string, newContent: string | null) {
+    if (!activeId) return;
+    try {
+      await api.post(
+        `/assistant/sessions/${activeId}/messages/${messageId}/replay`,
+        { content: newContent },
+      );
+      // Refresh the session so the truncated history and the new assistant
+      // placeholder appear, then SSE/polling will populate the streaming reply.
+      await loadSession(activeId);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   async function attachNote(label: string, content: string) {
     if (!content.trim()) return;
     const sid = await ensureSession();
@@ -1126,6 +1144,25 @@ export default function AssistantPage() {
                 <HighlighterIcon size={13} />
               </button>
 
+              {/* Clear all highlights — surfaces only when at least one exists,
+                  matching the Study Mode toolbar's behavior. */}
+              {highlights.length > 0 && (
+                <button
+                  onClick={() => setHighlights([])}
+                  title="Remove all highlights in this session"
+                  style={{
+                    background: "none",
+                    border: "1px solid rgba(255,255,255,0.06)",
+                    borderRadius: 5, cursor: "pointer",
+                    color: "var(--rf-text5)",
+                    padding: "4px 8px", display: "flex", alignItems: "center", gap: 4,
+                    fontSize: 11,
+                  }}
+                >
+                  <XIcon size={11} /> Clear marks
+                </button>
+              )}
+
               {/* In-chat keyword search */}
               <button
                 onClick={() => { setChatSearchOpen(o => !o); if (!chatSearchOpen) setTimeout(() => searchInputRef.current?.focus(), 30); }}
@@ -1277,6 +1314,8 @@ export default function AssistantPage() {
                 searchWholeWord={chatSearchWholeWord}
                 highlightModeActive={highlightMode}
                 onRemoveHighlight={onRemoveHighlight}
+                onEditUser={(mid, content) => replayMessage(mid, content)}
+                onRegenerate={(mid) => replayMessage(mid, null)}
               />
             ))}
           </ChatErrorBoundary>
@@ -2398,6 +2437,7 @@ function MessageBlock({
   liveJobData, streamingContent,
   stickyNotes = [], onAddNote, onUpdateNote, onDeleteNote,
   highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, highlightModeActive, onRemoveHighlight,
+  onEditUser, onRegenerate,
 }: {
   msg: AssistantMessage;
   steps: AssistantStep[];
@@ -2424,10 +2464,17 @@ function MessageBlock({
   highlightModeActive?: boolean;
   /** Called when the user clicks a highlight mark to remove it. */
   onRemoveHighlight?: (id: string) => void;
+  /** Edit a user message and replay from there. */
+  onEditUser?: (messageId: string, newContent: string) => void;
+  /** Regenerate an assistant reply (replays the prior user message). */
+  onRegenerate?: (messageId: string) => void;
 }) {
   const isUser = msg.role === "user";
   const isSystem = msg.role === "system";
   const taskForMsg = tasks.find(t => t.assistant_message_id === msg.id);
+  const [editing, setEditing] = useState(false);
+  const [editValue, setEditValue] = useState(msg.content);
+  useEffect(() => { setEditValue(msg.content); }, [msg.content]);
 
   if (isSystem) {
     return (
@@ -2472,21 +2519,68 @@ function MessageBlock({
               steps={steps}
               onCancel={() => onCancel(taskForMsg.job_id)}
               liveData={liveJobData[taskForMsg.job_id]}
+              messagePayload={msg.payload}
             />
           )}
-          <MessageBody
-            msg={msg}
-            isInflight={!!(taskForMsg && (taskForMsg.status === "running" || taskForMsg.status === "pending"))}
-            onSuggestionClick={onSuggestionClick}
-            onOpenPaper={onOpenPaper}
-            streamingText={streamingContent[msg.id]}
-            highlightsForMessage={highlightsForMessage}
-            searchQuery={searchQuery}
-            searchCaseSensitive={searchCaseSensitive}
-            searchWholeWord={searchWholeWord}
-            highlightModeActive={highlightModeActive}
-            onRemoveHighlight={onRemoveHighlight}
-          />
+          {isUser && editing ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <textarea
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                rows={Math.min(8, Math.max(2, (editValue.match(/\n/g)?.length || 0) + 2))}
+                style={{
+                  width: "100%", padding: 8, borderRadius: 6,
+                  background: "var(--rf-surface2)", color: "var(--rf-text1)",
+                  border: "1px solid var(--rf-border)", fontSize: "13px",
+                  fontFamily: "inherit", resize: "vertical",
+                }}
+                autoFocus
+              />
+              <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                <button
+                  onClick={() => { setEditing(false); setEditValue(msg.content); }}
+                  style={{
+                    fontSize: "11px", padding: "4px 10px", borderRadius: 5,
+                    background: "var(--rf-surface3)", color: "var(--rf-text3)",
+                    border: "1px solid var(--rf-border)", cursor: "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    if (editValue.trim() && editValue.trim() !== msg.content.trim() && onEditUser) {
+                      onEditUser(msg.id, editValue.trim());
+                      setEditing(false);
+                    }
+                  }}
+                  disabled={!editValue.trim() || editValue.trim() === msg.content.trim()}
+                  style={{
+                    fontSize: "11px", padding: "4px 10px", borderRadius: 5,
+                    background: "linear-gradient(135deg,#6366f1,#8b5cf6)", color: "white",
+                    border: "none", cursor: "pointer",
+                    opacity: !editValue.trim() || editValue.trim() === msg.content.trim() ? 0.4 : 1,
+                  }}
+                >
+                  Save &amp; regenerate
+                </button>
+              </div>
+            </div>
+          ) : (
+            <MessageBody
+              msg={msg}
+              isInflight={!!(taskForMsg && (taskForMsg.status === "running" || taskForMsg.status === "pending"))}
+              onSuggestionClick={onSuggestionClick}
+              onOpenPaper={onOpenPaper}
+              streamingText={streamingContent[msg.id]}
+              highlightsForMessage={highlightsForMessage}
+              searchQuery={searchQuery}
+              searchCaseSensitive={searchCaseSensitive}
+              searchWholeWord={searchWholeWord}
+              highlightModeActive={highlightModeActive}
+              onRemoveHighlight={onRemoveHighlight}
+            />
+          )}
           <div style={{ marginTop: 8, display: "flex", justifyContent: "flex-end", gap: 4 }}>
             {onAddNote && (
               <button
@@ -2499,6 +2593,32 @@ function MessageBlock({
                 }}
               >
                 <StickyNoteIcon size={10} /> Note
+              </button>
+            )}
+            {isUser && !editing && onEditUser && (
+              <button
+                onClick={() => setEditing(true)}
+                title="Edit and regenerate from this turn"
+                style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  fontSize: "10px", color: "var(--rf-text5)",
+                  background: "none", border: "none", cursor: "pointer", padding: "2px 6px",
+                }}
+              >
+                <PencilIcon size={10} /> Edit
+              </button>
+            )}
+            {msg.role === "assistant" && onRegenerate && taskForMsg?.status !== "running" && taskForMsg?.status !== "pending" && (
+              <button
+                onClick={() => onRegenerate(msg.id)}
+                title="Regenerate this reply"
+                style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  fontSize: "10px", color: "var(--rf-text5)",
+                  background: "none", border: "none", cursor: "pointer", padding: "2px 6px",
+                }}
+              >
+                <RefreshCwIcon size={10} /> Regenerate
               </button>
             )}
             {msg.role === "assistant" && (
@@ -2530,12 +2650,13 @@ function MessageBlock({
 }
 
 function ReasoningStrip({
-  task, steps, onCancel, liveData,
+  task, steps, onCancel, liveData, messagePayload,
 }: {
   task: AssistantTask;
   steps: AssistantStep[];
   onCancel: () => void;
   liveData?: { rationale?: string; plannedSteps?: { tool: string; title: string }[]; actions?: string[] };
+  messagePayload?: Record<string, unknown>;
 }) {
   const isInflight = task.status === "running" || task.status === "pending";
   // Open while a task is in-flight so the user can see progress; collapse
@@ -2622,6 +2743,51 @@ function ReasoningStrip({
               </span>
             </div>
           ))}
+          {/* Persisted trace fallback — for completed turns loaded from history,
+              DB step rows often aren't re-fetched. Reconstruct a clean step
+              trace from ``msg.payload.workflow.{actions,trace}`` so the
+              expanded view never collapses into an empty box. */}
+          {orderedSteps.length === 0 && !liveData?.plannedSteps &&
+            (() => {
+              const wf = (messagePayload as { workflow?: { actions?: string[]; trace?: unknown[] } } | undefined)?.workflow;
+              const actions = Array.isArray(wf?.actions) ? wf!.actions! : [];
+              const trace = Array.isArray(wf?.trace) ? wf!.trace! : [];
+              const rows: { tool: string; title: string }[] = [];
+              for (const t of trace) {
+                if (!t || typeof t !== "object") continue;
+                const obj = t as Record<string, unknown>;
+                const tool = typeof obj.tool === "string" ? obj.tool : typeof obj.name === "string" ? (obj.name as string) : "step";
+                const title = typeof obj.title === "string" ? obj.title
+                  : typeof obj.summary === "string" ? (obj.summary as string)
+                  : typeof obj.description === "string" ? (obj.description as string)
+                  : "";
+                rows.push({ tool, title });
+              }
+              if (rows.length === 0 && actions.length) {
+                for (const a of actions) rows.push({ tool: "action", title: a });
+              }
+              if (rows.length === 0) return (
+                <div style={{ fontSize: "10px", color: "var(--rf-text5)", padding: "3px 4px" }}>
+                  No step trace recorded for this turn.
+                </div>
+              );
+              return rows.map((r, i) => (
+                <div key={i} style={{
+                  display: "flex", alignItems: "center", gap: 6, padding: "3px 4px",
+                  borderRadius: 4, fontSize: "10px",
+                }}>
+                  <CheckCircle2Icon size={11} color="#22c55e" />
+                  <span style={{ color: "var(--rf-text2)", fontWeight: 600 }}>{r.tool}</span>
+                  <span style={{
+                    color: "var(--rf-text4)", flex: 1, overflow: "hidden",
+                    textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    {r.title}
+                  </span>
+                </div>
+              ));
+            })()
+          }
         </div>
       )}
     </div>

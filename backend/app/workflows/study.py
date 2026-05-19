@@ -379,19 +379,31 @@ async def _fetch_and_parse(state: StudyState) -> StudyState:
         )
         sections = [{"type": s.section_type, "content": s.content} for s in parsed.sections]
 
-        # Store section chunks + embeddings + persist parser metadata to Paper
+        # Store boundary-aware semantic sub-chunks of every section, plus
+        # their embeddings, and persist parser metadata to Paper. A "Results"
+        # section frequently runs 15k+ chars; embedding it as one row loses
+        # too much specificity for retrieval. ``chunk_sections`` splits on
+        # paragraph then sentence boundaries while preserving section_type.
+        from app.services.semantic_chunker import chunk_sections
+
+        sub_chunks = chunk_sections(sections)
+        if not sub_chunks:
+            log.info("study.fetch_and_parse: no embeddable content paper=%s", paper_id)
+            state["sections"] = sections
+            return state
+
         embed = get_embedding_adapter()
         async with async_session_factory() as db:
             paper_repo = PaperRepository(db)
-            texts = [s["content"] for s in sections]
+            texts = [c.content for c in sub_chunks]
             vectors = await embed.embed_texts(texts, task_type="RETRIEVAL_DOCUMENT")
 
-            for i, (sec, vec) in enumerate(zip(sections, vectors)):
+            for i, (sc, vec) in enumerate(zip(sub_chunks, vectors)):
                 chunk = PaperChunk(
                     paper_id=paper_id,
                     chunk_index=i + 1,
-                    section_type=sec["type"],
-                    content=sec["content"],
+                    section_type=sc.section_type,
+                    content=sc.content,
                     embedding=vec,
                     embedding_dim=embed.dimensions,
                     embedding_provider=embed.provider_id,
@@ -1739,24 +1751,33 @@ async def _ensure_papers_fully_chunked(paper_ids: list[UUID]) -> None:
                 sections = [{"type": s.section_type, "content": s.content}
                             for s in parsed.sections]
 
+                from app.services.semantic_chunker import chunk_sections
+                sub_chunks = chunk_sections(sections)
+                if not sub_chunks:
+                    log.info("bookmarks_rag: nothing to embed for %s", paper_id)
+                    return
+
                 embed = get_embedding_adapter()
-                texts = [s["content"] for s in sections]
+                texts = [c.content for c in sub_chunks]
                 vectors = await embed.embed_texts(texts, task_type="RETRIEVAL_DOCUMENT")
 
                 async with async_session_factory() as db:
                     repo = PaperRepository(db)
-                    for i, (sec, vec) in enumerate(zip(sections, vectors)):
+                    for i, (sc, vec) in enumerate(zip(sub_chunks, vectors)):
                         db.add(PaperChunk(
                             paper_id=paper_id,
                             chunk_index=i + 1,
-                            section_type=sec["type"],
-                            content=sec["content"],
+                            section_type=sc.section_type,
+                            content=sc.content,
                             embedding=vec,
                             embedding_dim=embed.dimensions,
                             embedding_provider=embed.provider_id,
                         ))
                     await db.commit()
-                log.info("bookmarks_rag: parsed PDF for paper %s (%d sections)", paper_id, len(sections))
+                log.info(
+                    "bookmarks_rag: parsed PDF for paper %s (%d sections → %d boundary-aware chunks)",
+                    paper_id, len(sections), len(sub_chunks),
+                )
             except Exception as exc:
                 log.warning("bookmarks_rag: PDF parse failed for %s — %s", paper_id, exc)
 

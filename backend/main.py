@@ -31,12 +31,34 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-_GUEST_EMAIL = "test@researchflow.ai"
-_GUEST_PASSWORD = "ResearchFlow2024!"
+def _seed_accounts_from_env() -> list[tuple[str, str, str, bool]]:
+    """Resolve seed accounts strictly from settings — no hardcoded passwords.
+
+    Returns a list of ``(email, password, display_name, is_admin)`` tuples
+    for every seed slot whose ``email`` AND ``password`` are both non-empty
+    in the environment. Empty password (the default) means "skip this
+    seed entirely" — production deploys can simply leave the password
+    vars unset and no demo accounts are created.
+    """
+    candidates: list[tuple[str, str, str, bool]] = [
+        (settings.seed_guest_email, settings.seed_guest_password, "Guest Researcher", False),
+        (settings.seed_admin_email, settings.seed_admin_password, "Admin",            True),
+        (settings.seed_user_email,  settings.seed_user_password,  "Researcher",       False),
+    ]
+    return [(e.strip(), p, name, admin)
+            for e, p, name, admin in candidates
+            if e and e.strip() and p]
 
 
 async def _ensure_seed_user() -> None:
-    """Idempotently create the guest/test user and its SourceMappings on startup."""
+    """Idempotently create the guest / admin / normal seed users on startup.
+
+    All three seed accounts share the same namespace subscriptions and
+    SourceMapping rows so they behave identically out of the box. The only
+    difference is ``is_admin`` on the admin account — and even that only
+    unlocks the admin panel; every other route behaves the same for all
+    three so the dev can switch logins without behavior surprises.
+    """
     from sqlalchemy import select as _select
     from app.db.session import async_session_factory
     from app.core.security import hash_password
@@ -49,47 +71,61 @@ async def _ensure_seed_user() -> None:
         ("cs.NLP", "arxiv_rss", "cs.CL"),
     ]
 
+    seed_accounts = _seed_accounts_from_env()
+    if not seed_accounts:
+        log.info("seed accounts: none configured (set SEED_*_PASSWORD env vars to enable)")
+        return
+
     async with async_session_factory() as db:
-        row = await db.execute(_select(User).where(User.email == _GUEST_EMAIL))
-        user = row.scalar_one_or_none()
+        for email, password, display_name, is_admin in seed_accounts:
+            row = await db.execute(_select(User).where(User.email == email))
+            user = row.scalar_one_or_none()
 
-        if not user:
-            user = User(
-                email=_GUEST_EMAIL,
-                hashed_password=hash_password(_GUEST_PASSWORD),
-                display_name="Guest Researcher",
-                expertise_level=ExpertiseLevel.practitioner,
-                orientation=Orientation.both,
-                onboarding_complete=True,
-            )
-            db.add(user)
-            await db.flush()
-            db.add(UserProviderSettings(user_id=user.id))
-            db.add(UserInterestProfile(user_id=user.id))
-            log.info("seed user created: %s", _GUEST_EMAIL)
-
-        for ns_key, source_name, arxiv_cat in _DEFAULT_NS:
-            sub = await db.execute(
-                _select(NamespaceSubscription).where(
-                    NamespaceSubscription.user_id == user.id,
-                    NamespaceSubscription.namespace_key == ns_key,
+            if not user:
+                user = User(
+                    email=email,
+                    hashed_password=hash_password(password),
+                    display_name=display_name,
+                    expertise_level=ExpertiseLevel.practitioner,
+                    orientation=Orientation.both,
+                    onboarding_complete=True,
+                    is_admin=is_admin,
                 )
-            )
-            if not sub.scalar_one_or_none():
-                db.add(NamespaceSubscription(user_id=user.id, namespace_key=ns_key))
+                db.add(user)
+                await db.flush()
+                db.add(UserProviderSettings(user_id=user.id))
+                db.add(UserInterestProfile(user_id=user.id))
+                log.info("seed user created: %s (admin=%s)", email, is_admin)
+            else:
+                # Keep the admin bit aligned on subsequent boots so an
+                # accidental demote in the DB gets repaired automatically
+                # for the seeded admin account.
+                if user.is_admin != is_admin:
+                    user.is_admin = is_admin
+                    log.info("seed user admin bit synced: %s → %s", email, is_admin)
 
-            mapping = await db.execute(
-                _select(SourceMapping).where(
-                    SourceMapping.namespace_key == ns_key,
-                    SourceMapping.source_name == source_name,
+            for ns_key, source_name, arxiv_cat in _DEFAULT_NS:
+                sub = await db.execute(
+                    _select(NamespaceSubscription).where(
+                        NamespaceSubscription.user_id == user.id,
+                        NamespaceSubscription.namespace_key == ns_key,
+                    )
                 )
-            )
-            if not mapping.scalar_one_or_none():
-                db.add(SourceMapping(
-                    namespace_key=ns_key,
-                    source_name=source_name,
-                    external_category_key=arxiv_cat,
-                ))
+                if not sub.scalar_one_or_none():
+                    db.add(NamespaceSubscription(user_id=user.id, namespace_key=ns_key))
+
+                mapping = await db.execute(
+                    _select(SourceMapping).where(
+                        SourceMapping.namespace_key == ns_key,
+                        SourceMapping.source_name == source_name,
+                    )
+                )
+                if not mapping.scalar_one_or_none():
+                    db.add(SourceMapping(
+                        namespace_key=ns_key,
+                        source_name=source_name,
+                        external_category_key=arxiv_cat,
+                    ))
 
         await db.commit()
 
@@ -190,9 +226,169 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
                 ALTER TABLE idea_capsules
                 ADD COLUMN IF NOT EXISTS source_query TEXT
             """))
+            # ``namespace_key`` stamped at capsule creation so the Genie
+            # Ideas list can filter directly. Without it, combined ideas
+            # whose seeds are other capsules (no Paper FK) leak across
+            # namespaces — the list-filter previously had no signal to
+            # discriminate them.
+            await conn.execute(_text("""
+                ALTER TABLE idea_capsules
+                ADD COLUMN IF NOT EXISTS namespace_key VARCHAR(100)
+            """))
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_idea_capsules_namespace
+                ON idea_capsules (user_id, namespace_key)
+            """))
+            # One-shot backfill for rows created before the namespace_key
+            # column shipped. Resolves the dominant namespace via two
+            # parallel paths and writes back to the row so future list
+            # queries hit the primary index instead of the seed-resolution
+            # fallback. Idempotent — re-running picks up new rows without
+            # touching already-stamped ones.
+            #
+            # Path A — paper-backed seeds (regular synthesized capsules):
+            #   genie_elements.id ∈ seed_element_ids (a JSONB string array)
+            #     ⟶ genie_elements.paper_id ⟶ papers.namespace_key
+            # Path B — capsule-backed seeds (combined capsules):
+            #   genie_elements.id ∈ seed_element_ids
+            #     ⟶ genie_elements.idea_capsule_id ⟶ idea_capsules.namespace_key
+            # Path A wins ties when both resolve. We take the modal
+            # namespace per capsule via MIN() of grouped counts. Wrapped
+            # in its own try/except so a malformed legacy row can't kill
+            # the whole startup migration block.
+            try:
+                await conn.execute(_text("""
+                    WITH seed_explode AS (
+                        SELECT
+                            c.id AS capsule_id,
+                            (s.value #>> '{}')::uuid AS element_id
+                        FROM idea_capsules c
+                        CROSS JOIN LATERAL jsonb_array_elements(
+                            COALESCE(c.seed_element_ids, '[]'::jsonb)
+                        ) AS s(value)
+                        WHERE c.namespace_key IS NULL
+                    ),
+                    paper_ns AS (
+                        SELECT
+                            se.capsule_id,
+                            p.namespace_key,
+                            COUNT(*) AS n
+                        FROM seed_explode se
+                        JOIN genie_elements ge ON ge.id = se.element_id
+                        JOIN papers p ON p.id = ge.paper_id
+                        WHERE p.namespace_key IS NOT NULL AND p.namespace_key <> ''
+                        GROUP BY se.capsule_id, p.namespace_key
+                    ),
+                    capsule_ns AS (
+                        SELECT
+                            se.capsule_id,
+                            parent.namespace_key,
+                            COUNT(*) AS n
+                        FROM seed_explode se
+                        JOIN genie_elements ge ON ge.id = se.element_id
+                        JOIN idea_capsules parent ON parent.id = ge.idea_capsule_id
+                        WHERE parent.namespace_key IS NOT NULL AND parent.namespace_key <> ''
+                        GROUP BY se.capsule_id, parent.namespace_key
+                    ),
+                    unified AS (
+                        SELECT capsule_id, namespace_key, n FROM paper_ns
+                        UNION ALL
+                        SELECT capsule_id, namespace_key, n FROM capsule_ns
+                    ),
+                    dominant AS (
+                        SELECT DISTINCT ON (capsule_id)
+                            capsule_id,
+                            namespace_key
+                        FROM unified
+                        ORDER BY capsule_id, n DESC, namespace_key
+                    )
+                    UPDATE idea_capsules ic
+                    SET namespace_key = d.namespace_key
+                    FROM dominant d
+                    WHERE ic.id = d.capsule_id
+                      AND ic.namespace_key IS NULL
+                """))
+                log.info("idea_capsules namespace_key backfill complete")
+            except Exception as exc:
+                log.warning("idea_capsules namespace_key backfill skipped: %s", exc)
         log.info("idea_capsules schema migration complete")
     except Exception as exc:
         log.warning("idea_capsules migration skipped: %s", exc)
+
+    # ── Admin schema: is_admin column + app_settings table ────────────────
+    # Both are idempotent so re-running on every startup is safe.
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS feature_overrides JSONB NOT NULL DEFAULT '{}'::jsonb"
+            ))
+            # RBAC scaffolding — ``role`` is forward-compatible (today
+            # everyone reads ``is_admin``; the string column lets us
+            # introduce editor / reviewer / etc. roles without another
+            # migration). ``tier_slug`` joins to ``tiers.slug`` when
+            # subscriptions ship. NULL today, fully optional.
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(40) NOT NULL DEFAULT 'member'"
+            ))
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS tier_slug VARCHAR(40)"
+            ))
+            await conn.execute(_text(
+                "CREATE INDEX IF NOT EXISTS idx_users_tier_slug ON users (tier_slug)"
+            ))
+            # Admin precedence: the seeded admin account (configured via
+            # SEED_ADMIN_EMAIL) is the canonical admin. Any user that was
+            # previously promoted via the legacy earliest-user bootstrap
+            # gets *demoted* here as long as the seeded admin exists,
+            # otherwise the guest account ends up with admin powers it
+            # shouldn't have.
+            #
+            # The seeded admin itself is (re)promoted in ``_ensure_seed_user``
+            # — this query only fixes up users that were accidentally
+            # promoted by the old bootstrap.
+            admin_email = (settings.seed_admin_email or "").strip()
+            if admin_email:
+                await conn.execute(
+                    _text(
+                        """
+                        UPDATE users
+                        SET is_admin = FALSE
+                        WHERE is_admin = TRUE
+                          AND email <> :admin_email
+                          AND email IN (:guest_email, :user_email)
+                        """
+                    ),
+                    {
+                        "admin_email": admin_email,
+                        "guest_email": (settings.seed_guest_email or "").strip(),
+                        "user_email": (settings.seed_user_email or "").strip(),
+                    },
+                )
+            # Lockout safety: if there is genuinely NO admin in the DB
+            # (e.g. a fresh boot where the seeded admin password is blank
+            # and no human has signed up yet), promote the earliest user
+            # so the install is not bricked. Once anyone becomes admin
+            # this clause is a no-op.
+            await conn.execute(_text(
+                """
+                UPDATE users SET is_admin = TRUE
+                WHERE id = (
+                    SELECT id FROM users
+                    WHERE is_admin = FALSE
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                )
+                AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = TRUE)
+                """
+            ))
+        log.info("admin schema migration complete (is_admin column + bootstrap)")
+    except Exception as exc:
+        log.warning("admin schema migration skipped: %s", exc)
 
     # Ensure generated_artifacts table exists (idempotent via create_all on local)
     try:
@@ -352,7 +548,37 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     yield
 
-    stop_scheduler()
+    # ── Graceful shutdown ─────────────────────────────────────────────────
+    # Stop accepting new scheduled jobs first, then drain pool/sockets so
+    # we never leak connections back to the OS on container exit.
+    try:
+        stop_scheduler()
+    except Exception as exc:
+        log.warning("scheduler shutdown error: %s", exc)
+
+    # Dispose the LangGraph checkpoint pool (asyncpg) so connections are
+    # returned to the server cleanly. Skipped silently if the checkpointer
+    # was never initialised — startup may have logged a warning above.
+    try:
+        from app.db.checkpointer import _checkpointer as _maybe_checkpointer
+        if _maybe_checkpointer is not None:
+            await _maybe_checkpointer.close()
+            log.info("LangGraph checkpoint pool closed")
+    except Exception as exc:
+        log.warning("checkpoint pool close error: %s", exc)
+
+    # Dispose the SQLAlchemy async engine — releases the connection pool
+    # back to PostgreSQL. Without this, Azure PostgreSQL leaves the pool's
+    # connections in the "idle in transaction" state for up to 30 min,
+    # consuming server-side max_connections and producing intermittent
+    # "remaining connection slots are reserved" errors on rolling deploys.
+    try:
+        from app.db.session import engine as _engine
+        await _engine.dispose()
+        log.info("SQLAlchemy engine disposed")
+    except Exception as exc:
+        log.warning("engine dispose error: %s", exc)
+
     log.info("ResearchFlow shutting down")
 
 

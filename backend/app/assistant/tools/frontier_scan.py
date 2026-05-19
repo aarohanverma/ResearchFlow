@@ -43,13 +43,19 @@ class FrontierScanTool:
 
     name = "frontier_scan"
     summary = (
-        "Cheap composition of existing signals (novelty score, recency decay, "
-        "breakthrough flag, personal interest overlap) ranked into a 'frontier' "
-        "ordering. Each paper carries a why_surfaced breakdown so the UI can "
-        "render explainable badges. Use when the user asks 'what's new' or "
-        "'frontier' or 'recent breakthroughs' rather than focused retrieval. "
+        "Ranking pass over already-indexed papers using existing signals "
+        "(novelty score, recency decay, breakthrough flag, personal interest "
+        "overlap). Each paper carries a why_surfaced breakdown so the UI can "
+        "render explainable badges.\n\n"
+        "USE WHEN: the user asks 'what's new', 'frontier', 'recent "
+        "breakthroughs', or 'what should I look at this week' — they want a "
+        "novelty-ordered scan of what's ALREADY in the corpus.\n"
+        "DO NOT USE WHEN: the user asks a specific topic-grounded question "
+        "(use deep_search), wants new arXiv papers not yet indexed "
+        "(use arxiv_search or arxiv_import), or wants a structured field "
+        "overview (use literature_survey).\n\n"
         "Default scope is cross-namespace; pass namespace_keys only when the "
-        "user explicitly scopes to a particular subject."
+        "user explicitly scopes. Cheap: no LLM calls, only DB + ranking."
     )
     cost_class = "cheap"
     side_effects = False

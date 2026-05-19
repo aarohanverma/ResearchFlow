@@ -15,13 +15,18 @@ import {
   SunIcon, MoonIcon,
 } from "lucide-react";
 import { JobsNotification } from "@/components/jobs/JobsPanel";
+import { FeatureProvider, useFeatures } from "@/lib/features";
 
 const NAV = [
   { href: "/feed",      label: "Feed",      icon: HomeIcon,          desc: "Paper feed" },
-  { href: "/assistant", label: "Assistant", icon: MessageSquareIcon, desc: "Research workspace" },
+  { href: "/assistant", label: "Assistant", icon: MessageSquareIcon, desc: "Research workspace", gatedBy: "assistant_enabled" },
   { href: "/bookmarks", label: "Saved",     icon: BookmarkIcon,      desc: "Bookmarks" },
-  { href: "/graph",     label: "Graph",     icon: NetworkIcon,       desc: "Knowledge graph" },
-  { href: "/genie",     label: "Genie",     icon: FlaskConicalIcon,  desc: "Idea synthesizer" },
+  // Graph nav is gated by the admin-controlled ``graph_enabled`` flag
+  // fetched from /settings/public. The entry is dropped from this list at
+  // render time when the flag is off, so the route disappears entirely
+  // (the backend also returns 404 in that case).
+  { href: "/graph",     label: "Graph",     icon: NetworkIcon,       desc: "Knowledge graph", gatedBy: "graph_enabled" },
+  { href: "/genie",     label: "Genie",     icon: FlaskConicalIcon,  desc: "Idea synthesizer", gatedBy: "genie_enabled" },
   { href: "/settings",  label: "Settings",  icon: SettingsIcon,      desc: "Preferences" },
 ];
 
@@ -89,9 +94,22 @@ function NamespaceSidebar() {
                   : <ChevronDownIcon size={10} />}
               </button>
 
-              {/* Subject label — click to set as active subject */}
+              {/* Subject label — click to set as active subject.
+                  Hard-refreshes the current route so no stale paper /
+                  idea data from the previous namespace lingers in any
+                  page's local state. The store update is synchronous;
+                  the location.reload runs after so the next paint comes
+                  from a clean fetch keyed by the new namespace. */}
               <button
-                onClick={() => { setSubject(subject.key); }}
+                onClick={() => {
+                  if (typeof window === "undefined") return;
+                  const sub = useNamespaceStore.getState().activeSubject;
+                  if (sub === subject.key) return; // no-op when clicking the active one
+                  setSubject(subject.key);
+                  // Defer until the store write commits so subscribers
+                  // see the new value if they re-render before reload.
+                  setTimeout(() => { window.location.reload(); }, 0);
+                }}
                 style={{
                   flex: 1, background: "none", border: "none", cursor: "pointer",
                   textAlign: "left", display: "flex", alignItems: "center", gap: 5,
@@ -201,6 +219,15 @@ function NamespaceSidebar() {
 // ─── Layout ───────────────────────────────────────────────────────────────────
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
+  const { token } = useAuthStore();
+  return (
+    <FeatureProvider enabled={!!token}>
+      <AppShell>{children}</AppShell>
+    </FeatureProvider>
+  );
+}
+
+function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router   = useRouter();
   const { token, user } = useAuthStore();
@@ -210,6 +237,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   // preference survives reloads. Collapsed shows just the nav icons; the
   // namespace tree and user footer fold into a narrow strip.
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Effective feature map — fetched by FeatureProvider; we read it via
+  // the shared hook so any nested component (Nav, Composer, Cauldron,
+  // PaperPanel) can gate UI off the same map without a refetch.
+  const { features } = useFeatures();
+  const appSettings = { graph_enabled: !!features.graph_enabled, features };
 
   // Apply persisted theme on mount (also done inline in root layout to avoid FOUC)
   useEffect(() => {
@@ -222,6 +254,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       if (stored === "1") setSidebarCollapsed(true);
     } catch {}
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => { if (mounted && !token) router.replace("/login"); }, [mounted, token, router]);
 
   if (!mounted) return <div className="h-screen w-screen" style={{ background: "var(--rf-bg)" }} />;
@@ -304,7 +337,17 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
         {/* Nav */}
         <div style={{ padding: sidebarCollapsed ? "0 6px" : "0 8px", marginBottom: 12, flexShrink: 0 }}>
-          {NAV.map(({ href, label, icon: Icon, desc }) => {
+          {NAV
+            .filter((n) => {
+              if (!n.gatedBy) return true;
+              const eff = appSettings.features?.[n.gatedBy];
+              if (eff !== undefined) return !!eff;
+              // Fallback: graph default off, everything else default on.
+              if (n.gatedBy === "graph_enabled") return appSettings.graph_enabled;
+              return true;
+            })
+            .concat(user?.is_admin ? [{ href: "/admin", label: "Admin", icon: SettingsIcon, desc: "Admin panel" }] : [])
+            .map(({ href, label, icon: Icon, desc }) => {
             const active = pathname.startsWith(href);
             return (
               <Link key={href} href={href} style={{ textDecoration: "none" }} title={sidebarCollapsed ? `${label} — ${desc}` : undefined}>

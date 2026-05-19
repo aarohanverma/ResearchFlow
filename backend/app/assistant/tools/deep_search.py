@@ -38,10 +38,19 @@ class DeepSearchTool:
 
     name = "deep_search"
     summary = (
-        "Hybrid retrieval (keyword + semantic + graph + LLM rerank) over the user's "
-        "indexed paper corpus, augmented with arXiv MCP candidates not yet imported. "
-        "Best first tool for any research question — searches beyond the current feed. "
-        "If corpus results are sparse, the orchestrator auto-imports the top arXiv matches."
+        "Hybrid retrieval over the indexed paper corpus: LLM query rewrite → "
+        "semantic + keyword + graph-concept search → reciprocal-rank fusion → "
+        "LLM rerank → optional arXiv MCP top-up.\n\n"
+        "USE WHEN: the user asks a specific research question ('papers on X', "
+        "'recent work on Y', 'what's been shown about Z'), wants to find "
+        "evidence for a claim, or you need grounding for downstream synthesis.\n"
+        "DO NOT USE WHEN: the user wants a structured field overview "
+        "(use literature_survey), a single concept explained "
+        "(use concept_explain), or only the newest unfiltered papers "
+        "(use frontier_scan).\n\n"
+        "Inputs: query (focused phrase, ≤1000 chars), namespace_keys (scope), "
+        "limit (top-N, default 8). Outputs: papers list with per-paper "
+        "search_score, ranked best-first."
     )
     cost_class = "heavy"
     side_effects = False

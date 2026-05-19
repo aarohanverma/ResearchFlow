@@ -96,12 +96,70 @@ _MERMAID_HEADERS = (
 )
 
 
+def _collapse_label_newlines(spec: str) -> str:
+    """Collapse newlines that appear INSIDE node-label brackets to spaces.
+
+    Mermaid expects each node declaration on one line. LLMs occasionally
+    wrap a long label across a hard newline (``H[Factual Consistency\\n
+    Confidence (c_f)]``) which causes the parser to absorb every
+    subsequent statement into that label as raw text — exactly the
+    "raw mermaid shown as a single text block" failure mode we saw on
+    Genie deep dives. We scan for ``id[...]`` / ``id(...)`` / ``id{...}``
+    spans and replace internal newlines with spaces. If a label opens but
+    never closes within the document we leave it alone so the bracket-
+    balance check below can decide whether to give up.
+    """
+    pairs = (("[", "]"), ("(", ")"), ("{", "}"))
+    out = spec
+    for opener, closer in pairs:
+        # Find <id><opener>...<closer> spans that contain a newline; replace
+        # the inner newlines with single spaces.
+        i = 0
+        result: list[str] = []
+        while i < len(out):
+            ch = out[i]
+            if ch.isalnum() or ch == "_":
+                # Capture identifier
+                j = i
+                while j < len(out) and (out[j].isalnum() or out[j] == "_"):
+                    j += 1
+                if j < len(out) and out[j] == opener:
+                    # Find matching closer with depth tracking
+                    depth = 1
+                    k = j + 1
+                    while k < len(out) and depth > 0:
+                        if out[k] == opener:
+                            depth += 1
+                        elif out[k] == closer:
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k += 1
+                    if k < len(out) and depth == 0:
+                        ident = out[i:j]
+                        content = out[j + 1 : k]
+                        # Collapse all whitespace runs (including newlines) to single spaces
+                        content_clean = re.sub(r"\s+", " ", content).strip()
+                        result.append(ident + opener + content_clean + closer)
+                        i = k + 1
+                        continue
+                result.append(out[i:j])
+                i = j
+                continue
+            result.append(ch)
+            i += 1
+        out = "".join(result)
+    return out
+
+
 def repair_mermaid(spec: str) -> str | None:
     """Best-effort cleanup of a Mermaid spec.
 
     Strips wrapping ``` fences, removes any prose before the first valid
-    header line, and balances trivial bracket mismatches. Returns the
-    cleaned spec, or ``None`` if it can't be salvaged.
+    header line, normalises newlines inside node labels (a common LLM
+    error that breaks rendering catastrophically), and balances trivial
+    bracket mismatches. Returns the cleaned spec, or ``None`` if it
+    can't be salvaged.
     """
     if not spec:
         return None
@@ -126,6 +184,12 @@ def repair_mermaid(spec: str) -> str | None:
     if start == -1:
         return None
     s = "\n".join(lower_lines[start:]).strip()
+
+    # Normalise newlines inside node labels — otherwise mermaid silently
+    # absorbs everything until the next ']' into one node's label and
+    # renders it as raw text. This is the most common Genie/deep-dive
+    # mermaid failure mode.
+    s = _collapse_label_newlines(s)
 
     # Balance brackets — append closers if a small mismatch exists. Refuse if
     # the imbalance is severe (likely truncated mid-spec).

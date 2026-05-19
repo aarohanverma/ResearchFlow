@@ -38,6 +38,7 @@ import MarkdownRenderer, {
 import { useHighlightSearch, HighlightSearchToolbar } from "@/components/ui/HighlightSearch";
 import { PaperPanel } from "@/components/paper/PaperPanel";
 import type { Paper } from "@/types";
+import { useFeature } from "@/lib/features";
 import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useAuthStore } from "@/store/auth";
 import { api } from "@/lib/api";
@@ -132,7 +133,6 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
 function MermaidDiagram({ spec }: { spec: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState(false);
-  const [height, setHeight] = useState(320);
 
   useEffect(() => {
     setError(false);
@@ -157,7 +157,16 @@ function MermaidDiagram({ spec }: { spec: string }) {
             fontSize: "13px",
             fontFamily: "ui-monospace, SFMono-Regular, monospace",
           },
-          flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            padding: 20,
+            useMaxWidth: true,
+            wrappingWidth: 240,
+            nodeSpacing: 50,
+            rankSpacing: 60,
+          },
+          maxTextSize: 200000,
           securityLevel: "loose",
           suppressErrorRendering: true,
         });
@@ -191,22 +200,14 @@ function MermaidDiagram({ spec }: { spec: string }) {
         ref.current.innerHTML = svg;
         const svgEl = ref.current.querySelector("svg");
         if (!svgEl) return;
-        let nh = 0;
-        const vb = svgEl.getAttribute("viewBox");
-        if (vb) {
-          const parts = vb.trim().split(/[\s,]+/);
-          const nw = parseFloat(parts[2] || "0");
-          nh = parseFloat(parts[3] || "0");
-          if (nw > 0 && nh > 0) {
-            const cw = ref.current.clientWidth || 800;
-            nh = Math.max(200, Math.min(500, Math.round((cw / nw) * nh)));
-          }
-        }
-        if (!nh) nh = parseFloat(svgEl.getAttribute("height") || "0") || 320;
+        // Let SVG scale to its natural viewBox aspect ratio: capping height
+        // squishes nodes and truncates labels. ``useMaxWidth: true`` already
+        // makes mermaid emit a fully responsive SVG; we only need to ensure
+        // it actually fills the container width and keeps its own aspect.
+        svgEl.removeAttribute("height");
         svgEl.setAttribute("width", "100%");
-        svgEl.setAttribute("height", String(nh));
-        svgEl.style.cssText = `width:100%;height:${nh}px;display:block;`;
-        setHeight(nh);
+        svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
+        svgEl.style.cssText = "width:100%;height:auto;max-width:100%;display:block;";
       } catch {
         if (cancelled) return;
         setError(true);
@@ -223,18 +224,71 @@ function MermaidDiagram({ spec }: { spec: string }) {
       </pre>
     );
   }
-  return <div ref={ref} className="overflow-x-auto w-full" style={{ height: `${height}px` }} />;
+  return <div ref={ref} className="overflow-x-auto w-full" />;
 }
 
 // ── Inline text renderer ──────────────────────────────────────────────────────
+
+// Citation handler context — wired from the IdeaDetail page so any [N]
+// reference inside the deep-dive markdown opens the same paper preview
+// overlay used by the Source Papers section.
+const CitationCtx = React.createContext<((n: string) => void) | null>(null);
+
+function renderInlineWithCitations(text: string, onClick: ((n: string) => void) | null, keyPrefix: string): React.ReactNode {
+  if (!onClick) return text;
+  const out: React.ReactNode[] = [];
+  const re = /\[(\d+(?:\s*[-,]\s*\d+)*)\]/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let i = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const inner = m[1];
+    const nums = inner.split(/\s*,\s*/).flatMap((part) => {
+      const r = part.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (r) {
+        const a = parseInt(r[1], 10), b = parseInt(r[2], 10);
+        if (a <= b && b - a < 50) return Array.from({ length: b - a + 1 }, (_, k) => String(a + k));
+      }
+      return [part.trim()];
+    });
+    out.push(
+      <span key={`${keyPrefix}-cit-${i++}`} className="inline-flex gap-0.5 align-baseline mx-0.5">
+        {nums.map((n, j) => (
+          <button
+            key={j}
+            type="button"
+            onClick={() => onClick(n)}
+            className="text-[11px] leading-none px-1 py-0.5 rounded bg-indigo-900/40 border border-indigo-700/40 text-indigo-300 hover:bg-indigo-800/60 hover:text-indigo-200 transition-colors"
+            title="Open source paper"
+          >
+            [{n}]
+          </button>
+        ))}
+      </span>,
+    );
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
 
 function InlineText({ text }: { text: string }) {
   // Decorations come from React context so the page-wide highlight + search
   // hook reaches every span — bold, italic, code, headings, list items,
   // callouts, table cells — without prop-drilling.
   const dec = useDecorations();
-  const wrap = (s: string, k: string): React.ReactNode =>
-    dec ? <>{decorateString(s, dec, k)}</> : s;
+  const onCite = React.useContext(CitationCtx);
+  const wrap = (s: string, k: string): React.ReactNode => {
+    const cited = onCite ? renderInlineWithCitations(s, onCite, k) : s;
+    if (!dec) return cited;
+    // ``decorateString`` operates on strings, not React nodes, so only
+    // apply it when there are no citation buttons to preserve.
+    if (typeof cited === "string") {
+      return <>{decorateString(cited, dec, k)}</>;
+    }
+    return cited;
+  };
   const normalised = text.replace(/\\\(([\s\S]+?)\\\)/g, (_m, e) => `$${e}$`);
   // Allow up to 600 chars and across newlines so long equations render correctly
   const parts = normalised.split(
@@ -736,7 +790,15 @@ interface ChatMessage {
   streaming?: boolean;
 }
 
-function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () => void }) {
+function IdeaChatPanel({
+  capsuleId,
+  onClose,
+  onCitationClick,
+}: {
+  capsuleId: string;
+  onClose: () => void;
+  onCitationClick?: (num: string, isArxiv: boolean) => void;
+}) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     { role: "assistant", content: "I have this research idea fully loaded. Ask me anything — how to test it, what could go wrong, how to extend it, related work, or how to pitch it." },
   ]);
@@ -799,14 +861,51 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
     inputRef.current?.focus();
   }
 
+  // Resizable side-panel width — persists via localStorage so the user's
+  // preferred width survives navigation / reload.
+  const [panelW, setPanelW] = useState<number>(() => {
+    if (typeof window === "undefined") return 420;
+    try {
+      const saved = parseInt(localStorage.getItem("rf_idea_qa_w") || "", 10);
+      if (Number.isFinite(saved) && saved >= 320 && saved <= 1100) return saved;
+    } catch {}
+    return 420;
+  });
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelW;
+    const onMove = (ev: MouseEvent) => {
+      const dx = startX - ev.clientX;
+      const w = Math.min(1100, Math.max(320, startW + dx));
+      setPanelW(w);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      try { localStorage.setItem("rf_idea_qa_w", String(panelW)); } catch {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  useEffect(() => {
+    try { localStorage.setItem("rf_idea_qa_w", String(panelW)); } catch {}
+  }, [panelW]);
+
   return (
     <motion.div
       initial={{ x: "100%", opacity: 0 }}
       animate={{ x: 0, opacity: 1 }}
       exit={{ x: "100%", opacity: 0 }}
       transition={{ type: "spring", damping: 30, stiffness: 340 }}
-      className="fixed right-0 top-0 bottom-0 w-[420px] bg-gray-950 border-l border-gray-800/70 flex flex-col z-40 shadow-2xl shadow-black/60"
+      className="fixed right-0 top-0 bottom-0 bg-gray-950 border-l border-gray-800/70 flex flex-col z-40 shadow-2xl shadow-black/60"
+      style={{ width: `${panelW}px` }}
     >
+      <div
+        onMouseDown={startResize}
+        className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-violet-500/30 transition-colors z-20"
+        title="Drag to resize"
+      />
       <div className="flex items-center justify-between px-4 py-3.5 border-b border-gray-800/60 bg-gray-950/95 backdrop-blur-sm">
         <div className="flex items-center gap-2.5">
           <div className="w-7 h-7 rounded-lg bg-violet-600/20 border border-violet-500/30 flex items-center justify-center">
@@ -827,7 +926,9 @@ function IdeaChatPanel({ capsuleId, onClose }: { capsuleId: string; onClose: () 
               {msg.role === "user" ? <UserIcon size={12} className="text-white" /> : <BotIcon size={12} className="text-violet-400" />}
             </div>
             <div className={`max-w-[87%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "bg-violet-600 text-white rounded-tr-sm" : "bg-gray-900 border border-gray-800/60 text-gray-200 rounded-tl-sm"}`}>
-              {msg.role === "user" ? <span className="whitespace-pre-wrap">{msg.content}</span> : <MarkdownRenderer content={msg.content} />}
+              {msg.role === "user"
+                ? <span className="whitespace-pre-wrap">{msg.content}</span>
+                : <MarkdownRenderer content={msg.content} onCitationClick={onCitationClick} />}
               {msg.streaming && <span className="inline-block w-1.5 h-4 bg-violet-400 rounded-sm animate-pulse ml-0.5 align-middle" />}
             </div>
           </div>
@@ -1180,6 +1281,9 @@ export default function IdeaDeepDivePage() {
   // the current idea (``id``) is always counted in, so we cap this at 2
   // (current + 2 others = max 3 capsules fused).
   const [combineOpen, setCombineOpen] = useState(false);
+  // Combine sub-feature gate — hides the "Combine with…" CTA when the
+  // admin (or per-user override) has turned the feature off.
+  const combineEnabled = useFeature("genie_combine_enabled", true);
   const [combineList, setCombineList] = useState<IdeaCapsule[] | null>(null);
   const [combineLoading, setCombineLoading] = useState(false);
   const [combineSubmitting, setCombineSubmitting] = useState(false);
@@ -1309,43 +1413,18 @@ export default function IdeaDeepDivePage() {
         setCombineError("Combine could not be queued.");
         return;
       }
-      const sessionId = queued.session_id;
-      const POLL_MS = 2500;
-      const MAX_ATTEMPTS = 145; // ~6 minutes
-      let attempts = 0;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let lastStatus: any = null;
-      while (attempts < MAX_ATTEMPTS) {
-        attempts += 1;
-        await new Promise<void>(resolve => setTimeout(resolve, POLL_MS));
-        try {
-          const sess = await api.get<{ status: string; capsule_id?: string | null; error?: string | null }>(
-            `/genie/sessions/${sessionId}`,
-          );
-          lastStatus = sess;
-          if (sess.status === "done" && sess.capsule_id) {
-            setCombineOpen(false);
-            router.push(`/genie/idea/${sess.capsule_id}`);
-            return;
-          }
-          if (sess.status === "failed" || sess.status === "done_empty" || sess.status === "cancelled") {
-            setCombineError(
-              sess.error
-              || (sess.status === "done_empty"
-                ? "These two ideas didn't combine into a meaningful hybrid. Pick a different pair."
-                : "Combine failed. Please try again."),
-            );
-            return;
-          }
-          // status === "running" → keep polling
-        } catch {
-          // Transient network error — keep polling.
-        }
-      }
-      setCombineError(
-        (lastStatus && typeof lastStatus.error === "string" && lastStatus.error)
-          || "Combine is taking longer than expected — check back in a moment.",
-      );
+      // Register with the global jobs store — the panel shows progress,
+      // a toast fires on completion, and the user can navigate freely.
+      useJobsStore.getState().addGenieJob({
+        session_id: queued.session_id,
+        status: "running",
+        capsule_id: null,
+        error: null,
+        created_at: new Date().toISOString(),
+        completed_at: null,
+        label: "Combine ideas",
+      });
+      setCombineOpen(false);
     } catch (e: unknown) {
       // 400 / 404 / 5xx surface here. The backend uses 422 historically for
       // infeasible pairs, but the new endpoint moves that verdict into the
@@ -1461,14 +1540,16 @@ export default function IdeaDeepDivePage() {
                       <><SparklesIcon size={12} />Generate Deep Dive</>
                     )}
                   </button>
-                  <button
-                    onClick={openCombine}
-                    className="flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"
-                    title="Fuse this idea with another to produce a new hybrid hypothesis"
-                  >
-                    <GitMergeIcon size={12} />
-                    Combine with…
-                  </button>
+                  {combineEnabled && (
+                    <button
+                      onClick={openCombine}
+                      className="flex items-center gap-2 px-4 py-1.5 rounded-xl text-xs font-semibold transition-all bg-gray-800 text-gray-300 hover:bg-gray-700 border border-gray-700/50"
+                      title="Fuse this idea with another to produce a new hybrid hypothesis"
+                    >
+                      <GitMergeIcon size={12} />
+                      Combine with…
+                    </button>
+                  )}
                   {ddStatus === "done" && (
                     <button
                       onClick={() => setShowChat(v => !v)}
@@ -1506,6 +1587,11 @@ export default function IdeaDeepDivePage() {
           {/* Content */}
           {status === "done" && capsule && (
             <DecorationsProvider value={highlightSearch.decorations}>
+            <CitationCtx.Provider value={(num: string) => {
+              const idx = parseInt(num, 10) - 1;
+              const sp = capsule?.source_papers?.[idx];
+              if (sp?.id) openSourcePaper(sp.id);
+            }}>
             <div ref={highlightSearch.scrollRef}>
               <CapsuleHero capsule={capsule} />
 
@@ -1716,13 +1802,27 @@ export default function IdeaDeepDivePage() {
               </div>
               <div className="h-16" />
             </div>
+            </CitationCtx.Provider>
             </DecorationsProvider>
           )}
         </div>
       </div>
 
       <AnimatePresence>
-        {showChat && id && <IdeaChatPanel capsuleId={id} onClose={() => setShowChat(false)} />}
+        {showChat && id && (
+          <IdeaChatPanel
+            capsuleId={id}
+            onClose={() => setShowChat(false)}
+            onCitationClick={(num) => {
+              // Citations rendered by the chat are 1-indexed against the
+              // capsule's ``source_papers`` array — open the same paper
+              // preview overlay used by the Source Papers section.
+              const idx = parseInt(num, 10) - 1;
+              const sp = capsule?.source_papers?.[idx];
+              if (sp?.id) openSourcePaper(sp.id);
+            }}
+          />
+        )}
       </AnimatePresence>
 
       {/* Source-paper preview overlay — same PaperPanel used on the Feed,

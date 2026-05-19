@@ -1,13 +1,23 @@
-"""Per-step result caching keyed on (tool, params, namespace, user).
+"""Per-step result caching keyed on (tool, params, namespace, [user]).
 
 Wraps the platform's existing CacheBackend (local-file or Redis depending on
 ``CACHE_BACKEND``). Cache hits short-circuit tool execution while still
 writing an AssistantStep row so the reasoning tree shows a "cache hit" entry.
 
-Each tool declares its own TTL via ``cache_ttl_seconds``; tools that aren't
-cacheable (side_effects=True, or anything time-sensitive) skip the cache
-entirely. The cache is keyed on a stable hash of the input params so a
-reorder of dict keys doesn't fork the cache.
+Two cache-key shapes:
+
+* **User-scoped** (default): ``assistant:step:{tool}:{user}:{ns}:{hash}``
+  — for tools whose output depends on user-private state (bookmarks,
+  memory, interest profile).
+* **Shared** : ``assistant:step:{tool}:shared:{ns}:{hash}`` — for tools
+  that hit public/deterministic sources (arXiv, Wikipedia, Wolfram,
+  Semantic Scholar, etc.). Dropping the user prefix lets every user
+  reuse the same cached result, which is exactly the dedup goal for
+  shared deterministic outputs.
+
+Membership in ``_SHARED_SOURCE_TOOLS`` is the explicit allow-list. Anything
+not listed stays user-scoped, so adding a new tool defaults to safe
+behaviour.
 """
 
 from __future__ import annotations
@@ -63,6 +73,47 @@ _TOOL_TTL: dict[str, int] = {
 _DEFAULT_TTL = 600  # 10 minutes default for tools not listed above
 
 
+# Tools whose output is a pure function of (params, public corpus) — no
+# dependence on the calling user's private state. These share their cache
+# across every user, so identical params dedup to a single fetch+compute.
+_SHARED_SOURCE_TOOLS: frozenset[str] = frozenset({
+    # arXiv / academic search & retrieval
+    "arxiv_search",
+    "arxiv_import",
+    "pubmed",
+    "inspire_hep",
+    "nasa_ads",
+    "crossref",
+    "citation_finder",
+    "literature_survey",
+    "research_trends",
+    "author_network",
+    "semantic_scholar",
+    "compare_papers",
+    "frontier_scan",
+    # Knowledge bases
+    "wikipedia",
+    "concept_explain",
+    "wolfram_alpha",
+    "oeis",
+    # Code / model search
+    "github_search",
+    "huggingface_search",
+    "papers_with_code",
+    # Security / clinical / economic
+    "nvd_cve",
+    "clinicaltrials",
+    "fred",
+    # Misc deterministic
+    "unpaywall",
+    "latex_parse",
+    "web_search",
+    "deep_search",
+    "graph_query",
+    "graph_neighbors",
+})
+
+
 class StepCache:
     """Cache key construction + read/write around the existing CacheBackend."""
 
@@ -81,10 +132,18 @@ class StepCache:
         user_id: UUID,
         namespace_key: str,
     ) -> str:
-        """Stable cache key. User-scoped to avoid cross-user data bleed."""
+        """Stable cache key.
+
+        Shared-source tools (``_SHARED_SOURCE_TOOLS``) drop the user
+        segment so every user reuses a single cached result, which is
+        the dedup goal for deterministic public-data tools. All other
+        tools stay user-scoped to avoid leaking private-state-dependent
+        outputs (e.g. bookmarks queries).
+        """
         canonical = json.dumps(params, sort_keys=True, default=str)
         digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
-        return f"assistant:step:{tool_name}:{user_id}:{namespace_key}:{digest}"
+        scope = "shared" if tool_name in _SHARED_SOURCE_TOOLS else str(user_id)
+        return f"assistant:step:{tool_name}:{scope}:{namespace_key}:{digest}"
 
     async def get(self, key: str) -> dict | None:
         """Return cached step output or ``None`` on miss."""

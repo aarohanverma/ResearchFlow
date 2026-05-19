@@ -62,6 +62,9 @@ class _JobChannel:
         self.history.append(event)
         if len(self.history) > self._max_history:
             self.history = self.history[-self._max_history:]
+        # ``list(self.subscribers)`` snapshots so subscriber list mutations
+        # during dispatch (e.g. a subscriber's unsubscribe inside a callback)
+        # never raise RuntimeError nor skip recipients.
         for q in list(self.subscribers):
             try:
                 q.put_nowait(event)
@@ -69,6 +72,13 @@ class _JobChannel:
                 log.warning("event bus queue full for job=%s — dropping event", event.job_id)
 
     def subscribe(self) -> asyncio.Queue[AssistantEvent]:
+        """Add a new subscriber and pre-fill it with the buffered history.
+
+        The queue ``maxsize`` is bounded so a stuck consumer cannot grow
+        the queue without bound. The history replay therefore stops early
+        if it would overflow — the consumer still gets the most recent
+        events because ``history`` is a sliding window.
+        """
         q: asyncio.Queue[AssistantEvent] = asyncio.Queue(maxsize=500)
         # Replay buffered history so late subscribers don't miss anything.
         for ev in self.history:
@@ -77,6 +87,15 @@ class _JobChannel:
             except asyncio.QueueFull:
                 break
         self.subscribers.append(q)
+        # If the channel was already closed before this subscribe (turn
+        # finished, then a late SSE client connected for history), drop a
+        # terminal heartbeat so the consumer can exit cleanly instead of
+        # waiting for an event that will never arrive.
+        if self._closed:
+            try:
+                q.put_nowait(AssistantEvent(kind="heartbeat", job_id="", payload={"closed": True}))
+            except asyncio.QueueFull:
+                pass
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
@@ -86,6 +105,14 @@ class _JobChannel:
             pass
 
     def close(self) -> None:
+        """Mark the channel closed and notify every live subscriber.
+
+        Sends a terminal ``heartbeat`` event with ``payload={"closed": True}``
+        so consumers can break out of their read loop deterministically
+        rather than waiting on the 15-s SSE heartbeat to time out.
+        """
+        if self._closed:
+            return
         self._closed = True
         for q in list(self.subscribers):
             try:
@@ -99,24 +126,35 @@ class _JobChannel:
 
 
 class AssistantEventBus:
-    """Process-wide bus: one channel per job_id, lazy-created on first use."""
+    """Process-wide bus: one channel per job_id, lazy-created on first use.
+
+    All public methods are safe to call from any coroutine on the same event
+    loop — channel creation uses ``setdefault`` so two concurrent
+    :meth:`publish` / :meth:`subscribe` calls for the same brand-new job_id
+    can never end up with two distinct channels (one would otherwise win and
+    the other's events would be silently dropped).
+    """
 
     def __init__(self) -> None:
         self._channels: dict[str, _JobChannel] = {}
 
-    def publish(self, event: AssistantEvent) -> None:
-        ch = self._channels.get(event.job_id)
-        if ch is None:
-            ch = _JobChannel()
-            self._channels[event.job_id] = ch
-        ch.publish(event)
+    def _get_or_create(self, job_id: str) -> _JobChannel:
+        """Return the channel for ``job_id``, creating it atomically if absent.
 
-    def subscribe(self, job_id: str) -> asyncio.Queue[AssistantEvent]:
+        ``dict.setdefault`` is atomic with respect to other coroutines on
+        the same event loop, so we never race on first-publish vs
+        first-subscribe for the same job.
+        """
         ch = self._channels.get(job_id)
         if ch is None:
-            ch = _JobChannel()
-            self._channels[job_id] = ch
-        return ch.subscribe()
+            ch = self._channels.setdefault(job_id, _JobChannel())
+        return ch
+
+    def publish(self, event: AssistantEvent) -> None:
+        self._get_or_create(event.job_id).publish(event)
+
+    def subscribe(self, job_id: str) -> asyncio.Queue[AssistantEvent]:
+        return self._get_or_create(job_id).subscribe()
 
     def unsubscribe(self, job_id: str, q: asyncio.Queue) -> None:
         ch = self._channels.get(job_id)
@@ -152,6 +190,10 @@ class AssistantEventBus:
     def evict(self, job_id: str) -> None:
         """Drop a finished channel after subscribers have drained."""
         self._channels.pop(job_id, None)
+
+    def channel_count(self) -> int:
+        """Diagnostic: number of live channels in memory."""
+        return len(self._channels)
 
 
 _BUS = AssistantEventBus()

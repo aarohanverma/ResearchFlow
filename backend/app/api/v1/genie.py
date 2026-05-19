@@ -5,21 +5,30 @@ import logging
 import uuid
 from collections import Counter
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 
 log = logging.getLogger(__name__)
 
-from app.core.deps import CurrentUserID, DBSession
+from app.core.deps import CurrentUserID, DBSession, require_feature
 from app.models.genie import ElementType, GenieElement, GenieSession, IdeaCapsule
 from app.models.paper import Paper, PaperChunk
 from app.repositories.paper import PaperRepository
 from app.schemas import GenieRequest, IdeaCapsuleResponse, IdeaCapsuleListItem, SourcePaperInfo
 from app.workflows.genie import run_genie, run_genie_background
 
-router = APIRouter(prefix="/genie", tags=["genie"])
+# Router-level gate: when ``genie_enabled`` is off for the caller, every
+# route below returns 404 — the entire feature looks unmounted. Sub-flags
+# (genie_auto_enabled, genie_combine_enabled) are applied per-endpoint
+# further down so admins can grant manual synthesis but withhold auto
+# discovery, or vice-versa.
+router = APIRouter(
+    prefix="/genie",
+    tags=["genie"],
+    dependencies=[Depends(require_feature("genie_enabled"))],
+)
 
 # Strong references to background tasks so Python 3.12+ doesn't GC them while
 # they're still running (which would emit a RuntimeWarning and may cancel the
@@ -356,7 +365,7 @@ async def get_session_status(session_id: uuid.UUID, user_id: CurrentUserID, db: 
     }
 
 
-@router.post("/synthesize-auto", response_class=StreamingResponse)
+@router.post("/synthesize-auto", response_class=StreamingResponse, dependencies=[Depends(require_feature("genie_auto_enabled"))])
 async def synthesize_auto(
     user_id: CurrentUserID,
     db: DBSession,
@@ -438,7 +447,7 @@ _CONCEPT_STOPLIST: frozenset[str] = frozenset({
 })
 
 
-@router.post("/auto-batch")
+@router.post("/auto-batch", dependencies=[Depends(require_feature("genie_auto_enabled"))])
 async def auto_batch_synthesis(
     user_id: CurrentUserID,
     db: DBSession,
@@ -1387,6 +1396,7 @@ async def list_capsules(
         IdeaCapsule.is_scout_generated,
         IdeaCapsule.source_mode,
         IdeaCapsule.source_query,
+        IdeaCapsule.namespace_key,
         IdeaCapsule.deep_dive_status,
         IdeaCapsule.created_at,
         IdeaCapsule.seed_element_ids,
@@ -1400,42 +1410,127 @@ async def list_capsules(
 
     if namespace_keys:
         allowed_ns = {k.strip() for k in namespace_keys.split(",") if k.strip()}
-        all_seed_ids: list[uuid.UUID] = []
-        for row in rows:
-            for eid in (row.seed_element_ids or []):
-                try:
-                    all_seed_ids.append(uuid.UUID(str(eid)))
-                except (ValueError, AttributeError):
-                    pass
 
-        element_ns_map: dict[str, str] = {}
-        if all_seed_ids:
-            ns_rows = await db.execute(
-                select(GenieElement.id, Paper.namespace_key)
-                .join(Paper, Paper.id == GenieElement.paper_id)
+        # ── Primary: rows with a stamped namespace_key filter directly ─
+        # These were created (or back-filled) after the namespace_key column
+        # shipped. Combined ideas land here via their stamped dominant
+        # parent namespace, so they no longer leak across namespaces.
+        primary_kept: list = []
+        legacy_rows: list = []
+        for row in rows:
+            ns = (getattr(row, "namespace_key", None) or "").strip()
+            if ns:
+                if ns in allowed_ns:
+                    primary_kept.append(row)
+            else:
+                legacy_rows.append(row)
+
+        # ── Fallback for legacy rows (NULL namespace_key) ──────────────
+        # Resolve namespace through:
+        #   1. seed_element → Paper.namespace_key  (papers/concepts/methods)
+        #   2. seed_element → IdeaCapsule.namespace_key  (parent capsules,
+        #      used by combined ideas whose seeds are other capsules with
+        #      no Paper FK).
+        # A row with NEITHER signal is shown (legacy-safe), but newly
+        # created combined ideas always have namespace_key set so the
+        # "show on missing" branch only affects pre-migration data.
+        if legacy_rows:
+            all_seed_ids: list[uuid.UUID] = []
+            for row in legacy_rows:
+                for eid in (row.seed_element_ids or []):
+                    try:
+                        all_seed_ids.append(uuid.UUID(str(eid)))
+                    except (ValueError, AttributeError):
+                        pass
+
+            element_ns_map: dict[str, str] = {}
+            if all_seed_ids:
+                # Path 1: seed → paper namespace
+                paper_ns_rows = await db.execute(
+                    select(GenieElement.id, Paper.namespace_key)
+                    .join(Paper, Paper.id == GenieElement.paper_id)
+                    .where(
+                        GenieElement.id.in_(all_seed_ids),
+                        GenieElement.paper_id.isnot(None),
+                    )
+                )
+                for r in paper_ns_rows.fetchall():
+                    element_ns_map[str(r.id)] = r.namespace_key or ""
+
+                # Path 2: seed → parent-capsule namespace. Combined ideas'
+                # seed GenieElements point at other capsules; that path
+                # is what previously broke the filter.
+                capsule_ns_rows = await db.execute(
+                    select(GenieElement.id, IdeaCapsule.namespace_key)
+                    .join(IdeaCapsule, IdeaCapsule.id == GenieElement.idea_capsule_id)
+                    .where(
+                        GenieElement.id.in_(all_seed_ids),
+                        GenieElement.idea_capsule_id.isnot(None),
+                    )
+                )
+                for r in capsule_ns_rows.fetchall():
+                    eid = str(r.id)
+                    # Don't overwrite a paper-derived namespace with a
+                    # missing capsule-namespace.
+                    if r.namespace_key and not element_ns_map.get(eid):
+                        element_ns_map[eid] = r.namespace_key
+
+            for row in legacy_rows:
+                seed_ns = {
+                    element_ns_map[eid]
+                    for eid in (row.seed_element_ids or [])
+                    if eid in element_ns_map and element_ns_map[eid]
+                }
+                if not seed_ns:
+                    # No namespace can be resolved at all — show it so we
+                    # never silently drop a legitimate row. This branch
+                    # only triggers for very old rows; new combined ideas
+                    # land in primary_kept via their stamped namespace.
+                    primary_kept.append(row)
+                elif seed_ns & allowed_ns:
+                    primary_kept.append(row)
+
+        rows = primary_kept
+
+    # Resolve direct parent capsule ids for combined ideas — frontend uses
+    # this to greys out ancestors when entering Combine mode.
+    parent_map: dict[str, list[str]] = {}
+    combined_rows = [
+        r for r in rows
+        if (getattr(r, "source_mode", "") or "") == "combined" and r.seed_element_ids
+    ]
+    if combined_rows:
+        all_seed_uuids: list[uuid.UUID] = []
+        seed_to_row: dict[str, list[str]] = {}
+        for r in combined_rows:
+            for eid in (r.seed_element_ids or []):
+                try:
+                    all_seed_uuids.append(uuid.UUID(str(eid)))
+                except (ValueError, AttributeError):
+                    continue
+                seed_to_row.setdefault(str(eid), []).append(str(r.id))
+        if all_seed_uuids:
+            link_rows = await db.execute(
+                select(GenieElement.id, GenieElement.idea_capsule_id)
                 .where(
-                    GenieElement.id.in_(all_seed_ids),
-                    GenieElement.paper_id.isnot(None),
+                    GenieElement.id.in_(all_seed_uuids),
+                    GenieElement.idea_capsule_id.isnot(None),
                 )
             )
-            for r in ns_rows.fetchall():
-                element_ns_map[str(r.id)] = r.namespace_key or ""
+            for elem_id, cap_id in link_rows.fetchall():
+                if not cap_id:
+                    continue
+                for row_id in seed_to_row.get(str(elem_id), []):
+                    bucket = parent_map.setdefault(row_id, [])
+                    if str(cap_id) not in bucket:
+                        bucket.append(str(cap_id))
 
-        kept: list = []
-        for row in rows:
-            seed_ns = {
-                element_ns_map[eid]
-                for eid in (row.seed_element_ids or [])
-                if eid in element_ns_map and element_ns_map[eid]
-            }
-            if not seed_ns or seed_ns & allowed_ns:
-                kept.append(row)
-        rows = kept
-
-    return [
-        IdeaCapsuleListItem.model_validate(row, from_attributes=True)
-        for row in rows
-    ]
+    out: list[IdeaCapsuleListItem] = []
+    for row in rows:
+        item = IdeaCapsuleListItem.model_validate(row, from_attributes=True)
+        item.parent_capsule_ids = parent_map.get(str(row.id), [])
+        out.append(item)
+    return out
 
 
 async def _resolve_source_papers(capsule: IdeaCapsule, db) -> list[SourcePaperInfo]:
@@ -1685,7 +1780,7 @@ class CapsuleCombineRequest(BaseModel):
     capsule_b_id: uuid.UUID | None = None
 
 
-@router.post("/capsules/combine", status_code=202)
+@router.post("/capsules/combine", status_code=202, dependencies=[Depends(require_feature("genie_combine_enabled"))])
 async def combine_capsules(
     body: CapsuleCombineRequest,
     user_id: CurrentUserID,

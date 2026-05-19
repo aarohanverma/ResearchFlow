@@ -8,12 +8,13 @@ from uuid import UUID
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from app.assistant.events import get_event_bus
 from app.assistant.tools import describe_for_planner
-from app.core.deps import CurrentUserID, DBSession
+from app.core.deps import CurrentUserID, DBSession, require_feature
 from app.repositories.assistant import AssistantRepository
 from app.schemas import (
     ArxivImportRequest,
@@ -34,7 +35,11 @@ from app.schemas import (
 from app.services import research_assistant as assistant_service
 from app.services.arxiv_import import ArxivImportService
 
-router = APIRouter(prefix="/assistant", tags=["assistant"])
+router = APIRouter(
+    prefix="/assistant",
+    tags=["assistant"],
+    dependencies=[Depends(require_feature("assistant_enabled"))],
+)
 
 
 @router.get("/sessions", response_model=list[AssistantSessionResponse])
@@ -248,6 +253,55 @@ async def cancel_task(job_id: str, user_id: CurrentUserID):
     if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"status": "cancelled", "job_id": job_id}
+
+
+class AssistantReplayRequest(BaseModel):
+    """Edit a user turn (``content`` set) or regenerate an assistant turn (``content`` omitted)."""
+
+    content: str | None = None
+
+
+@router.post(
+    "/sessions/{session_id}/messages/{message_id}/replay",
+    response_model=AssistantSubmitResponse,
+    status_code=202,
+)
+async def replay_message(
+    session_id: UUID,
+    message_id: UUID,
+    body: AssistantReplayRequest,
+    user_id: CurrentUserID,
+    db: DBSession,
+):
+    """Edit-and-resubmit a user message OR regenerate an assistant reply.
+
+    Both modes truncate every message after the target and queue a fresh
+    orchestration turn so the user sees a clean ChatGPT-style "rewrite
+    this and try again" flow without leaving dangling branches.
+    """
+    try:
+        user_msg_id, assistant_msg_id, job_id = await assistant_service.replay_turn(
+            user_id=user_id,
+            session_id=session_id,
+            message_id=message_id,
+            new_content=body.content,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    repo = AssistantRepository(db)
+    session = await repo.get_session(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    user_msg = next(m for m in session.messages if m.id == user_msg_id)
+    assistant_msg = next(m for m in session.messages if m.id == assistant_msg_id)
+    task = next(t for t in session.tasks if t.job_id == job_id)
+    return AssistantSubmitResponse(
+        session=AssistantSessionResponse.model_validate(session),
+        user_message=user_msg,
+        assistant_message=assistant_msg,
+        task=task,
+    )
 
 
 @router.get("/tasks", response_model=list[AssistantTaskResponse])
@@ -636,7 +690,7 @@ async def get_seed_questions(
     Checks a static map first; generates via LLM for unknown namespaces with
     a 2-second timeout and graceful fallback.
     """
-    questions = _seeds_for_namespace(namespace_key)
+    questions = await _seeds_for_namespace(namespace_key)
     return {"questions": questions, "namespace_key": namespace_key}
 
 
@@ -736,9 +790,19 @@ async def stream_task_events(
                     # Heartbeat keeps proxies (nginx / cloud LBs) from idling out.
                     yield ": heartbeat\n\n"
                     continue
+                except asyncio.CancelledError:
+                    # Client disconnected mid-stream — exit cleanly so the
+                    # subscription is unregistered in the finally block.
+                    break
                 payload = json.dumps(event.to_json(), default=str)
                 yield f"event: {event.kind}\ndata: {payload}\n\n"
                 if event.kind in {"task_completed", "task_failed", "task_cancelled"}:
+                    break
+                # Channel-closed sentinel from the event bus — the producing
+                # turn finished without emitting a terminal task event (e.g.
+                # worker process exited mid-turn). Drop the connection rather
+                # than holding the SSE open indefinitely.
+                if event.kind == "heartbeat" and (event.payload or {}).get("closed"):
                     break
         finally:
             bus.unsubscribe(job_id, queue)

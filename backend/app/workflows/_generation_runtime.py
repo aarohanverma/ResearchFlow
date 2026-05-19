@@ -287,7 +287,17 @@ def queue_generation_job(
 async def recover_orphaned_artifacts() -> int:
     """Resume or fail artifacts left in ``running``/``queued`` state after a crash.
 
-    For each orphaned artifact:
+    Safety bounds (added May 2026 to prevent surprise re-billing):
+
+    * **Age cap** — artifacts older than ``_ARTIFACT_RESUME_AGE`` are NOT
+      resumed; they are marked failed. Long-stale orphans almost always
+      indicate a real error rather than a transient restart.
+    * **Operator opt-out** — set ``ARTIFACT_AUTO_RESUME=0`` (or
+      ``DISABLE_AUTO_RECOVERY=1``) to skip resume entirely on startup.
+      Useful during incident response when you don't want every restart
+      to chew tokens re-finishing prior runs.
+
+    For each surviving orphan:
 
     - If a LangGraph checkpoint exists for its UUID, re-dispatch the workflow so
       it resumes from the last completed node (no wasted tokens).
@@ -298,8 +308,18 @@ async def recover_orphaned_artifacts() -> int:
     Returns:
         Number of artifacts processed (resumed + failed).
     """
+    import os
+    from datetime import timedelta as _td
     from sqlalchemy import or_, select, update
     from app.models.artifact import ArtifactStatus, GeneratedArtifact
+
+    _ARTIFACT_RESUME_AGE = _td(hours=2)
+
+    # Operator opt-out: ARTIFACT_AUTO_RESUME=0 disables resume; orphans are
+    # marked failed wholesale. Useful for incident response.
+    auto_resume = (os.environ.get("ARTIFACT_AUTO_RESUME", "1").strip() not in {"0", "false", "False", "no"})
+    if os.environ.get("DISABLE_AUTO_RECOVERY", "").strip() in {"1", "true", "True", "yes"}:
+        auto_resume = False
 
     try:
         async with async_session_factory() as db:
@@ -318,6 +338,55 @@ async def recover_orphaned_artifacts() -> int:
 
     if not orphans:
         return 0
+
+    now = datetime.now(timezone.utc)
+
+    # Partition orphans into (too-old | opted-out) vs (in-window + resumable).
+    too_old: list = []
+    resumable: list = []
+    for art in orphans:
+        created = art.created_at
+        if created and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age = now - created if created else _ARTIFACT_RESUME_AGE
+        if (not auto_resume) or age > _ARTIFACT_RESUME_AGE:
+            too_old.append(art)
+        else:
+            resumable.append(art)
+
+    # Mark too-old / opt-out orphans failed up-front so they don't sit
+    # forever and so the remainder of this function only deals with rows
+    # we actually intend to dispatch.
+    if too_old:
+        reason = (
+            "Auto-recovery disabled — please retry."
+            if not auto_resume
+            else "Worker restart older than recovery window — please retry."
+        )
+        try:
+            async with async_session_factory() as db:
+                for art in too_old:
+                    await db.execute(
+                        update(GeneratedArtifact)
+                        .where(GeneratedArtifact.id == art.id)
+                        .values(
+                            status=ArtifactStatus.failed,
+                            error_message=reason,
+                            completed_at=now,
+                        )
+                    )
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("recover_orphaned_artifacts: failing too-old orphans failed — %s", exc)
+
+    orphans = resumable
+    if not orphans:
+        log.info(
+            "recover_orphaned_artifacts: marked %d too-old/opt-out orphan(s) failed, "
+            "no in-window orphans to resume",
+            len(too_old),
+        )
+        return len(too_old)
 
     # Initialise checkpointer so we can check for existing state
     try:

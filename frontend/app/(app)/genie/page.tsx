@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import { useAuthStore } from "@/store/auth";
 import { useJobsStore } from "@/store/jobs";
 import { useNamespaceStore, NAMESPACE_TREE } from "@/store/namespace";
+import { useFeature } from "@/lib/features";
 import type { GenieElement, IdeaCapsule, BookmarkFolder, Bookmark } from "@/types";
 import { FolderIcon, SlidersHorizontalIcon, RotateCcwIcon, ThermometerIcon } from "lucide-react";
 import {
@@ -118,6 +119,40 @@ const DEFAULT_THRESHOLDS = {
 
 const THRESHOLDS_KEY = "genie_thresholds";
 
+/**
+ * Build a short, plain-prose TL;DR from an Idea Capsule's hypothesis text.
+ *
+ * The combined-idea fusion model produces one long paragraph rich with
+ * markdown emphasis (``**bold**``, backticks, parens with commas) and
+ * almost no early sentence terminators. Splitting on the first ``[.!?]``
+ * returns the whole paragraph, which then renders as a wall of raw
+ * markdown. This helper strips emphasis markers, lifts the first clause,
+ * and caps to a reasonable length so the TL;DR is what it claims to be.
+ */
+function buildTldr(hypothesis: string, maxLen = 220): string {
+  if (!hypothesis) return "";
+  // Drop markdown emphasis markers; keep the underlying word.
+  let s = hypothesis
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*\n]+)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  // Strip a leading "TL;DR — " if the model emitted one verbatim.
+  s = s.replace(/^TL[;:]?DR\s*[—\-:]\s*/i, "");
+  // Take the first real sentence. Parentheses with commas inside fool a
+  // naive split, so we look for ".", "!", or "?" followed by whitespace
+  // (or end of string).
+  const m = s.match(/^[^.!?]+[.!?](?=\s|$)/);
+  let head = (m ? m[0] : s).trim();
+  if (head.length > maxLen) {
+    head = head.slice(0, maxLen - 1).trimEnd() + "…";
+  } else if (!/[.!?…]$/.test(head)) {
+    head += ".";
+  }
+  return head;
+}
+
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function GeniePage() {
@@ -129,7 +164,18 @@ export default function GeniePage() {
   const genieJobs = useJobsStore((s) => s.genieJobs);
   const { selectedTopics, activeSubject, getPrimaryNamespaceKey } = useNamespaceStore();
   const searchParams = useSearchParams();
+  // Feature gates — hide UI for any Genie sub-feature the admin has
+  // turned off. The /genie/* router would already 404 the request, but
+  // hiding the button is the cleaner UX so the user never sees a dead
+  // control that vanishes when clicked.
+  const combineEnabled = useFeature("genie_combine_enabled", true);
+  const autoEnabled = useFeature("genie_auto_enabled", true);
   const [mode, setMode] = useState<Mode>("manual");
+  // Fall back to manual when the user lands in / has stale auto mode
+  // and the admin has since disabled auto-discovery.
+  useEffect(() => {
+    if (!autoEnabled && mode === "auto") setMode("manual");
+  }, [autoEnabled, mode]);
   const [activeTab, setActiveTab] = useState<Tab>(
     searchParams.get("tab") === "discoveries" ? "discoveries" : "cauldron"
   );
@@ -164,6 +210,9 @@ export default function GeniePage() {
   const [combineSelected, setCombineSelected] = useState<string[]>([]);
   const [combineBusy, setCombineBusy] = useState(false);
   const [combineErr, setCombineErr] = useState<string | null>(null);
+  // Hybrid client-side search over the Ideas list — filters on title,
+  // hypothesis, open_questions, and source_query as the user types.
+  const [ideaSearch, setIdeaSearch] = useState("");
   const toggleCombineSelect = useCallback((capsuleId: string) => {
     setCombineSelected(prev => {
       if (prev.includes(capsuleId)) return prev.filter(id => id !== capsuleId);
@@ -196,46 +245,21 @@ export default function GeniePage() {
         setCombineBusy(false);
         return;
       }
-      // Poll until terminal status; 2.5 s × 145 ≈ 6 min cap.
-      const sessionId = queued.session_id;
-      const POLL_MS = 2500;
-      const MAX_ATTEMPTS = 145;
-      let attempts = 0;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let lastStatus: any = null;
-      while (attempts < MAX_ATTEMPTS) {
-        attempts += 1;
-        await new Promise<void>(resolve => setTimeout(resolve, POLL_MS));
-        try {
-          const sess = await api.get<{ status: string; capsule_id?: string | null; error?: string | null }>(
-            `/genie/sessions/${sessionId}`,
-          );
-          lastStatus = sess;
-          if (sess.status === "done" && sess.capsule_id) {
-            // Refresh capsule list so the new hybrid appears immediately on
-            // return navigation, then jump to its detail page.
-            api.get<IdeaCapsule[]>(capsulesUrl).then(setCapsules).catch(() => {});
-            router.push(`/genie/idea/${sess.capsule_id}`);
-            setCombineBusy(false);
-            setCombineSelected([]);
-            return;
-          }
-          if (sess.status === "failed" || sess.status === "done_empty" || sess.status === "cancelled") {
-            setCombineErr(
-              sess.error
-                || (sess.status === "done_empty"
-                  ? "These ideas didn't combine into a meaningful hybrid. Try a different selection."
-                  : "Combine failed. Please try again."),
-            );
-            setCombineBusy(false);
-            return;
-          }
-        } catch { /* transient — keep polling */ }
-      }
-      setCombineErr(
-        (lastStatus && typeof lastStatus.error === "string" && lastStatus.error)
-          || "Combine is taking longer than expected — check back in a moment.",
-      );
+      // Register the combine run with the global Genie-jobs store — the
+      // jobs panel polls and shows the toast/notification automatically,
+      // matching the Auto / Query / Manual-Synthesize background UX. No
+      // inline polling here; the user can leave the page.
+      addGenieJob({
+        session_id: queued.session_id,
+        status: "running",
+        capsule_id: null,
+        error: null,
+        created_at: new Date().toISOString(),
+        completed_at: null,
+        label: "Combine ideas",
+      });
+      setActiveTab("discoveries");
+      exitCombineMode();
       setCombineBusy(false);
     } catch (e: unknown) {
       const err = e as { status?: number; detail?: string | { message?: string }; message?: string };
@@ -308,12 +332,31 @@ export default function GeniePage() {
     const qs = new URLSearchParams();
     if (selectedTopics.length) qs.set("namespace_keys", selectedTopics.join(","));
     qs.set("bookmarks_only", "true");
-    api.get<GenieElement[]>(`/genie/elements?${qs}`).then(setElements).catch(() => {});
-    setCapsulesLoading(true);
-    api.get<IdeaCapsule[]>(capsulesUrl)
-      .then(setCapsules)
-      .catch(() => {})
-      .finally(() => setCapsulesLoading(false));
+    // SWR pattern — paint cached snapshot instantly when a fresh one
+    // exists, then refresh in the background. The capsule list is
+    // expensive to render with all the score bars; serving it cached
+    // makes tab-revisits feel instant.
+    import("@/lib/swr").then(({ swrGet }) => {
+      swrGet<GenieElement[]>(
+        `genie:elements:${qs.toString()}`,
+        `/genie/elements?${qs}`,
+        (v) => setElements(v),
+        45_000,
+      ).catch(() => {});
+
+      setCapsulesLoading(true);
+      swrGet<IdeaCapsule[]>(
+        `genie:capsules:${selectedTopics.join(",")}`,
+        capsulesUrl,
+        (v, source) => {
+          setCapsules(v);
+          // Stop showing skeletons as soon as ANY data arrives
+          // (cache or network).
+          if (source === "cache" || source === "network") setCapsulesLoading(false);
+        },
+        45_000,
+      ).catch(() => setCapsulesLoading(false));
+    });
     api.get<AutoStatus>("/genie/auto-status").then(setAutoStatus).catch(() => {});
     api.get<BookmarkFolder[]>("/bookmarks/folders").then(setFolders).catch(() => {});
     api.get<Bookmark[]>("/bookmarks").then(data => {
@@ -563,6 +606,11 @@ export default function GeniePage() {
           completed_at: null,
           label: "Custom Genie Job",
         });
+        // Match Auto / Query / Combine UX — surface the job-in-progress on
+        // the Ideas tab so the user sees the running pill and the freshly
+        // synthesized capsule lands there when complete, instead of
+        // streaming output into the Cauldron panel.
+        setActiveTab("discoveries");
       } catch {}
       return;
     }
@@ -704,11 +752,13 @@ export default function GeniePage() {
           </div>
 
           <div className="flex bg-gray-900 rounded-xl p-0.5 gap-0.5">
-            {([
+            {(([
               { key: "manual", icon: "⚗️", label: "Manual" },
-              { key: "auto",   icon: "⚡", label: "Auto"   },
+              // Auto tab hides when the admin disables the auto-discovery
+              // sub-feature; manual/query keep working in either case.
+              ...(autoEnabled ? [{ key: "auto" as Mode, icon: "⚡", label: "Auto" }] : []),
               { key: "query",  icon: "🔍", label: "Query"  },
-            ] as { key: Mode; icon: string; label: string }[]).map(({ key, icon, label }) => (
+            ]) as { key: Mode; icon: string; label: string }[]).map(({ key, icon, label }) => (
               <button
                 key={key}
                 onClick={() => {
@@ -1056,8 +1106,10 @@ export default function GeniePage() {
             </div>
 
             <div className="rounded-xl border border-white/5 bg-gray-900/40 p-3 text-center">
-              <p className="text-2xl font-bold text-white mb-0.5">{capsules.length}</p>
-              <p className="text-[10px] text-gray-600">Total Ideas</p>
+              <p className="text-2xl font-bold text-white mb-0.5">
+                {capsules.filter(c => c.source_mode === "auto" || c.is_scout_generated).length}
+              </p>
+              <p className="text-[10px] text-gray-600">Auto Ideas</p>
             </div>
 
             <button
@@ -1187,9 +1239,9 @@ export default function GeniePage() {
           ))}
 
           {/* Combine-mode toggle — surfaces only on the Ideas tab and only
-              when there are at least 2 ideas to combine. Off by default so
-              the page stays clean; clicking flips card UI into select mode. */}
-          {activeTab === "discoveries" && capsules.length >= 2 && (
+              when there are at least 2 ideas to combine. Hidden entirely
+              when the admin has disabled the combine sub-feature. */}
+          {activeTab === "discoveries" && capsules.length >= 2 && combineEnabled && (
             <button
               onClick={() => combineMode ? exitCombineMode() : setCombineMode(true)}
               className={
@@ -1271,55 +1323,54 @@ export default function GeniePage() {
 
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => synthesize(false)}
-                  disabled={cauldron.length < 2 || streaming}
-                  className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-30 text-white font-semibold rounded-xl px-5 py-2 text-sm transition-all shadow-lg shadow-indigo-900/40"
-                >
-                  {streaming ? <Loader2Icon size={13} className="animate-spin" /> : <ZapIcon size={13} />}
-                  {streaming ? "Synthesizing…" : "Synthesize"}
-                </button>
-
-                <button
                   onClick={() => synthesize(true)}
-                  disabled={cauldron.length < 2 || streaming || genieJobs.some(gj => gj.status === "pending" || gj.status === "running")}
-                  className="flex items-center gap-2 bg-gray-800/60 hover:bg-gray-700/60 disabled:opacity-30 text-gray-300 font-medium rounded-xl px-4 py-2 text-sm transition-all border border-white/5"
-                  title="Run as background job — one at a time"
+                  disabled={
+                    cauldron.length < 2
+                    || streaming
+                    || genieJobs.some(gj => gj.status === "pending" || gj.status === "running")
+                  }
+                  className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-30 text-white font-semibold rounded-xl px-5 py-2 text-sm transition-all shadow-lg shadow-indigo-900/40"
+                  title="Synthesize — runs in the background; the resulting idea appears in the Ideas tab when ready."
                 >
-                  <ClockIcon size={13} className="text-gray-500" />
-                  Background
+                  <ZapIcon size={13} />
+                  Synthesize
                 </button>
               </div>
             </div>
 
-            <AnimatePresence>
-              {streamLog.length > 0 && (
-                <motion.div
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="space-y-3"
-                >
-                  {streamLog.map((event, i) => (
-                    <GenieEventBlock key={i} event={event} />
-                  ))}
-
-                  {SECTION_ORDER.filter((s) => elaborationSections[s]).map((section) => (
-                    <ElaborationSectionBlock
-                      key={section}
-                      section={section}
-                      content={elaborationSections[section]}
-                    />
-                  ))}
-
-                  <div ref={bottomRef} />
-                </motion.div>
-              )}
-            </AnimatePresence>
+            {/* Inline streaming output was removed — Manual Genie now runs as
+                a background job (matching Auto and Query modes). Progress is
+                visible via the global Jobs panel; the resulting idea lands on
+                the Ideas tab when synthesis completes. */}
           </div>
         )}
 
         {/* ── Discoveries tab ──────────────────────────────────────────── */}
         {activeTab === "discoveries" && (
           <div className="flex-1 overflow-y-auto p-6">
+            {/* Hybrid client-side search across title, hypothesis, open
+                questions, and source_query. Matches the Feed search UX —
+                instant filter as the user types, no extra round-trip. */}
+            {!capsulesLoading && capsules.length > 0 && (
+              <div className="mb-5 relative">
+                <SearchIcon size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600 pointer-events-none" />
+                <input
+                  value={ideaSearch}
+                  onChange={(e) => setIdeaSearch(e.target.value)}
+                  placeholder="Search ideas by title, hypothesis, question…"
+                  className="w-full bg-gray-900/60 border border-white/8 rounded-xl pl-9 pr-9 py-2.5 text-sm text-gray-100 placeholder:text-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
+                />
+                {ideaSearch && (
+                  <button
+                    onClick={() => setIdeaSearch("")}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                    title="Clear search"
+                  >
+                    <XIcon size={13} />
+                  </button>
+                )}
+              </div>
+            )}
             {capsulesLoading ? (
               // Skeleton cards while the initial capsule fetch is in flight.
               // Three rows is enough to fill the visible area on most screens
@@ -1395,20 +1446,75 @@ export default function GeniePage() {
                   </div>
                 )}
 
-                {capsules.map((capsule) => (
-                  <CapsuleCard
-                    key={capsule.id}
-                    capsule={capsule}
-                    onDelete={() => deleteCapsule(capsule.id)}
-                    onChat={() => setChatCapsule(capsule)}
-                    combineSelected={combineMode && combineSelected.includes(capsule.id)}
-                    combineDisabled={
-                      combineBusy ||
-                      (!combineSelected.includes(capsule.id) && combineSelected.length >= COMBINE_MAX)
+                {(() => {
+                  const searchQ = ideaSearch.trim().toLowerCase();
+                  const filtered = searchQ
+                    ? capsules.filter((c) => {
+                        const hay = [
+                          c.title,
+                          c.hypothesis,
+                          c.open_questions,
+                          c.source_query,
+                          c.rationale,
+                        ]
+                          .filter(Boolean)
+                          .join(" \n ")
+                          .toLowerCase();
+                        return hay.includes(searchQ);
+                      })
+                    : capsules;
+                  // Build ancestor sets so combined ideas can't be re-fused with
+                  // any of their own ancestors (or vice-versa). Walks
+                  // `parent_capsule_ids` transitively over the visible capsules.
+                  const parentMap = new Map<string, string[]>();
+                  for (const c of capsules) {
+                    parentMap.set(c.id, c.parent_capsule_ids || []);
+                  }
+                  const ancestorCache = new Map<string, Set<string>>();
+                  const collectAncestors = (id: string): Set<string> => {
+                    if (ancestorCache.has(id)) return ancestorCache.get(id)!;
+                    const acc = new Set<string>();
+                    const stack = [...(parentMap.get(id) || [])];
+                    while (stack.length) {
+                      const p = stack.pop()!;
+                      if (acc.has(p)) continue;
+                      acc.add(p);
+                      for (const gp of parentMap.get(p) || []) stack.push(gp);
                     }
-                    onCombineToggle={combineMode ? () => toggleCombineSelect(capsule.id) : undefined}
-                  />
-                ))}
+                    ancestorCache.set(id, acc);
+                    return acc;
+                  };
+                  // A capsule is forbidden if:
+                  //   - it is an ancestor of any selected capsule, OR
+                  //   - any selected capsule is an ancestor of it.
+                  const forbidden = new Set<string>();
+                  for (const sel of combineSelected) {
+                    for (const a of collectAncestors(sel)) forbidden.add(a);
+                    for (const c of capsules) {
+                      if (collectAncestors(c.id).has(sel)) forbidden.add(c.id);
+                    }
+                  }
+                  return filtered.map((capsule) => {
+                    const isForbidden = combineMode && forbidden.has(capsule.id);
+                    return (
+                      <CapsuleCard
+                        key={capsule.id}
+                        capsule={capsule}
+                        onDelete={() => deleteCapsule(capsule.id)}
+                        onChat={() => setChatCapsule(capsule)}
+                        combineSelected={combineMode && combineSelected.includes(capsule.id)}
+                        combineDisabled={
+                          combineBusy ||
+                          isForbidden ||
+                          (!combineSelected.includes(capsule.id) && combineSelected.length >= COMBINE_MAX)
+                        }
+                        onCombineToggle={
+                          combineMode && !isForbidden ? () => toggleCombineSelect(capsule.id) : undefined
+                        }
+                      />
+                    );
+                  });
+                })()}
               </div>
             )}
           </div>
@@ -1819,7 +1925,7 @@ function CapsuleCard({
               </p>
             )}
             <p className="text-sm text-indigo-400/90 font-medium leading-relaxed mb-1">
-              TL;DR — {capsule.hypothesis.split(/[.!?]/)[0].trim()}.
+              TL;DR — {buildTldr(capsule.hypothesis)}
             </p>
           </div>
 

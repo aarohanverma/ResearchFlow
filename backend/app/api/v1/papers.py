@@ -352,11 +352,15 @@ async def unhide_paper(
 
 
 @router.get("/{paper_id}", response_model=PaperResponse)
-async def get_paper(paper_id: UUID, db: DBSession):
+async def get_paper(paper_id: UUID, user_id: CurrentUserID, db: DBSession):  # noqa: ARG001 — auth gate
     """Return the full detail of a single paper by its UUID.
+
+    Papers are shared content, but the endpoint is auth-gated to prevent
+    unauthenticated scraping and rate-limit abuse.
 
     Args:
         paper_id: UUID of the paper to retrieve.
+        user_id: Required for auth; the paper itself is returned unfiltered.
         db: Injected async database session.
 
     Returns:
@@ -373,7 +377,7 @@ async def get_paper(paper_id: UUID, db: DBSession):
 
 
 @router.get("/{paper_id}/related", response_model=list[PaperResponse])
-async def get_related_papers(paper_id: UUID, db: DBSession):
+async def get_related_papers(paper_id: UUID, user_id: CurrentUserID, db: DBSession):  # noqa: ARG001 — auth gate
     """Return up to 5 papers semantically similar to the given paper.
 
     Uses pure cosine similarity on abstract embeddings (minimum 0.50) with a
@@ -472,7 +476,7 @@ async def get_related_papers(paper_id: UUID, db: DBSession):
 
 
 @router.get("/{paper_id}/tldr")
-async def get_paper_tldr(paper_id: UUID, db: DBSession):
+async def get_paper_tldr(paper_id: UUID, user_id: CurrentUserID, db: DBSession):  # noqa: ARG001 — auth gate
     """Return cached TLDR or generate + save using the cheapest model."""
     repo = PaperRepository(db)
     paper = await repo.get_by_id(paper_id)

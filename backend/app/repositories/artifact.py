@@ -119,6 +119,76 @@ class ArtifactRepository:
         )
         return result.scalar_one_or_none()
 
+    async def find_reusable_completed_global(
+        self,
+        *,
+        source_id: UUID,
+        generation_type: GenerationType,
+        expertise_level: str | None,
+        orientation: str | None,
+        provider: str | None,
+        model_used: str | None,
+        parser_used: str | None,
+    ) -> GeneratedArtifact | None:
+        """Find a globally-reusable completed artifact across all users.
+
+        Generation outputs are deterministic functions of the source paper/capsule
+        and the (expertise, orientation, provider, model, parser) tuple — none of
+        which is user-specific. When any user has already produced the matching
+        artifact, every other user requesting the same combination should reuse
+        the heavy outputs (blob, content, tokens) rather than pay for re-generation.
+
+        Returns the **oldest** matching completed artifact, so the canonical row
+        is stable (lookups don't bounce between competing copies as new users
+        regenerate). Returns ``None`` if no global match exists.
+        """
+        stmt = select(GeneratedArtifact).where(
+            GeneratedArtifact.source_id == source_id,
+            GeneratedArtifact.generation_type == generation_type,
+            GeneratedArtifact.status == ArtifactStatus.completed,
+        )
+        if expertise_level is not None:
+            stmt = stmt.where(GeneratedArtifact.expertise_level == expertise_level)
+        if orientation is not None:
+            stmt = stmt.where(GeneratedArtifact.orientation == orientation)
+        if provider is not None:
+            stmt = stmt.where(GeneratedArtifact.provider == provider)
+        if model_used is not None:
+            stmt = stmt.where(GeneratedArtifact.model_used == model_used)
+        # parser_used is permissive — only constrain when the requester knows the parser.
+        if parser_used is not None:
+            stmt = stmt.where(
+                (GeneratedArtifact.parser_used == parser_used)
+                | (GeneratedArtifact.parser_used.is_(None))
+            )
+
+        stmt = stmt.order_by(GeneratedArtifact.created_at.asc()).limit(1)
+        result = await self._db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def count_references_to_blob(
+        self,
+        *,
+        blob_path: str,
+        exclude_artifact_id: UUID | None = None,
+    ) -> int:
+        """Count how many artifact rows reference a given blob path.
+
+        Used to decide whether deleting a single artifact should also delete
+        the underlying blob. With cross-user dedup, multiple artifacts may
+        share the same ``blob_path``; the blob should survive until the last
+        referencing row is removed.
+        """
+        from sqlalchemy import func as _func
+
+        stmt = select(_func.count()).select_from(GeneratedArtifact).where(
+            GeneratedArtifact.blob_path == blob_path,
+        )
+        if exclude_artifact_id is not None:
+            stmt = stmt.where(GeneratedArtifact.id != exclude_artifact_id)
+        result = await self._db.execute(stmt)
+        return int(result.scalar_one() or 0)
+
     async def list_for_source(
         self,
         *,

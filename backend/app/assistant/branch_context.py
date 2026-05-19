@@ -124,14 +124,29 @@ async def ensure_branch_seed_summary(
             if not text:
                 return ""
 
-            state["branch_seed_summary"] = {
-                "anchor": anchor_id,
-                "text": text,
-                "generated_at": _now_iso(),
-            }
-            session.state = state
-            flag_modified(session, "state")
-            await db.commit()
+            # Serialise the final write so we don't clobber a concurrent
+            # writer's ``state`` update on the same session.
+            from app.assistant.state_lock import session_state_lock
+            async with session_state_lock(session_id):
+                async with async_session_factory() as db2:
+                    repo2 = AssistantRepository(db2)
+                    fresh = await repo2.get_session(user_id, session_id)
+                    if fresh is None:
+                        return text
+                    fresh_state = dict(fresh.state or {})
+                    cached_again = fresh_state.get("branch_seed_summary") or {}
+                    # A concurrent writer may already have produced the
+                    # same anchor — keep the freshest version.
+                    if cached_again.get("anchor") == anchor_id and cached_again.get("text"):
+                        return cached_again["text"]
+                    fresh_state["branch_seed_summary"] = {
+                        "anchor": anchor_id,
+                        "text": text,
+                        "generated_at": _now_iso(),
+                    }
+                    fresh.state = fresh_state
+                    flag_modified(fresh, "state")
+                    await db2.commit()
             return text
     except Exception as exc:
         log.debug("ensure_branch_seed_summary failed session=%s: %s", session_id, exc)
@@ -149,15 +164,24 @@ async def update_branch_progress_summary(
     summary into the parent's ``state["branch_summaries"]`` map. A
     ``last_message_id`` checkpoint prevents redundant work — when nothing
     new has been said on the branch since the last update, we no-op.
+
+    State serialisation:
+        The LLM summarisation runs OUTSIDE the parent's state lock so
+        sibling branches can summarise concurrently. Only the final
+        merge into ``parent.state["branch_summaries"]`` is serialised
+        under the parent's lock, which prevents sibling branches from
+        clobbering each other's slots in the registry.
     """
+    from app.assistant.state_lock import session_state_lock
+
     try:
+        # ── Phase 1: discover, dedup, summarise (no parent lock held) ─
         async with async_session_factory() as db:
             repo = AssistantRepository(db)
             branch = await repo.get_session(user_id, branch_session_id)
             if branch is None or branch.parent_session_id is None:
                 return
             msgs = list(branch.messages or [])
-            # Filter out empty/in-flight messages so we don't summarise drafts.
             substantive = [
                 m for m in msgs
                 if (m.content or "").strip()
@@ -166,38 +190,60 @@ async def update_branch_progress_summary(
             if not substantive:
                 return
             latest_id = str(substantive[-1].id)
-            parent = await repo.get_session(user_id, branch.parent_session_id)
-            if parent is None:
+            parent_id = branch.parent_session_id
+            parent_preview = await repo.get_session(user_id, parent_id)
+            if parent_preview is None:
                 return
-            pstate = dict(parent.state or {})
-            registry = dict(pstate.get("branch_summaries") or {})
-            existing = registry.get(str(branch_session_id)) or {}
+            preview_registry = dict((parent_preview.state or {}).get("branch_summaries") or {})
+            existing = preview_registry.get(str(branch_session_id)) or {}
             if existing.get("last_message_id") == latest_id and existing.get("summary"):
                 return  # no new content since last update
-
+            branch_title = branch.title
+            branch_ns = branch.namespace_key
             tail = substantive[-_BRANCH_PROGRESS_TAIL:]
-            summary = await _summarize_messages(
-                tail,
-                heading=(
-                    f"Branch session ({branch.title!r}) — summarise what was "
-                    f"explored, what was found, and any pending question, in "
-                    f"≤{_BRANCH_PROGRESS_MAX_WORDS} words."
-                ),
-                max_words=_BRANCH_PROGRESS_MAX_WORDS,
-                namespace_key=branch.namespace_key,
-            )
-            if not summary:
-                return
-            registry[str(branch_session_id)] = {
-                "title": branch.title,
-                "summary": summary,
-                "last_message_id": latest_id,
-                "updated_at": _now_iso(),
-            }
-            pstate["branch_summaries"] = registry
-            parent.state = pstate
-            flag_modified(parent, "state")
-            await db.commit()
+
+        summary = await _summarize_messages(
+            tail,
+            heading=(
+                f"Branch session ({branch_title!r}) — summarise what was "
+                f"explored, what was found, and any pending question, in "
+                f"≤{_BRANCH_PROGRESS_MAX_WORDS} words."
+            ),
+            max_words=_BRANCH_PROGRESS_MAX_WORDS,
+            namespace_key=branch_ns,
+        )
+        if not summary:
+            return
+
+        # ── Phase 2: serialised merge under the parent's state lock ──
+        async with session_state_lock(parent_id):
+            async with async_session_factory() as db:
+                repo = AssistantRepository(db)
+                parent = await repo.get_session(user_id, parent_id)
+                if parent is None:
+                    return
+                pstate = dict(parent.state or {})
+                registry = dict(pstate.get("branch_summaries") or {})
+                # Re-check the dedup checkpoint inside the lock to avoid
+                # a concurrent writer's slot being clobbered by a stale
+                # decision from before we acquired the lock.
+                fresh_existing = registry.get(str(branch_session_id)) or {}
+                if (
+                    fresh_existing.get("last_message_id") == latest_id
+                    and fresh_existing.get("summary")
+                ):
+                    return
+                registry[str(branch_session_id)] = {
+                    "title": branch_title,
+                    "summary": summary,
+                    "last_message_id": latest_id,
+                    "updated_at": _now_iso(),
+                }
+                pstate["branch_summaries"] = registry
+                parent.state = pstate
+                flag_modified(parent, "state")
+                await db.commit()
+            return
     except Exception as exc:
         log.debug(
             "update_branch_progress_summary failed branch=%s: %s",
@@ -225,9 +271,10 @@ async def prune_session_state(*, session_id: UUID, user_id: UUID) -> None:
 
     Never raises; this is best-effort housekeeping fired post-turn.
     """
+    from app.assistant.state_lock import session_state_lock
     try:
         from datetime import datetime, timezone, timedelta
-        async with async_session_factory() as db:
+        async with session_state_lock(session_id), async_session_factory() as db:
             session = await db.get(AssistantSession, session_id)
             if session is None:
                 return

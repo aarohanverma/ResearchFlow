@@ -94,42 +94,78 @@ async def consolidate_after_turn(
 
     Never raises — wrapped so the orchestrator can ``asyncio.create_task``
     this and walk away.
+
+    State serialisation:
+        The LLM call runs OUTSIDE the per-session lock so multiple
+        consolidation passes can compose their decisions in parallel.
+        Only the final read-modify-write against ``session.state`` is
+        serialised, so we never lose updates between this pass and a
+        concurrent branch-summary roll-up / telemetry append. The lock
+        is intra-process; cross-process contention is documented as
+        last-writer-wins in ``STATE_OWNERSHIP.md``.
     """
+    from app.assistant.state_lock import session_state_lock
+
     try:
+        # ── Phase 1: LLM decision (no lock held) ──────────────────────
         async with async_session_factory() as db:
             session = await db.get(AssistantSession, session_id)
             if session is None:
                 return
-
-            # Load current memory state (across the right scopes) to give
-            # the LLM enough context to AVOID duplicating known facts.
             current_state = dict(session.state or {})
             short_mem = current_state.get("chat_memory") or {}
             root = await _resolve_root_session(db, session_id) or session
             root_state = dict(root.state or {})
             tree_mem = root_state.get("tree_memory") or {}
-            # Legacy alias for back-compat reads.
             for k, v in (root_state.get("memory") or {}).items():
                 tree_mem.setdefault(k, v)
             ns_mem = (current_state.get("ns_memory") or {}) or (root_state.get("ns_memory") or {})
 
-            decision = await _ask_llm_what_to_remember(
-                user_query=user_query,
-                assistant_answer=assistant_answer,
-                namespace_key=namespace_key,
-                short_mem=short_mem,
-                tree_mem=tree_mem,
-                ns_mem=ns_mem,
-            )
-            if not decision:
-                return
+        decision = await _ask_llm_what_to_remember(
+            user_query=user_query,
+            assistant_answer=assistant_answer,
+            namespace_key=namespace_key,
+            short_mem=short_mem,
+            tree_mem=tree_mem,
+            ns_mem=ns_mem,
+        )
+        if not decision:
+            return
+        writes = (decision.get("writes") or [])[:_MAX_WRITES_PER_TURN]
+        deletes = (decision.get("deletes") or [])[:_MAX_DELETES_PER_TURN]
+        if not writes and not deletes:
+            return
 
-            writes = (decision.get("writes") or [])[:_MAX_WRITES_PER_TURN]
-            deletes = (decision.get("deletes") or [])[:_MAX_DELETES_PER_TURN]
-
-            await _apply_writes(db, session, root, writes)
-            await _apply_deletes(db, session, root, deletes)
-            await db.commit()
+        # ── Phase 2: serialised commit ────────────────────────────────
+        # Reload the session under the per-session lock so we apply the
+        # decision against the freshest state. Tree memory may live on
+        # the root session; for medium-tier writes we additionally lock
+        # the root key to avoid sibling branches racing on the same
+        # ``tree_memory`` dict.
+        async with session_state_lock(session_id):
+            async with async_session_factory() as db:
+                session = await db.get(AssistantSession, session_id)
+                if session is None:
+                    return
+                root = await _resolve_root_session(db, session_id) or session
+                if root.id == session.id:
+                    await _apply_writes(db, session, root, writes)
+                    await _apply_deletes(db, session, root, deletes)
+                    await db.commit()
+                    return
+                # Critical: re-fetch root AFTER acquiring its lock. The earlier
+                # ``_resolve_root_session`` returns a snapshot taken before the
+                # lock was held, so a sibling branch's auto-memory pass that
+                # committed in the lock-acquisition window would otherwise be
+                # silently overwritten when we save ``root.state`` below.
+                async with session_state_lock(root.id):
+                    root = await db.get(AssistantSession, root.id)
+                    if root is None:
+                        return
+                    await db.refresh(root)
+                    await _apply_writes(db, session, root, writes)
+                    await _apply_deletes(db, session, root, deletes)
+                    await db.commit()
     except Exception as exc:
         log.warning("auto-memory consolidation failed session=%s: %s", session_id, exc)
 

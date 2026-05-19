@@ -298,6 +298,58 @@ async def trigger_generation(
                 message="Returning cached artifact. Use force_regenerate=true to regenerate.",
             )
 
+    # Cross-user dedup: a deterministic generation already completed for some
+    # other user with the same (source, type, expertise, orientation, provider,
+    # model, parser) signature. Clone the heavy outputs into a new per-user row
+    # so ownership/lifecycle remain user-scoped while saving regeneration cost.
+    if not force_regenerate:
+        reusable = await repo.find_reusable_completed_global(
+            source_id=source_uuid,
+            generation_type=gt,
+            expertise_level=expertise,
+            orientation=orientation,
+            provider=provider,
+            model_used=model,
+            parser_used=parser,
+        )
+        if reusable is not None and reusable.user_id != user_id:
+            cloned = await repo.create(
+                user_id=user_id,
+                generation_type=gt,
+                source_type=st,
+                source_id=source_uuid,
+                expertise_level=expertise,
+                orientation=orientation,
+            )
+            await repo.mark_completed(
+                cloned.id,
+                blob_path=reusable.blob_path,
+                content=reusable.content,
+                provider=reusable.provider,
+                model_used=reusable.model_used,
+                parser_used=reusable.parser_used,
+                input_tokens=0,  # this user paid no tokens — they reused output
+                output_tokens=0,
+                duration_ms=0,
+                metadata={
+                    **(reusable.artifact_metadata or {}),
+                    "reused_from_artifact": str(reusable.id),
+                },
+            )
+            await db.commit()
+            cached_title = (reusable.artifact_metadata or {}).get("source_title", "")
+            log.info(
+                "generate.trigger global_dedup artifact=%s reused_from=%s type=%s",
+                cloned.id, reusable.id, gt,
+            )
+            return TriggerResponse(
+                artifact_id=str(cloned.id),
+                job_id="cached",
+                status="completed",
+                source_title=cached_title,
+                message="Reused deterministic output from prior generation.",
+            )
+
     # Create a new artifact row in queued state
     artifact = await repo.create(
         user_id=user_id,
@@ -467,12 +519,29 @@ async def delete_artifact(
         raise HTTPException(status_code=404, detail="Artifact not found.")
 
     if artifact.blob_path:
+        # Refcount: shared deterministic outputs (clones from global dedup) may
+        # point at the same blob_path. Only delete the underlying blob when this
+        # is the LAST referencing artifact — otherwise other users' rows would
+        # be left dangling.
         try:
-            from app.adapters.blob import get_blob_storage
-            blob = get_blob_storage()
-            await blob.delete(artifact.blob_path)
-        except Exception as exc:  # noqa: BLE001 — non-fatal
-            log.warning("generate.delete_artifact blob delete failed: %s", exc)
+            other_refs = await repo.count_references_to_blob(
+                blob_path=artifact.blob_path, exclude_artifact_id=artifact.id,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            log.warning("generate.delete_artifact refcount failed: %s", exc)
+            other_refs = 1  # conservative: assume another user references it
+        if other_refs == 0:
+            try:
+                from app.adapters.blob import get_blob_storage
+                blob = get_blob_storage()
+                await blob.delete(artifact.blob_path)
+            except Exception as exc:  # noqa: BLE001 — non-fatal
+                log.warning("generate.delete_artifact blob delete failed: %s", exc)
+        else:
+            log.info(
+                "generate.delete_artifact id=%s preserved blob %s (%d other refs)",
+                artifact.id, artifact.blob_path, other_refs,
+            )
 
     # Remove checkpoint data so orphan rows don't accumulate
     try:

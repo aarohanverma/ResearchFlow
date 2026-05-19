@@ -510,9 +510,25 @@ async def _update_graph(state: IngestionState) -> IngestionState:
     Papers are batch-fetched in a single query. Graph assignments run with
     bounded concurrency (semaphore of 4), each in its own DB session to
     avoid session-sharing issues across coroutines.
+
+    When the global ``graph_enabled`` flag is off, this whole node is a
+    no-op — paper ingestion still runs end-to-end (parsing, embedding,
+    scoring, PotD), the knowledge graph simply isn't populated. Keeps
+    the graph fully disconnected when admins turn it off.
     """
     new_ids = state["new_paper_ids"]
     if not new_ids:
+        return {**state, "graph_updated": True}
+
+    try:
+        from app.services.admin_settings import get_app_settings
+        s = await get_app_settings()
+        if not bool(s.get("graph_enabled", False)):
+            log.info("ingestion.update_graph: skipped (graph_enabled=False)")
+            return {**state, "graph_updated": True}
+    except Exception:
+        # Fail-closed: when the flag can't be resolved, skip rather than
+        # silently re-enable graph writes.
         return {**state, "graph_updated": True}
 
     log.info("ingestion.update_graph count=%d", len(new_ids))

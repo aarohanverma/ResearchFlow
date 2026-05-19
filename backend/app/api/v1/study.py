@@ -8,12 +8,16 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel
 
-from app.core.deps import CurrentUserID, DBSession
+from app.core.deps import CurrentUserID, DBSession, require_feature
 from app.core.security import decode_access_token
 from app.repositories.paper import PaperRepository
 from app.workflows.study import get_user_jobs, queue_study, run_study, run_study_chat
 
-router = APIRouter(prefix="/study", tags=["study"])
+router = APIRouter(
+    prefix="/study",
+    tags=["study"],
+    dependencies=[Depends(require_feature("study_mode_enabled"))],
+)
 
 
 async def _user_id_from_query(token: str = Query(...)) -> UUID:

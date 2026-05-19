@@ -30,6 +30,8 @@ from app.models.paper import (
 from app.models.user import Annotation, User, UserInterestProfile, UserProviderSettings
 from app.models.workflow import TokenUsage, WorkflowRun
 from app.models.artifact import GeneratedArtifact
+from app.models.admin import AppSetting
+from app.models.rbac import Tier
 
 __all__ = [
     "User", "UserProviderSettings", "UserInterestProfile", "Annotation",
@@ -41,4 +43,6 @@ __all__ = [
     "GeneratedArtifact",
     "AssistantSession", "AssistantMessage", "AssistantTask", "AssistantStep",
     "AssistantArtifact", "AssistantAttachment",
+    "AppSetting",
+    "Tier",
 ]

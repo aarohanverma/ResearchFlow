@@ -233,7 +233,40 @@
       "Bash(.venv/bin/python -m pytest -x -q)",
       "Bash(grep -n \"max_tokens=\\\\|\\\\[:[0-9]\\\\{3,\\\\}\\\\]\\\\|content\\\\[:[0-9]\" /home/av/Projects/ResearchFlow/backend/app/workflows/genie.py /home/av/Projects/ResearchFlow/backend/app/workflows/genie_combine.py /home/av/Projects/ResearchFlow/backend/app/workflows/study.py)",
       "Bash(echo \"EXIT=$?\")",
-      "Bash(grep -n \"AnimatePresence>$\\\\|combineOpen &&\\\\|showChat && id\" /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/genie/idea/\\\\[id\\\\]/page.tsx)"
+      "Bash(grep -n \"AnimatePresence>$\\\\|combineOpen &&\\\\|showChat && id\" /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/genie/idea/\\\\[id\\\\]/page.tsx)",
+      "Bash(grep -rn *)",
+      "Bash(python -m pytest --collect-only -q)",
+      "Bash(python -c \"from app.api.v1 import generate; from app.repositories.artifact import ArtifactRepository; print\\('imports ok'\\)\")",
+      "Bash(python -m pytest -x -q)",
+      "Bash(npx --no-install tsc --noEmit)",
+      "Bash(grep -nA 30 \"class \\\\\\(LoginRequest\\\\|RegisterRequest\\\\|TokenResponse\\\\|UserResponse\\\\\\)\" /home/av/Projects/ResearchFlow/backend/app/schemas.py)",
+      "Bash(grep -nB1 -A 10 \"LoginRequest\\\\|RegisterRequest\\\\|TokenResponse\" /home/av/Projects/ResearchFlow/backend/app/schemas.py)",
+      "Bash(grep -nA 20 \"^@router.get.\\\\\"/{paper_id}\\\\\"\" app/api/v1/papers.py)",
+      "Bash(grep -nA 15 \"^@router.get.\\\\\"/expand\" app/api/v1/graph.py)",
+      "Bash(grep -nA 25 \"^@router\\\\..*\\\\\"/{paper_id}\\\\\"\" app/api/v1/study.py)",
+      "Bash(grep -nA 6 'graph:build:' app/api/v1/graph.py)",
+      "Bash(grep -nA 4 \"_run_deep_search_background\\\\|ds_job:\" app/api/v1/search.py)",
+      "Bash(grep -nB1 -A 15 \"^async def get_capsule\\\\|^async def get_session_status\\\\|^async def cancel_session\" app/api/v1/genie.py)",
+      "Bash(grep -nA 10 \"^async def get_session\\\\|^async def list_message_steps\\\\|^async def list_steps\\\\|^async def list_artifacts\" app/api/v1/assistant.py)",
+      "Bash(grep -nA 10 \"^async def cancel_task\\\\|^async def cancel_build_deep\\\\|^async def cancel_session\\\\|^async def cancel_artifact\" app/api/v1/assistant.py app/api/v1/generate.py app/api/v1/graph.py)",
+      "Bash(python -m pytest tests/test_security.py tests/test_api_auth.py -v)",
+      "Bash(python -m pytest -q)",
+      "Bash(grep -nB1 -A 6 \"cache_key.*=.*f\\\\\"\\\\|cache_key.*=.*hashlib\" app/api/v1/search.py app/assistant/orchestrator.py)",
+      "Bash(grep -nB1 -A 8 \"cache_key\" app/assistant/orchestrator.py)",
+      "Bash(grep -nB1 -A 5 \"InlineMath\\\\|rightarrow\\\\|\\\\\\\\\\\\\\\\rightarrow\\\\|\\\\\\\\$.*\\\\\\\\$\" /home/av/Projects/ResearchFlow/frontend/components/ui/MarkdownRenderer.tsx)",
+      "Bash(grep -n \"useMaxWidth\\\\|MermaidDiagram\\\\|mermaid.initialize\\\\|nh = parseFloat\\\\|height: \\\\`\\\\${\" /home/av/Projects/ResearchFlow/frontend/components/ui/MarkdownRenderer.tsx /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/assistant/page.tsx /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/study/\\\\[id\\\\]/page.tsx)",
+      "Bash(python -c \"from app.api.v1.router import router; print\\('OK', sum\\(1 for _ in router.routes\\), 'routes'\\)\")",
+      "Bash(python -c \"from app.api.v1.router import router; print\\('routes OK', len\\(router.routes\\)\\)\")",
+      "Bash(python -m pytest tests/test_hardening_reset.py -x -q)",
+      "Bash(python -m pytest -x -q --timeout=30)",
+      "Bash(python -m pytest tests/test_hardening_audit2.py -x --tb=short -q)",
+      "Bash(grep -nE \"except\\\\s*:\\\\s*$|except Exception\\\\s*:\\\\s*$|except.*pass$\" backend/app/assistant/recovery.py backend/app/services/research_assistant.py)",
+      "Bash(grep -nE \"except\\\\s*:\\\\s*$|except Exception:\\\\s*$\" backend/app/assistant/recovery.py backend/app/services/research_assistant.py)",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(python -m pytest tests/test_hardening_memory.py -x -q)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }

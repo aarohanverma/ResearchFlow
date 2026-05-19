@@ -412,7 +412,20 @@ async def _vector_retrieve(state: RagState) -> RagState:
 
 
 async def _graph_retrieve(state: RagState) -> RagState:
-    """Extract keywords → match concept/method nodes → load connected papers."""
+    """Extract keywords → match concept/method nodes → load connected papers.
+
+    When the graph feature is disabled, the whole step is a no-op — vector
+    retrieval has already populated ``candidate_chunk_ids`` and downstream
+    rerank / synthesis stages don't care whether graph expansion ran or
+    not. This keeps RAG working perfectly even with the graph turned off.
+    """
+    try:
+        from app.services.feature_flags import is_global_feature_enabled
+        if not await is_global_feature_enabled("graph_enabled"):
+            return state  # graceful no-op; vector candidates already in state
+    except Exception:
+        return state  # fail-closed; never break RAG over a flag-check error
+
     import re
     query = state["rewritten_query"]
     # Simple keyword extraction — split on spaces, filter short words

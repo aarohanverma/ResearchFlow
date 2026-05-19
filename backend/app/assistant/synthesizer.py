@@ -84,8 +84,12 @@ _FORMAT_GUIDANCE = (
     "• Emphasis — **bold** for key terms and definitions; *italic* for paper names "
     "and proper-noun emphasis; `code` (inline backticks) for symbols, identifiers, "
     "numeric thresholds, and file paths.\n"
-    "• Math — inline math with `$...$`, display math with `$$...$$`. Use real LaTeX, "
-    "not ASCII fallbacks like ``E = m*c^2``.\n"
+    "• Math — inline math with `$...$`, display math with `$$...$$`. Reserve "
+    "LaTeX for genuine math (equations, fractions, sums, integrals, subscripts). "
+    "For typographic arrows and operators in PROSE (NOT equations), use Unicode "
+    "directly: → ⇒ ↔ × · ± ≤ ≥ ≠ ≈ — never write `$\\rightarrow$` or "
+    "`$\\to$` in a sentence. Save `$...$` for symbols that genuinely need math "
+    "typesetting.\n"
     "• Code blocks — triple-backticks with a language tag (` ```python ` etc.) "
     "for runnable snippets, pseudocode, or shell commands. Never paste tables of "
     "numbers inside code blocks — use a markdown table instead.\n"
@@ -502,6 +506,7 @@ def _build_extra_context(results: dict) -> str:
     if mr:
         med = mr.output.get("medium") or {}
         lng = mr.output.get("long") or {}
+        brs = mr.output.get("branches") or {}
         # Support both new typed format {value, type, ts} and legacy string format
         def _fmt_entry(k: str, v: object) -> str:
             if isinstance(v, dict):
@@ -509,7 +514,7 @@ def _build_extra_context(results: dict) -> str:
                 vval = v.get("value", "")
                 return f"  [{vtype}] {k}: {vval}"
             return f"  {k}: {v}"
-        if med or lng:
+        if med or lng or brs:
             lines: list[str] = []
             if med:
                 lines.append("Session memory:")
@@ -517,6 +522,13 @@ def _build_extra_context(results: dict) -> str:
             if lng:
                 lines.append("Namespace memory (persists across sessions):")
                 lines.extend(_fmt_entry(k, v) for k, v in list(lng.items())[:8])
+            if brs:
+                lines.append("Branch / nested-chat progress (parent + siblings):")
+                for entry in list(brs.values())[:8]:
+                    title = (entry.get("title") or "Branch").strip()
+                    summary = (entry.get("summary") or "").strip()
+                    if summary:
+                        lines.append(f"  • {title}: {summary}")
             parts.append(f"<session_memory>\n" + "\n".join(lines) + "\n</session_memory>")
 
     # Frontier scan — recent papers

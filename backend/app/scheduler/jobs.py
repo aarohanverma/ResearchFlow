@@ -12,10 +12,21 @@ _scheduler: AsyncIOScheduler | None = None
 
 
 async def _run_ingestion_all() -> None:
-    """Run ingestion for every SourceMapping namespace in the DB."""
+    """Run ingestion for every SourceMapping namespace in the DB.
+
+    Gated on the global ``arxiv_ingest_enabled`` flag — when the admin
+    turns ingestion off the cron stops fetching new papers entirely.
+    The rest of the system (feed view of existing papers, RA, Genie,
+    bookmarks) keeps working; only fresh imports pause.
+    """
     from app.db.session import async_session_factory
     from app.repositories.graph import GraphRepository
     from app.workflows.ingestion import run_all_ingestion
+    from app.services.feature_flags import is_global_feature_enabled
+
+    if not await is_global_feature_enabled("arxiv_ingest_enabled"):
+        log.info("scheduler.ingestion: skipped (arxiv_ingest_enabled=False)")
+        return
 
     async with async_session_factory() as db:
         repo = GraphRepository(db)
@@ -80,20 +91,26 @@ async def _rebuild_bookmark_index() -> None:
                     )
                     papers_to_embed = [p for p in papers_q.scalars() if p.abstract]
 
+                    from app.services.semantic_chunker import chunk_section
                     for paper in papers_to_embed:
                         try:
+                            sub_chunks = chunk_section(paper.abstract or "", "abstract")
+                            if not sub_chunks:
+                                continue
                             vectors = await embed.embed_texts(
-                                [paper.abstract], task_type="RETRIEVAL_DOCUMENT"
+                                [c.content for c in sub_chunks],
+                                task_type="RETRIEVAL_DOCUMENT",
                             )
-                            db.add(PaperChunk(
-                                paper_id=paper.id,
-                                chunk_index=0,
-                                section_type="abstract",
-                                content=paper.abstract,
-                                embedding=vectors[0],
-                                embedding_dim=embed.dimensions,
-                                embedding_provider=embed.provider_id,
-                            ))
+                            for idx, (sc, vec) in enumerate(zip(sub_chunks, vectors)):
+                                db.add(PaperChunk(
+                                    paper_id=paper.id,
+                                    chunk_index=idx,
+                                    section_type="abstract",
+                                    content=sc.content,
+                                    embedding=vec,
+                                    embedding_dim=embed.dimensions,
+                                    embedding_provider=embed.provider_id,
+                                ))
                             rebuilt += 1
                         except Exception as exc:
                             log.warning(

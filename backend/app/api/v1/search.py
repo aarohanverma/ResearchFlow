@@ -38,11 +38,11 @@ from typing import Any
 # RuntimeWarning and may cancel orphaned tasks).
 _background_tasks: set[asyncio.Task] = set()
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.adapters.cache import get_cache
 from app.adapters.embedding import get_embedding_adapter
-from app.core.deps import CurrentUserID, DBSession
+from app.core.deps import CurrentUserID, DBSession, require_feature
 from app.repositories.search import SearchRepository
 from app.schemas import DeepSearchJobResponse, DeepSearchRequest, SearchResponse
 
@@ -268,7 +268,7 @@ async def _embed_query(query: str) -> tuple[list[float], int, str] | None:
 # Deep Search  (LLM-assisted retrieval pipeline)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@router.post("/deep", response_model=DeepSearchJobResponse)
+@router.post("/deep", response_model=DeepSearchJobResponse, dependencies=[Depends(require_feature("deep_search_enabled"))])
 async def deep_search(
     body: DeepSearchRequest,
     user_id: CurrentUserID,
@@ -317,7 +317,7 @@ async def deep_search(
     return result
 
 
-@router.post("/deep-bg", response_model=DeepSearchJobResponse)
+@router.post("/deep-bg", response_model=DeepSearchJobResponse, dependencies=[Depends(require_feature("deep_search_enabled"))])
 async def deep_search_background(
     body: DeepSearchRequest,
     user_id: CurrentUserID,
@@ -341,12 +341,16 @@ async def deep_search_background(
     """
     job_id = str(_uuid_mod.uuid4())
 
-    # Write pending state so the status endpoint can answer immediately
+    # Write pending state so the status endpoint can answer immediately.
+    # user_id is stamped on the record so the status/poll endpoint can
+    # enforce per-user ownership and prevent cross-user leakage of query
+    # text + results.
     cache = get_cache()
     await cache.set(
         f"ds_job:{job_id}",
         {"status": "pending", "query": body.query, "rewritten_query": None,
-         "results": None, "error": None, "cached": False, "imported_count": 0},
+         "results": None, "error": None, "cached": False, "imported_count": 0,
+         "user_id": str(user_id)},
         ttl_seconds=_DS_CACHE_TTL,
     )
 
@@ -361,6 +365,7 @@ async def deep_search_background(
             limit=body.limit,
             include_arxiv_mcp=body.include_arxiv_mcp,
             arxiv_max_results=body.arxiv_max_results,
+            user_id=str(user_id),
         )
     )
     _background_tasks.add(task)
@@ -394,6 +399,18 @@ async def deep_search_status(job_id: str, user_id: CurrentUserID):
             query="",
             error="Job not found or expired.",
         )
+    # Enforce per-user ownership: deep search queries + results are private.
+    # When the cached record is missing user_id (legacy job from before this
+    # guard shipped), treat it as un-owned and return not_found rather than
+    # exposing it. The TTL is short enough that this is a transient case.
+    owner = str(data.get("user_id") or "")
+    if not owner or owner != str(user_id):
+        return DeepSearchJobResponse(
+            job_id=job_id,
+            status="failed",
+            query="",
+            error="Job not found or expired.",
+        )
     return DeepSearchJobResponse(
         job_id=job_id,
         status=data.get("status", "pending"),
@@ -418,8 +435,13 @@ async def _run_deep_search_background(
     limit: int,
     include_arxiv_mcp: bool = True,
     arxiv_max_results: int = 8,
+    user_id: str,
 ) -> None:
-    """Background wrapper — runs ``_run_deep_search`` and writes result to cache."""
+    """Background wrapper — runs ``_run_deep_search`` and writes result to cache.
+
+    ``user_id`` is preserved on every cache write so the status endpoint can
+    enforce ownership and prevent cross-user disclosure of query + results.
+    """
     from app.db.session import async_session_factory
     try:
         async with async_session_factory() as db:
@@ -444,6 +466,7 @@ async def _run_deep_search_background(
                 "error": result.error,
                 "cached": result.cached,
                 "imported_count": result.imported_count,
+                "user_id": user_id,
             },
             ttl_seconds=_DS_CACHE_TTL,
         )
@@ -453,7 +476,8 @@ async def _run_deep_search_background(
         await cache.set(
             f"ds_job:{job_id}",
             {"status": "failed", "query": query, "rewritten_query": None,
-             "results": None, "error": str(exc), "cached": False, "imported_count": 0},
+             "results": None, "error": str(exc), "cached": False, "imported_count": 0,
+             "user_id": user_id},
             ttl_seconds=_DS_CACHE_TTL,
         )
 

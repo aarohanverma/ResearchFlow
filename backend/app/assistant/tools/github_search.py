@@ -26,9 +26,78 @@ _TIMEOUT = 15.0
 _GITHUB_SEARCH_URL = "https://api.github.com/search/repositories"
 _MAX_RESULTS = 10
 
+# Stop-words removed during compress — function words that GitHub's lexical
+# matcher will down-rank or ignore. Kept small and English-only since the
+# tool itself targets english repositories.
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "of", "in", "on", "at",
+    "to", "for", "with", "from", "by", "is", "are", "was", "were", "be",
+    "being", "been", "have", "has", "had", "do", "does", "did", "i", "me",
+    "my", "you", "your", "we", "us", "our", "this", "that", "those", "these",
+    "it", "its", "as", "so", "than", "then", "there", "here", "what", "which",
+    "who", "whom", "how", "why", "when", "where", "should", "would", "could",
+    "can", "may", "might", "will", "shall", "any", "some", "all", "no", "not",
+    "find", "show", "give", "want", "need", "please", "make", "build",
+    "implementation", "implement", "implementations", "code", "codes",
+    "research", "paper", "papers", "project", "projects",
+})
+
+
+def _compress_keyword_query(raw: str, *, max_words: int = 8) -> str:
+    """Compress a verbose natural-language query into a tight keyword phrase.
+
+    GitHub's search API matches by lexical overlap on a handful of terms; a
+    long sentence like "find me research code implementation for retrieval
+    augmented generation with chunk size and top-k retrieval" reliably
+    returns zero results. We strip stop-words and keep the most informative
+    domain terms (longer + non-stopword), capped at ``max_words``.
+
+    Pass-through behaviour when the input is already concise (≤6 words) so
+    we don't accidentally over-trim legitimate compact queries.
+    """
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return cleaned
+    words = cleaned.split()
+    if len(words) <= 6:
+        return cleaned
+
+    # Keep words that are NOT stop-words OR are short technical tokens
+    # (e.g. "RAG", "LLM", "FFT"). Preserve original casing where possible
+    # since GitHub treats e.g. "PyTorch" and "pytorch" as the same token
+    # for matching but the user sees the query echoed in logs.
+    informative: list[str] = []
+    for w in words:
+        token = w.strip(".,;:?!\"'()[]{}")
+        if not token:
+            continue
+        if token.lower() in _STOPWORDS:
+            continue
+        informative.append(token)
+        if len(informative) >= max_words:
+            break
+
+    # If filtering stripped too aggressively, fall back to the first
+    # ``max_words`` words verbatim so we still send something.
+    if len(informative) < 3:
+        informative = words[:max_words]
+    return " ".join(informative)
+
 
 class GitHubSearchInput(BaseModel):
-    query: str = Field(description="Search query for GitHub repositories (e.g. 'transformer attention mechanism pytorch')")
+    query: str = Field(
+        min_length=2,
+        max_length=120,
+        description=(
+            "SHORT keyword phrase naming the technique or library, NOT a "
+            "sentence. GitHub's index uses keyword matching, not semantic "
+            "search. Good: 'retrieval augmented generation pytorch', "
+            "'mixture of experts jax', 'GraphSAGE pytorch geometric'. "
+            "Bad: 'find me research code for RAG with chunk size and top-k "
+            "retrieval' (too verbose, will return 0 results). Keep to "
+            "3–8 concrete terms."
+        ),
+    )
     language: str = Field(default="", description="Filter by programming language (e.g. 'python', 'jupyter notebook')")
     min_stars: int = Field(default=0, description="Minimum star count filter (e.g. 50 for established repos)")
     sort: str = Field(default="stars", description="Sort by: 'stars', 'forks', 'updated', 'best-match'")
@@ -64,7 +133,13 @@ class GitHubSearchTool:
     async def run(self, ctx: ToolContext, params: GitHubSearchInput) -> ToolResult:
         await ctx.emit_progress(20, f"Searching GitHub for '{params.query[:60]}'…")
 
-        q = params.query.strip()
+        # GitHub's search ranks by lexical overlap and chokes on long
+        # phrases. If the planner sent a verbose sentence (over ~8 words),
+        # compress it to the most-informative content keywords before
+        # querying — this is how we turn 'find me retrieval augmented
+        # generation chunk size top-k research implementation code' into
+        # something GitHub actually matches.
+        q = _compress_keyword_query(params.query)
         if params.language:
             q += f" language:{params.language}"
         if params.min_stars > 0:

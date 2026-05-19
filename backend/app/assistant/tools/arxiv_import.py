@@ -35,11 +35,21 @@ class ArxivImportTool:
 
     name = "arxiv_import"
     summary = (
-        "Search arXiv via MCP and import new candidates into the active namespace. "
-        "Persists Paper rows, embeds abstracts, and indexes them in the knowledge "
-        "graph. Use when the user wants to grow the corpus, not just browse. "
-        "Pass namespace_keys=[] (default) for cross-arXiv search; only set "
-        "namespace_keys when the user explicitly scopes to specific categories."
+        "Persisting arXiv search: searches arXiv via MCP, IMPORTS new "
+        "candidates into the active namespace, EMBEDS abstracts, and "
+        "INDEXES them in the knowledge graph. Side-effecting — grows the "
+        "user's corpus.\n\n"
+        "USE WHEN: the user wants to GROW their corpus ('add the latest "
+        "papers on X to my feed', 'pull recent work on Y'), or when the "
+        "orchestrator decides the corpus is too thin for synthesis.\n"
+        "DO NOT USE WHEN: the user only wants to browse / preview "
+        "(use arxiv_search — no persistence), already has enough corpus "
+        "for a question (use deep_search), or wants a structured survey "
+        "(literature_survey will call arxiv_import internally if needed).\n\n"
+        "Pass namespace_keys=[] (default) for cross-arXiv search. Inputs: "
+        "query, namespace_key (where new papers land), max_results. "
+        "Output: imported count + paper_ids + arxiv_results — surfaced in "
+        "the Grounded grid via the coverage-guard fallback."
     )
     cost_class = "moderate"
     side_effects = True

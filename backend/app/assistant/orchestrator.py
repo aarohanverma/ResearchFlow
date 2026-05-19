@@ -54,8 +54,18 @@ _STAGE_PROGRESS = {
 # slipped through the LLM rerank tail and adds noise rather than grounding.
 # Capping the surviving list at 8 keeps the UI's *Grounded papers* block
 # scannable without dropping a useful long tail.
-_MIN_GROUNDING_SCORE = 0.40
-_MAX_GROUNDING_PAPERS = 8
+_MIN_GROUNDING_SCORE = 0.50
+_MAX_GROUNDING_PAPERS = 10
+
+# Minimum semantic similarity (query ↔ paper title+abstract) below which a
+# candidate paper is treated as off-topic noise. Applied AFTER the intrinsic
+# `search_score` gate so we also catch papers that ride in through paths
+# without per-result scores (e.g. arxiv_import coverage guard, lit-survey
+# arXiv-MCP fallback, frontier_scan recency dumps). 0.5 leaves room for
+# legitimate cross-vocabulary matches while reliably trimming the
+# "recent arXiv listing within the same namespace" tail that was
+# rendering unrelated papers in the Grounded block.
+_MIN_QUERY_PAPER_SIMILARITY = 0.50
 
 # Phrases/patterns that reliably indicate an off-topic request — i.e., not
 # research, learning, synthesis, exploration, or platform-adjacent tasks.
@@ -183,6 +193,15 @@ class Orchestrator:
             async with async_session_factory() as db:
                 ctx_bundle = await self._load_context(db, job_id)
                 if ctx_bundle is None:
+                    # Session or task was removed between submit and execution
+                    # (user archived the workspace, replay_turn deleted the
+                    # message, or recovery resumed a long-gone job). Mark the
+                    # row failed so the UI does not show a forever-running
+                    # task and the notification panel can settle.
+                    await self._handle_failed(
+                        job_id,
+                        "Session or task no longer exists — cannot execute turn.",
+                    )
                     return
                 task, session, query, namespace_keys, primary_ns, orientation, expertise = ctx_bundle
                 # Use branch-aware history computed in _load_context (includes parent msgs).
@@ -362,6 +381,18 @@ class Orchestrator:
                 except Exception:
                     log.debug("research brief composition skipped")
 
+            # Resolve effective feature flags for this user so any feature
+            # the admin disabled (globally or just for this user) is
+            # invisible to the planner — its corresponding tool is not
+            # even surfaced as a choice.
+            disabled_features: set[str] = set()
+            try:
+                from app.services.feature_flags import get_effective_features
+                eff = await get_effective_features(task.user_id)
+                disabled_features = {k for k, v in eff.items() if not v}
+            except Exception as _ff_exc:
+                log.debug("feature-flag resolution skipped: %s", _ff_exc)
+
             # LLM planner with heuristic fallback. ``aplan`` never raises —
             # it falls through to the heuristic on any LLM/parse failure.
             if hasattr(self._planner, "aplan"):
@@ -374,6 +405,7 @@ class Orchestrator:
                     expertise=expertise,
                     memory={"short": short_memory, "medium": tree_memory, "long": ns_memory},
                     disabled_tools=disabled_tools,
+                    disabled_features=disabled_features,
                     research_brief=brief_text or None,
                     intent_hint=intent_hint_text or None,
                 )
@@ -620,22 +652,23 @@ class Orchestrator:
         short_memory = dict(session_state.get("chat_memory") or {})
         ns_memory = dict(session_state.get("ns_memory") or {})
 
-        # Find the tree-root for medium memory. For a non-branch session the
-        # session is its own root, so this is cheap.
+        # Find the tree-root for medium memory. For a non-branch session
+        # this resolves in zero DB hops; for nested branches we use the
+        # recursive CTE so root resolution stays O(1) roundtrips instead
+        # of N sequential ``repo.get_session`` calls (each of which loads
+        # messages + tasks via selectinload — quite expensive on long
+        # parents). See the legacy walk preserved in
+        # ``app.assistant.tools.memory._resolve_root_session`` for the
+        # error-handling fallback. Only ``state`` is read here, so a
+        # lightweight ``db.get`` is sufficient for the final fetch.
         root_session = session
         if session.parent_session_id:
             try:
-                seen: set = set()
-                cur = session
-                for _ in range(20):
-                    if cur.parent_session_id is None or cur.parent_session_id in seen:
-                        break
-                    seen.add(cur.id)
-                    nxt = await repo.get_session(task.user_id, cur.parent_session_id)
-                    if nxt is None:
-                        break
-                    cur = nxt
-                root_session = cur
+                from app.assistant.tools.memory import _resolve_root_session_id
+                root_id = await _resolve_root_session_id(repo._db, session.id)
+                if root_id and root_id != session.id:
+                    from app.models.assistant import AssistantSession as _AS
+                    root_session = await repo._db.get(_AS, root_id) or session
             except Exception:
                 root_session = session
         root_state = dict(root_session.state or {}) if root_session is not None else {}
@@ -938,7 +971,17 @@ class Orchestrator:
     def _inject_dependencies(
         self, planned: PlannedStep, results: dict[str, ToolResult]
     ) -> dict[str, Any]:
-        """Wire deep_search outputs into downstream steps that need paper ids."""
+        """Wire outputs from earlier steps into downstream steps that need them.
+
+        * ``deep_search → genie_synthesize``: pull top paper ids/titles
+          into the seed list so the planner doesn't have to guess UUIDs.
+        * ``genie_synthesize → genie_deep_dive``: pin the deep-dive's
+          ``capsule_id`` to the just-synthesized capsule. Without this
+          the deep-dive tool falls back to a keyword search over ALL
+          prior capsules and routinely picks an older idea whose title
+          happens to overlap with the query — producing a confusing
+          "synthesized X, deep-dived on Y" mismatch in the chat.
+        """
         params = dict(planned.params)
         if planned.tool == "genie_synthesize":
             ds = results.get("deep_search")
@@ -946,6 +989,27 @@ class Orchestrator:
                 papers = ds.output["papers"][:5]
                 params["paper_ids"] = [str(p.get("paper_id") or "") for p in papers if p.get("paper_id")]
                 params["paper_titles"] = [str(p.get("title") or "") for p in papers]
+        elif planned.tool == "genie_deep_dive":
+            # Prefer the freshly-synthesized capsule when one exists this
+            # turn. Honour an explicit capsule_id from the planner only
+            # when no synthesize step ran (otherwise the planner's ID is
+            # almost always stale/guessed).
+            gs = results.get("genie_synthesize")
+            if gs and isinstance(gs.output, dict):
+                cap = gs.output.get("capsule") or {}
+                cap_id = str(cap.get("id") or "").strip()
+                if cap_id:
+                    params["capsule_id"] = cap_id
+                    # Clear any speculative query so the explicit id wins.
+                    params["query"] = ""
+            # Same pattern for genie_combine: the combined capsule id is
+            # the canonical target for a follow-up deep dive.
+            gc = results.get("genie_combine")
+            if gc and isinstance(gc.output, dict):
+                cap_id = str(gc.output.get("capsule_id") or "").strip()
+                if cap_id and not params.get("capsule_id"):
+                    params["capsule_id"] = cap_id
+                    params["query"] = ""
         return params
 
     async def _run_step(
@@ -1101,11 +1165,12 @@ class Orchestrator:
                     log.exception("failed to persist artifact step=%s", step_id)
                     await db.rollback()
 
-        if cache_key is not None:
-            payload = dict(result.output)
-            payload["__summary"] = result.summary
-            await self._cache.set(cache_key, payload, tool_name=planned.tool)
-
+        # Mark the step row + publish the event BEFORE the cache write.
+        # A slow / wedged cache backend (Redis blip, full disk on the
+        # local file cache) would otherwise leave the step DB row in the
+        # "running" state for the duration of the cache call's failure
+        # mode, which is what the UI binds to. The cache write is a
+        # latency optimisation, not a correctness boundary.
         await self._mark_step(
             step_id,
             status=AssistantStepStatus.completed,
@@ -1118,6 +1183,17 @@ class Orchestrator:
             "step_id": str(step_id), "tool": planned.tool,
             "summary": result.summary, "cache_hit": False,
         })
+
+        if cache_key is not None:
+            payload = dict(result.output)
+            payload["__summary"] = result.summary
+            try:
+                await self._cache.set(cache_key, payload, tool_name=planned.tool)
+            except Exception as exc:
+                # Already swallowed inside StepCache.set; this is just
+                # defence-in-depth so a misbehaving custom backend cannot
+                # bring down a turn after the step row is already settled.
+                log.debug("step cache write skipped tool=%s err=%s", planned.tool, exc)
 
     # ── Phase: finalize ───────────────────────────────────────────────────
 
@@ -1183,6 +1259,11 @@ class Orchestrator:
         await self._append_progress(job_id, plan.actions, "Synthesizing answer",
                                     _STAGE_PROGRESS["synthesizing"])
         papers = self._papers_from_results(results)
+        # Second-pass relevance gate: embed the user's literal query and drop
+        # any surviving candidate whose title+abstract is too semantically
+        # distant. Catches off-topic papers that slip through retrieval paths
+        # without per-result scores. Skipped (no-op) if the embedder is offline.
+        papers = await self._tighten_paper_relevance(query, papers)
         arxiv_results = self._arxiv_results_from_results(results)
         imported_count = self._imported_from_results(results)
         graph_result = self._graph_from_results(results)
@@ -1553,6 +1634,88 @@ class Orchestrator:
     # ── Result extractors ────────────────────────────────────────────────
 
     @staticmethod
+    async def _tighten_paper_relevance(query: str, papers: list[dict]) -> list[dict]:
+        """Drop papers whose abstract+title is too semantically far from the user's query.
+
+        Necessary because some retrieval paths surface papers without
+        per-result relevance scores (``arxiv_import`` coverage guard,
+        literature_survey's arXiv-MCP fallback, ``frontier_scan`` recency
+        dumps). Those paths previously rendered any cs-namespace recent
+        paper as "grounded" even when its topic was unrelated to the user's
+        question.
+
+        We embed the user's query once, embed each candidate's
+        title + abstract (truncated to 600 chars), and keep those whose
+        cosine similarity clears ``_MIN_QUERY_PAPER_SIMILARITY``. Falls
+        back to the input list on any embedding failure so we never
+        accidentally strip ALL grounding away.
+        """
+        if not papers or not query.strip():
+            return papers
+
+        import math
+        try:
+            from app.adapters.embedding import get_embedding_adapter
+            embed = get_embedding_adapter()
+            q_vec = await embed.embed_query(query)
+        except Exception as exc:
+            log.debug("relevance filter: query embed failed (%s) — keeping input", exc)
+            return papers
+
+        texts: list[str] = []
+        for p in papers:
+            title = str(p.get("title") or "")
+            abstract = str(p.get("abstract") or p.get("tldr") or p.get("summary") or "")
+            blob = f"{title}. {abstract}".strip()[:1200]
+            texts.append(blob or title or "untitled")
+
+        try:
+            vecs = await embed.embed_texts(texts, task_type="SEMANTIC_SIMILARITY")
+        except Exception as exc:
+            log.debug("relevance filter: doc embed failed (%s) — keeping input", exc)
+            return papers
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            if not a or not b or len(a) != len(b):
+                return 0.0
+            dot = 0.0
+            na = 0.0
+            nb = 0.0
+            for x, y in zip(a, b):
+                dot += x * y
+                na += x * x
+                nb += y * y
+            if na <= 0 or nb <= 0:
+                return 0.0
+            return dot / (math.sqrt(na) * math.sqrt(nb))
+
+        scored: list[tuple[float, dict]] = []
+        for p, v in zip(papers, vecs or []):
+            if not v:
+                continue
+            sim = _cos(q_vec, v)
+            annotated = dict(p)
+            annotated["query_similarity"] = round(sim, 4)
+            scored.append((sim, annotated))
+
+        if not scored:
+            return papers
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        kept = [p for sim, p in scored if sim >= _MIN_QUERY_PAPER_SIMILARITY]
+        # Never collapse to zero — keep at least the top-2 even if both are
+        # weak, so the UI shows the best available context rather than an
+        # empty Grounded block.
+        if len(kept) < 2:
+            kept = [p for _sim, p in scored[: max(2, _MAX_GROUNDING_PAPERS)]]
+        log.info(
+            "relevance filter: kept %d/%d papers (min_sim=%.2f, top_sim=%.2f)",
+            len(kept), len(papers), _MIN_QUERY_PAPER_SIMILARITY,
+            scored[0][0] if scored else 0.0,
+        )
+        return kept[:_MAX_GROUNDING_PAPERS]
+
+    @staticmethod
     def _papers_from_results(results: dict[str, ToolResult]) -> list[dict]:
         """Combine grounded papers from any retrieval tool that produced them.
 
@@ -1595,6 +1758,11 @@ class Orchestrator:
             r = results.get(tool_name)
             if r and r.output.get("papers"):
                 return _filter(list(r.output["papers"]))
+        # Literature survey now surfaces its relevance-filtered candidate
+        # papers so the Grounded grid reflects what the survey synthesised on.
+        ls = results.get("literature_survey")
+        if ls and ls.output.get("papers"):
+            return _filter(list(ls.output["papers"]))
         cx = results.get("concept_explain")
         if cx and cx.output.get("supporting_papers"):
             return _filter(list(cx.output["supporting_papers"]))

@@ -1,6 +1,11 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
+// KaTeX CSS is required for inline math rendered by ``MarkdownRenderer``'s
+// ``InlineMath`` component. Without it the rendered HTML is unstyled
+// glyphs / lays out incorrectly. Importing here loads it once for every
+// route.
+import "katex/dist/katex.min.css";
 import { Toaster } from "@/components/ui/toaster";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });

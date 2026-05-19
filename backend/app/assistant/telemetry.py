@@ -40,7 +40,14 @@ async def record_turn_outcome(
     citation_count: int,
     grounded_paper_count: int,
 ) -> None:
-    """Append one record to the session's telemetry ring."""
+    """Append one record to the session's telemetry ring.
+
+    Serialised under the per-session state lock to avoid losing entries
+    when multiple concurrent flows (e.g. a clarification finaliser and
+    a regular post-turn telemetry write) race on the same ring.
+    """
+    from app.assistant.state_lock import session_state_lock
+
     try:
         record: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -55,7 +62,7 @@ async def record_turn_outcome(
             "citations": int(citation_count or 0),
             "grounded_papers": int(grounded_paper_count or 0),
         }
-        async with async_session_factory() as db:
+        async with session_state_lock(session_id), async_session_factory() as db:
             row = await db.get(AssistantSession, session_id)
             if row is None:
                 return

@@ -81,10 +81,16 @@ class IdeaCapsule(Base):
     # Discovery mode
     is_scout_generated: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Origin tag: "manual" | "auto" | "query"
+    # Origin tag: "manual" | "auto" | "query" | "combined"
     source_mode: Mapped[str] = mapped_column(String(20), server_default="manual")
     # For query mode: the natural-language query the user typed
     source_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Namespace this capsule belongs to. Stamped at creation so the Ideas
+    # list can filter directly per-namespace without traversing seed →
+    # paper → namespace, which fails for ``combined`` capsules whose seeds
+    # are other capsules (no Paper FK).
+    namespace_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
 
     status: Mapped[str] = mapped_column(String(30), default="draft")  # draft | saved | dismissed
 

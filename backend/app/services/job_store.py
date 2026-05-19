@@ -247,11 +247,54 @@ class RedisJobStore(JobStore):
             return None
 
     async def update(self, job_id: str, patch: dict[str, Any]) -> None:
-        existing = await self.get(job_id)
-        if existing is None:
+        """Merge ``patch`` into an existing record under optimistic locking.
+
+        Two workers updating the same job simultaneously (e.g. orchestrator
+        progress + recovery sweep) used to clobber each other because the
+        previous implementation was a plain ``get`` then ``put`` outside any
+        transaction. We now retry under Redis ``WATCH`` so a concurrent
+        write causes a transparent retry instead of silently losing the
+        loser's patch. A bounded retry budget guards against thrash.
+        """
+        client = await self._get_client()
+        if client is None:
             return
-        existing.update(patch)
-        await self.put(job_id, existing)
+
+        key = self._key(job_id)
+        for _ in range(5):  # bounded retry budget
+            try:
+                async with client.pipeline(transaction=True) as pipe:
+                    try:
+                        await pipe.watch(key)
+                        raw = await pipe.get(key)
+                        if raw is None:
+                            await pipe.unwatch()
+                            return
+                        try:
+                            existing = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            await pipe.unwatch()
+                            return
+                        existing.update(patch)
+                        merged_json = json.dumps(existing)
+                        pipe.multi()
+                        await pipe.setex(key, self._ttl, merged_json)
+                        result = await pipe.execute()
+                        if result is None:
+                            # WATCH detected a concurrent write — retry.
+                            continue
+                        return
+                    finally:
+                        try:
+                            await pipe.reset()
+                        except Exception:
+                            pass
+            except Exception as exc:  # noqa: BLE001
+                # Some redis client versions raise WatchError as a generic
+                # Exception subclass — fall through to the next retry.
+                log.debug("RedisJobStore.update retry: %s", exc)
+                continue
+        log.debug("RedisJobStore.update gave up after retries job=%s", job_id)
 
     async def list_by_user(self, user_id: str) -> list[dict[str, Any]]:
         client = await self._get_client()

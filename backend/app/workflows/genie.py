@@ -427,17 +427,29 @@ async def _find_bridges(state: GenieState) -> GenieState:
                 max_sim = max(max_sim, sim)
     state["max_seed_similarity"] = round(max_sim, 3)
 
-    async with async_session_factory() as db:
-        from sqlalchemy import select
-        from app.models.graph import KnowledgeNode, NodeType
+    # Bridge concepts come from the knowledge graph. When the graph is
+    # disabled, we skip this lookup entirely and the downstream viability
+    # check falls back to seed-similarity only — synthesis still works,
+    # just without the cross-domain bridge hint.
+    candidate_nodes: list = []
+    try:
+        from app.services.feature_flags import is_global_feature_enabled
+        graph_on = await is_global_feature_enabled("graph_enabled")
+    except Exception:
+        graph_on = False
 
-        # Search across all namespaces — cross-namespace synthesis needs global bridges
-        result = await db.execute(
-            select(KnowledgeNode).where(
-                KnowledgeNode.node_type.in_([NodeType.concept, NodeType.method]),
-            ).limit(300)
-        )
-        candidate_nodes = list(result.scalars())
+    if graph_on:
+        async with async_session_factory() as db:
+            from sqlalchemy import select
+            from app.models.graph import KnowledgeNode, NodeType
+
+            # Search across all namespaces — cross-namespace synthesis needs global bridges
+            result = await db.execute(
+                select(KnowledgeNode).where(
+                    KnowledgeNode.node_type.in_([NodeType.concept, NodeType.method]),
+                ).limit(300)
+            )
+            candidate_nodes = list(result.scalars())
 
     bridges: list[str] = []
     if candidate_nodes:
@@ -912,11 +924,30 @@ async def _generate_genie_diagrams(state: GenieState) -> GenieState:
     from app.workflows._generation_prompts import repair_mermaid, validate_mermaid
 
     _MERMAID_SYSTEM = (
-        "Generate a Mermaid concept map showing how the seed ideas connect to produce this hypothesis. "
-        "Return ONLY raw valid Mermaid syntax — no code fences, no markdown, no explanation. "
-        "Start directly with 'graph TD' or 'graph LR'. "
-        "Keep it compact (≤12 nodes) so the full graph fits and ends with a complete edge — "
-        "never truncate mid-edge or mid-node-label."
+        "Generate a Mermaid concept map showing how the seed ideas connect to produce this hypothesis.\n\n"
+        "STRICT FORMAT RULES — violations cause the diagram to fail to render:\n"
+        "1. The FIRST line MUST be exactly `graph TD` or `graph LR` (no fences, "
+        "no prose, no leading whitespace).\n"
+        "2. NO code fences (```). NO markdown. NO explanation before or after.\n"
+        "3. Each line is ONE statement: either a node declaration `Id[Label]` "
+        "or a single edge `A -->|optional label| B`. Never split a node or edge "
+        "across multiple lines.\n"
+        "4. Node labels MUST be on ONE line — never contain a real newline. "
+        "If a label is long, shorten it; do not wrap.\n"
+        "5. Do NOT put `[`, `]`, `(`, or `)` INSIDE a node label. If you must "
+        "reference parenthetical text, omit the parens. Backticks and underscores "
+        "are fine.\n"
+        "6. Identifiers are short alphanumeric tokens (H1, P2, N5). Keep labels "
+        "under 60 characters.\n"
+        "7. Keep it compact: 4–10 nodes. Every opening bracket MUST be closed on "
+        "the same line. End with a complete edge — never truncate mid-spec.\n\n"
+        "EXAMPLE of correct output (replace with your content):\n"
+        "graph TD\n"
+        "  P1[Idea one]\n"
+        "  P2[Idea two]\n"
+        "  H[Combined hypothesis]\n"
+        "  P1 -->|grounds| H\n"
+        "  P2 -->|extends| H"
     )
     hyp_statement = str(hyp.get("statement", ""))[:1000]
 
@@ -1074,6 +1105,7 @@ async def _save_capsule(state: GenieState) -> GenieState:
             is_scout_generated=state.get("is_auto", False),
             source_mode=state.get("source_mode", "manual"),
             source_query=state.get("source_query", "") or None,
+            namespace_key=(state.get("namespace_key") or "").strip() or None,
             status="draft",
         )
         db.add(capsule)
@@ -1554,8 +1586,17 @@ async def run_deep_dive(capsule_id: str, user_id: str) -> AsyncIterator[str]:
             except Exception as e:
                 log.warning("deep_dive: could not resolve seed element ids: %s", e)
 
-        # 3. Resolve concept/method elements → knowledge_node_id → connected paper nodes
-        if seed_ids:
+        # 3. Resolve concept/method elements → knowledge_node_id → connected paper nodes.
+        # Concept and method seeds only resolve via the knowledge graph;
+        # when the graph is disabled we skip this resolution path. Paper-
+        # typed seeds (step 2) and idea-typed seeds (step 4) continue to
+        # work normally, so deep dives stay useful without the graph.
+        try:
+            from app.services.feature_flags import is_global_feature_enabled
+            _graph_on = await is_global_feature_enabled("graph_enabled")
+        except Exception:
+            _graph_on = False
+        if seed_ids and _graph_on:
             try:
                 from app.models.graph import KnowledgeNode, KnowledgeEdge, NodeType, EdgeType
                 from uuid import UUID as _UUID3

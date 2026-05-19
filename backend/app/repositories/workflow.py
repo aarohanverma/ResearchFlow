@@ -1,12 +1,19 @@
 """WorkflowRepository — idempotency and token usage tracking."""
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.workflow import TokenUsage, WorkflowRun, WorkflowStatus
+
+# How long after ``started_at`` a ``running`` row is still considered to
+# represent a live workflow, blocking a fresh trigger. After this window
+# we assume the previous worker crashed / was killed and allow the next
+# trigger to start a new run. 2 h matches the orchestrator's recovery
+# window for assistant tasks (``recovery._RESUME_AGE_LIMIT``).
+_IN_FLIGHT_GRACE = timedelta(hours=2)
 
 
 class WorkflowRepository:
@@ -40,12 +47,17 @@ class WorkflowRepository:
     async def should_run(
         self, workflow_name: str, scope_key: str, run_date: date | None = None
     ) -> bool:
-        """Return ``True`` if no successfully completed run exists for today.
+        """Return ``True`` if the workflow should run for the given day.
 
-        Checks for a ``WorkflowRun`` row with the given name and scope that has
-        status ``completed`` and a ``run_date`` equal to today (or the supplied
-        ``run_date``). Used as an idempotency guard so jobs do not repeat within
-        the same calendar day.
+        Returns ``False`` when EITHER:
+          * a ``completed`` run already exists today (the original idempotency
+            guard), or
+          * a ``running`` row exists that started within ``_IN_FLIGHT_GRACE``
+            (concurrent-run guard — prevents double-billing when ingestion is
+            triggered manually while a previous run is still mid-flight).
+
+        Stale ``running`` rows older than the grace window are ignored so a
+        crashed previous worker doesn't block legitimate retries forever.
 
         Args:
             workflow_name: Logical name of the workflow (e.g. ``"ingestion"``).
@@ -54,17 +66,27 @@ class WorkflowRepository:
                 ``None``.
 
         Returns:
-            ``True`` if no completed run exists for the given date, meaning the
-            workflow should execute. ``False`` if it has already completed.
+            ``True`` if neither a completed run for today nor a live in-flight
+            run exists, meaning the workflow should execute.
         """
         run_dt = self._utc_midnight(run_date)
+        in_flight_cutoff = datetime.now(timezone.utc) - _IN_FLIGHT_GRACE
         result = await self._db.execute(
             select(WorkflowRun).where(
                 WorkflowRun.workflow_name == workflow_name,
                 WorkflowRun.scope_key == scope_key,
-                WorkflowRun.run_date == run_dt,
-                WorkflowRun.status == WorkflowStatus.completed,
+                or_(
+                    # Completed today — original idempotency guard.
+                    (WorkflowRun.run_date == run_dt) &
+                    (WorkflowRun.status == WorkflowStatus.completed),
+                    # Currently in-flight within the grace window — concurrent
+                    # trigger guard. Falls open once the row is older than the
+                    # grace period so a crashed run doesn't deadlock retries.
+                    (WorkflowRun.status == WorkflowStatus.running) &
+                    (WorkflowRun.started_at >= in_flight_cutoff),
+                ),
             )
+            .limit(1)
         )
         return result.scalar_one_or_none() is None
 

@@ -5,13 +5,14 @@ import logging
 import uuid as _uuid
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 
 from app.adapters.cache import get_cache
-from app.core.deps import CurrentUserID, DBSession
+from app.core.deps import AdminUserID, CurrentUserID, DBSession, require_admin
 from app.models.paper import Paper as PaperModel
 from app.schemas import GraphResponse
+from app.services.admin_settings import get_app_settings
 from app.services.graph import GraphService
 
 log = logging.getLogger(__name__)
@@ -23,7 +24,26 @@ _BUILD_TASKS: dict[str, asyncio.Task] = {}
 # and saturating the DB connection pool when many namespaces are selected.
 _BUILD_SEMAPHORE = asyncio.Semaphore(2)
 
-router = APIRouter(prefix="/graph", tags=["graph"])
+
+async def _ensure_graph_enabled(user_id: CurrentUserID) -> None:
+    """Reject every graph route when the feature is off for this user.
+
+    Resolves the *effective* flag for the caller — admin-set global flag
+    plus any per-user override. Returns 404 so the feature is invisible
+    and the route looks like it doesn't exist (UI hides nav similarly).
+    """
+    from app.services.feature_flags import is_feature_enabled
+
+    enabled = await is_feature_enabled("graph_enabled", user_id)
+    if not enabled:
+        raise HTTPException(status_code=404, detail="Graph feature is disabled.")
+
+
+router = APIRouter(
+    prefix="/graph",
+    tags=["graph"],
+    dependencies=[Depends(_ensure_graph_enabled)],
+)
 
 
 @router.get("", response_model=GraphResponse)
@@ -183,11 +203,15 @@ async def get_subgraph(
 
 
 @router.get("/expand/{node_id}")
-async def expand_node(node_id: UUID, db: DBSession):
+async def expand_node(node_id: UUID, user_id: CurrentUserID, db: DBSession):  # noqa: ARG001 — auth gate
     """Return the immediate neighbours of a single knowledge graph node.
+
+    The graph is shared content; the endpoint is auth-gated to prevent
+    unauthenticated scraping.
 
     Args:
         node_id: UUID of the node to expand.
+        user_id: Required for auth; the returned neighbourhood is shared.
         db: Injected async database session.
 
     Returns:
@@ -199,7 +223,7 @@ async def expand_node(node_id: UUID, db: DBSession):
 
 
 @router.post("/rebuild-hierarchy", status_code=200)
-async def rebuild_hierarchy(db: DBSession, user_id: CurrentUserID):
+async def rebuild_hierarchy(db: DBSession, user_id: AdminUserID):
     """Backfill TOPIC → SUBTOPIC → PAPER edges for all existing paper nodes.
 
     Safe to call multiple times — idempotent edge creation means re-running
@@ -218,7 +242,7 @@ async def rebuild_hierarchy(db: DBSession, user_id: CurrentUserID):
 @router.post("/build-deep", status_code=200)
 async def build_deep_graph(
     db: DBSession,
-    user_id: CurrentUserID,
+    user_id: AdminUserID,
     namespace_key: str | None = Query(default=None, description="Scope to a single namespace; omit for all"),
 ):
     """Generate a deep LLM-powered taxonomy: TOPIC → SUBTOPIC (area) → CONCEPT (cluster) → PAPER.
@@ -337,7 +361,7 @@ async def _run_build_deep_background(
 
 @router.post("/build-deep-bg", status_code=202)
 async def build_deep_graph_background(
-    user_id: CurrentUserID,
+    user_id: AdminUserID,
     db: DBSession,
     namespace_key: str | None = Query(default=None, description="Scope to a single namespace; omit for all"),
 ):
@@ -411,7 +435,7 @@ async def build_deep_status(job_id: str, user_id: CurrentUserID):
 
 
 @router.post("/build-deep/{job_id}/cancel", status_code=200)
-async def cancel_build_deep(job_id: str, user_id: CurrentUserID):
+async def cancel_build_deep(job_id: str, user_id: AdminUserID):
     """Cancel a running Build Deep task and release its namespace lock."""
     cache = get_cache()
     data = await cache.get(f"graph:build:{job_id}")
@@ -435,7 +459,7 @@ async def cancel_build_deep(job_id: str, user_id: CurrentUserID):
 
 
 @router.post("/deduplicate", status_code=200)
-async def deduplicate_nodes(db: DBSession, user_id: CurrentUserID):
+async def deduplicate_nodes(db: DBSession, user_id: AdminUserID):
     """Merge duplicate graph nodes that share the same (label, node_type, namespace_key).
 
     Caused by a race condition when multiple Build Deep jobs run simultaneously and
@@ -510,7 +534,7 @@ async def deduplicate_nodes(db: DBSession, user_id: CurrentUserID):
 @router.post("/clear", status_code=200)
 async def clear_graph(
     db: DBSession,
-    user_id: CurrentUserID,
+    user_id: AdminUserID,
     namespace_keys: str | None = Query(default=None, description="Comma-separated namespaces to clear. Omit to clear all."),
 ):
     """Delete graph nodes/edges and caches scoped to the given namespaces (or all if omitted).
@@ -599,7 +623,7 @@ async def clear_graph(
 @router.post("/cleanup", status_code=200)
 async def cleanup_graph(
     db: DBSession,
-    user_id: CurrentUserID,
+    user_id: AdminUserID,
     namespace_key: str | None = Query(default=None),
 ):
     """Remove stale SUBTOPIC nodes whose namespace_key is not a known arXiv category,

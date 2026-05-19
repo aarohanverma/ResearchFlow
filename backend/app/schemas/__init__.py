@@ -9,10 +9,16 @@ from pydantic import BaseModel, EmailStr, Field
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    """Request body for POST /auth/register."""
+    """Request body for POST /auth/register.
+
+    Bcrypt accepts at most 72 bytes of input. We cap password length
+    here so users hit a clear validation error before the hash layer
+    raises. 128 chars is generous; the byte-level guard in
+    ``app.core.security`` catches multi-byte edge cases too.
+    """
 
     email: EmailStr
-    password: str = Field(min_length=8)
+    password: str = Field(min_length=8, max_length=128)
     display_name: str = Field(min_length=1, max_length=100)
 
 
@@ -20,14 +26,21 @@ class LoginRequest(BaseModel):
     """Request body for POST /auth/login."""
 
     email: EmailStr
-    password: str
+    # No min_length on login: existing accounts may pre-date the policy
+    # change and a length-based 422 would leak that the account exists.
+    password: str = Field(max_length=128)
 
 
 class TokenResponse(BaseModel):
-    """Response body containing a JWT bearer token."""
+    """Response body containing a JWT bearer token.
+
+    ``expires_in`` is the token lifetime in seconds (OAuth2 convention)
+    so clients can plan a refresh without decoding the JWT.
+    """
 
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 0
 
 
 class UserResponse(BaseModel):
@@ -39,6 +52,7 @@ class UserResponse(BaseModel):
     expertise_level: str
     orientation: str
     onboarding_complete: bool
+    is_admin: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -268,8 +282,13 @@ class IdeaCapsuleListItem(BaseModel):
     is_scout_generated: bool = False
     source_mode: str = "manual"
     source_query: str | None = None
+    namespace_key: str | None = None
     deep_dive_status: str = "none"
     created_at: datetime
+    # Direct parents (only set for combined ideas) — used client-side to
+    # disable ancestor capsules when entering Combine mode, since a combined
+    # idea must never be re-fused with one of its own ancestors.
+    parent_capsule_ids: list[str] = []
 
     model_config = {"from_attributes": True}
 

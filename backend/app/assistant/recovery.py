@@ -39,11 +39,25 @@ _RESUME_AGE_LIMIT = timedelta(hours=2)
 async def reconcile_orphans() -> dict[str, int]:
     """Scan running/pending tasks at startup and either resume or fail them.
 
+    Operator opt-out: set ``ASSISTANT_AUTO_RESUME=0`` (or
+    ``DISABLE_AUTO_RECOVERY=1``) to skip resume entirely. Every orphan is
+    marked failed instead. Useful for incident response when you don't
+    want a server restart to chew tokens re-finishing prior turns.
+
     Returns:
         Counts dict like ``{"resumed": int, "failed": int, "cancelled": int}``
         for the startup log.
     """
+    import os
     counts = {"resumed": 0, "failed": 0, "cancelled": 0}
+
+    auto_resume = (
+        os.environ.get("ASSISTANT_AUTO_RESUME", "1").strip()
+        not in {"0", "false", "False", "no"}
+    )
+    if os.environ.get("DISABLE_AUTO_RECOVERY", "").strip() in {"1", "true", "True", "yes"}:
+        auto_resume = False
+
     async with async_session_factory() as db:
         result = await db.execute(
             select(AssistantTask).where(
@@ -56,6 +70,13 @@ async def reconcile_orphans() -> dict[str, int]:
         orphans = list(result.scalars())
 
     if not orphans:
+        return counts
+
+    if not auto_resume:
+        log.info("assistant recovery: auto-resume disabled — failing %d orphan(s)", len(orphans))
+        for task in orphans:
+            await _mark_failed(task.job_id, "Auto-recovery disabled — please retry.")
+            counts["failed"] += 1
         return counts
 
     log.info("assistant recovery: %d orphaned task(s) to reconcile", len(orphans))

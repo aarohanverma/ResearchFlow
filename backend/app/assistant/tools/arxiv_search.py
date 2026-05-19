@@ -32,11 +32,19 @@ class ArxivSearchTool:
 
     name = "arxiv_search"
     summary = (
-        "Search arXiv via the MCP server (with Atom-API fallback). Returns raw "
-        "RawPaper rows; does not persist or embed. Use when the user wants to "
-        "discover candidate papers before deciding what to import. "
-        "Pass namespace_keys=[] (default) for cross-arXiv search — only set "
-        "namespace_keys when the user explicitly scopes to specific categories."
+        "Browse-only arXiv lookup via MCP (Atom-API fallback). Returns raw "
+        "results WITHOUT persisting, embedding, or indexing them.\n\n"
+        "USE WHEN: the user wants to PREVIEW or SCAN arXiv candidates "
+        "before deciding what to keep (e.g. 'show me arXiv papers on X — "
+        "I'll pick which to save').\n"
+        "DO NOT USE WHEN: the user wants the corpus to grow (use "
+        "arxiv_import — that persists + embeds + indexes), wants ranked "
+        "research evidence (use deep_search — it includes corpus + arXiv "
+        "MCP and runs LLM rerank), or wants a structured survey "
+        "(use literature_survey).\n\n"
+        "Pass namespace_keys=[] (default) for cross-arXiv search. Inputs: "
+        "query (≤500 chars), namespace_keys, max_results. Output: raw "
+        "results list — NOT surfaced in the Grounded grid (no paper_id)."
     )
     cost_class = "moderate"
     side_effects = False

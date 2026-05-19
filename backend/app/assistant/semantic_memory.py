@@ -231,14 +231,31 @@ async def _load_cache(session_id: UUID | str) -> dict[str, dict]:
 
 
 async def _persist_cache(session_id: UUID | str, cache: dict[str, dict]) -> None:
+    """Persist the embedding cache under the per-session state lock.
+
+    Concurrent recall passes can each compute fresh embeddings and want
+    to write back; serialising guarantees the merged cache reflects all
+    of them rather than one writer clobbering the other.
+    """
+    from app.assistant.state_lock import session_state_lock
+
     try:
-        async with async_session_factory() as db:
-            sid = UUID(str(session_id)) if not isinstance(session_id, UUID) else session_id
+        sid = UUID(str(session_id)) if not isinstance(session_id, UUID) else session_id
+        async with session_state_lock(sid), async_session_factory() as db:
             row = await db.get(AssistantSession, sid)
             if row is None:
                 return
             state = dict(row.state or {})
-            state[_CACHE_KEY] = cache
+            # Merge with any concurrent writer's contribution rather than
+            # overwriting wholesale — the entries are content-addressed by
+            # hash, so unioning is safe.
+            existing = dict(state.get(_CACHE_KEY) or {})
+            existing.update(cache)
+            # Enforce the cap after merge in case a sibling pass pushed us
+            # over the limit.
+            if len(existing) > _CACHE_MAX_ENTRIES:
+                existing = dict(sorted(existing.items())[: _CACHE_MAX_ENTRIES])
+            state[_CACHE_KEY] = existing
             row.state = state
             flag_modified(row, "state")
             await db.commit()

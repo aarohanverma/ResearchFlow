@@ -90,6 +90,16 @@ async def _index_paper_background(paper_id: UUID, user_id: UUID) -> None:
     except Exception as exc:
         log.warning("bookmark indexing: stage-1 failed paper=%s err=%s", paper_id, exc)
 
+    # Skip the graph-assignment stage entirely when the feature is off.
+    # Bookmarking still works (embedding + Genie element creation below);
+    # only the graph node + cache invalidation are suppressed.
+    try:
+        from app.services.admin_settings import get_app_settings
+        _settings = await get_app_settings()
+        _graph_on = bool(_settings.get("graph_enabled", False))
+    except Exception:
+        _graph_on = False
+
     try:
         async with async_session_factory() as db:
             paper_repo = PaperRepository(db)
@@ -98,14 +108,15 @@ async def _index_paper_background(paper_id: UUID, user_id: UUID) -> None:
                 return
 
             try:
-                svc = GraphService(db)
-                await svc.add_paper_node(paper)
-                # Invalidate in-memory build cache so next Build Deep includes this paper
-                GraphService._build_cache.pop(paper.namespace_key or "cs.AI", None)
-                GraphService._build_cache.pop(None, None)
-                # Clear the persistent subgraph cache so the graph page shows the new node
-                await GraphService.clear_subgraph_cache(paper.namespace_key)
-                await GraphService.clear_subgraph_cache(None)
+                if _graph_on:
+                    svc = GraphService(db)
+                    await svc.add_paper_node(paper)
+                    # Invalidate in-memory build cache so next Build Deep includes this paper
+                    GraphService._build_cache.pop(paper.namespace_key or "cs.AI", None)
+                    GraphService._build_cache.pop(None, None)
+                    # Clear the persistent subgraph cache so the graph page shows the new node
+                    await GraphService.clear_subgraph_cache(paper.namespace_key)
+                    await GraphService.clear_subgraph_cache(None)
             except Exception as graph_exc:
                 log.warning("bookmark indexing: graph node failed paper=%s err=%s", paper_id, graph_exc)
                 await db.rollback()

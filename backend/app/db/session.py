@@ -1,10 +1,40 @@
 """Async SQLAlchemy engine and session factory.
 One engine, one factory — shared across the process lifetime."""
 
+import json
+from datetime import date, datetime
+from decimal import Decimal
+from uuid import UUID
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+
+
+def _json_default(obj):
+    # JSONB columns regularly carry UUIDs, timestamps, and Decimals from
+    # repositories — stdlib json.dumps cannot serialize those by default,
+    # which previously crashed the assistant finalize step.
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except Exception:
+            return obj.hex()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+def _json_serializer(value) -> str:
+    return json.dumps(value, default=_json_default, ensure_ascii=False)
+
 
 engine = create_async_engine(
     settings.database_url,
@@ -18,6 +48,7 @@ engine = create_async_engine(
     # next caller to get an error even with pool_pre_ping=True (pre-ping
     # only fires when the connection is checked OUT, not during idle wait).
     pool_recycle=1200,
+    json_serializer=_json_serializer,
 )
 
 async_session_factory = async_sessionmaker(

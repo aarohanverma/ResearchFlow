@@ -784,7 +784,16 @@ function getMermaid(): Promise<typeof import("mermaid").default> {
           fontSize: "13px",
           fontFamily: "ui-monospace, SFMono-Regular, monospace",
         },
-        flowchart: { htmlLabels: true, curve: "basis", padding: 20 },
+        flowchart: {
+          htmlLabels: true,
+          curve: "basis",
+          padding: 20,
+          useMaxWidth: true,
+          wrappingWidth: 240,
+          nodeSpacing: 50,
+          rankSpacing: 60,
+        },
+        maxTextSize: 200000,
         securityLevel: "loose",
         suppressErrorRendering: true,
       });
@@ -933,30 +942,17 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
       const svgEl = ref.current.querySelector("svg");
       if (!svgEl) return;
 
-      // Read natural dimensions from viewBox or explicit attrs
-      let nw = 0, nh = 0;
-      const vb = svgEl.getAttribute("viewBox");
-      if (vb) {
-        const parts = vb.trim().split(/[\s,]+/);
-        nw = parseFloat(parts[2] || "0");
-        nh = parseFloat(parts[3] || "0");
-      }
-      if (!nw) nw = parseFloat(svgEl.getAttribute("width") || "0");
-      if (!nh) nh = parseFloat(svgEl.getAttribute("height") || "0");
-
-      // Scale to container width, clamp height
-      const containerW = ref.current.clientWidth || 800;
-      const clampMax   = maxHeight ?? MAX_DIAGRAM_H;
-      let displayH     = 360;
-      if (nw > 0 && nh > 0) {
-        displayH = Math.round((containerW / nw) * nh);
-        displayH = Math.max(MIN_DIAGRAM_H, Math.min(displayH, clampMax));
-      }
-
-      svgEl.setAttribute("width",  "100%");
-      svgEl.setAttribute("height", String(displayH));
-      svgEl.style.cssText = `width:100%;height:${displayH}px;display:block;`;
-      setHeight(displayH);
+      // Let SVG scale naturally to its viewBox. Forcing a clamped height
+      // squishes long node labels and clips them ("Confidence-Gated Graph
+      // Repai" instead of "...Repair"). useMaxWidth=true in initialize()
+      // already makes mermaid emit a responsive SVG; we just need to keep
+      // its intrinsic aspect ratio.
+      svgEl.removeAttribute("height");
+      svgEl.setAttribute("width", "100%");
+      svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      const cap = maxHeight ?? MAX_DIAGRAM_H;
+      svgEl.style.cssText = `width:100%;height:auto;max-width:100%;max-height:${cap}px;display:block;`;
+      setHeight(0); // unused now; left in case other code reads it
     })();
 
     return () => { cancelled = true; };
@@ -973,7 +969,6 @@ function MermaidDiagram({ spec, maxHeight }: { spec: string; maxHeight?: number 
     <div
       ref={ref}
       className="overflow-x-auto w-full"
-      style={{ height: `${height}px` }}
     />
   );
 }

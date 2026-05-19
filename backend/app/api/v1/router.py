@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import assistant, auth, bookmarks, chat, dev, feed, genie, generate, graph, papers, search, settings, study
+from app.api.v1 import admin, assistant, auth, bookmarks, chat, dev, feed, genie, generate, graph, papers, search, settings, study
 
 router = APIRouter(prefix="/api/v1")
 
@@ -19,3 +19,5 @@ router.include_router(genie.router)
 router.include_router(settings.router)
 router.include_router(generate.router)
 router.include_router(dev.router)
+router.include_router(admin.router)
+router.include_router(admin.settings_router)

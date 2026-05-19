@@ -235,6 +235,53 @@ function _decorateString(
  * bad node doesn't kill the whole diagram. All transforms are conservative
  * (no semantic edits) and idempotent.
  */
+/**
+ * Collapse whitespace runs that appear INSIDE node-label brackets to single
+ * spaces. Mermaid expects each node declaration on one line; a hard newline
+ * inside ``H[Factual Consistency\nConfidence (c_f)]`` causes the parser to
+ * absorb every subsequent statement into that label as raw text — that's the
+ * "raw mermaid shown as a single text block" failure mode we saw on Genie
+ * deep dives. The walker tracks bracket depth so nested ``[`` / ``(`` inside
+ * a label are handled correctly.
+ */
+function collapseLabelNewlines(spec: string, open: string, close: string): string {
+  const out: string[] = [];
+  let i = 0;
+  while (i < spec.length) {
+    const ch = spec[i];
+    if (/[A-Za-z0-9_]/.test(ch)) {
+      let j = i;
+      while (j < spec.length && /[A-Za-z0-9_]/.test(spec[j])) j++;
+      if (spec[j] === open) {
+        let depth = 1;
+        let k = j + 1;
+        while (k < spec.length && depth > 0) {
+          if (spec[k] === open) depth++;
+          else if (spec[k] === close) {
+            depth--;
+            if (depth === 0) break;
+          }
+          k++;
+        }
+        if (k < spec.length && depth === 0) {
+          const ident = spec.slice(i, j);
+          const content = spec.slice(j + 1, k);
+          const cleaned = content.replace(/\s+/g, " ").trim();
+          out.push(ident + open + cleaned + close);
+          i = k + 1;
+          continue;
+        }
+      }
+      out.push(spec.slice(i, j));
+      i = j;
+      continue;
+    }
+    out.push(ch);
+    i++;
+  }
+  return out.join("");
+}
+
 export function sanitizeMermaidSpec(raw: string): string {
   let s = raw;
 
@@ -246,6 +293,13 @@ export function sanitizeMermaidSpec(raw: string): string {
   // no parser ambiguity. Standalone `[N]` never has a legal meaning in
   // mermaid source so this is safe everywhere.
   s = s.replace(/\[(\d+(?:\s*[-,]\s*\d+)*)\]/g, "($1)");
+
+  // Collapse internal newlines inside node-label brackets. Without this,
+  // a single multi-line label can swallow the rest of the spec into one
+  // text block and the diagram fails to render at all.
+  s = collapseLabelNewlines(s, "[", "]");
+  s = collapseLabelNewlines(s, "(", ")");
+  s = collapseLabelNewlines(s, "{", "}");
 
   // Trailing-semicolon edges sometimes break older parsers; leave as-is —
   // mermaid 10+ tolerates them.
@@ -334,7 +388,16 @@ function MermaidBlock({ spec }: { spec: string }) {
             secondaryColor: "#1e1b4b",
             fontSize: "13px",
           },
-          flowchart: { htmlLabels: true, curve: "basis" },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: true,
+            wrappingWidth: 240,
+            padding: 20,
+            nodeSpacing: 50,
+            rankSpacing: 60,
+          },
+          maxTextSize: 200000,
           securityLevel: "loose",
           // Suppress mermaid's auto-injected "Syntax error in text" bomb SVG.
           // We handle errors ourselves with a graceful fallback.
@@ -589,6 +652,57 @@ export function InlineText({
   );
 }
 
+// Lightweight LaTeX → Unicode rewrite for the most common typographic
+// commands. Used as the InlineMath fallback so a brief KaTeX-loading delay
+// (or a silent KaTeX failure) shows readable text instead of raw
+// "$\rightarrow$" syntax. Extend cautiously — anything that needs real
+// math typesetting (fractions, integrals, subscripts) must still go
+// through KaTeX.
+const _LATEX_TO_UNICODE: Array<[RegExp, string]> = [
+  [/\\rightarrow\b/g, "→"],
+  [/\\leftarrow\b/g, "←"],
+  [/\\Rightarrow\b/g, "⇒"],
+  [/\\Leftarrow\b/g, "⇐"],
+  [/\\leftrightarrow\b/g, "↔"],
+  [/\\Leftrightarrow\b/g, "⇔"],
+  [/\\to\b/g, "→"],
+  [/\\implies\b/g, "⇒"],
+  [/\\iff\b/g, "⇔"],
+  [/\\times\b/g, "×"],
+  [/\\cdot\b/g, "·"],
+  [/\\pm\b/g, "±"],
+  [/\\leq\b/g, "≤"],
+  [/\\geq\b/g, "≥"],
+  [/\\neq\b/g, "≠"],
+  [/\\approx\b/g, "≈"],
+  [/\\sim\b/g, "∼"],
+  [/\\infty\b/g, "∞"],
+  [/\\alpha\b/g, "α"],
+  [/\\beta\b/g, "β"],
+  [/\\gamma\b/g, "γ"],
+  [/\\delta\b/g, "δ"],
+  [/\\theta\b/g, "θ"],
+  [/\\lambda\b/g, "λ"],
+  [/\\mu\b/g, "μ"],
+  [/\\pi\b/g, "π"],
+  [/\\sigma\b/g, "σ"],
+  [/\\Sigma\b/g, "Σ"],
+  [/\\Omega\b/g, "Ω"],
+  [/\\sum\b/g, "∑"],
+  [/\\prod\b/g, "∏"],
+  // \text{X} → X (the surrounding braces get stripped too)
+  [/\\text\{([^}]*)\}/g, "$1"],
+  [/\\mathrm\{([^}]*)\}/g, "$1"],
+  [/\\mathbf\{([^}]*)\}/g, "$1"],
+  [/\\,/g, " "],
+];
+
+function latexLikeToUnicode(expr: string): string {
+  let out = expr;
+  for (const [pat, rep] of _LATEX_TO_UNICODE) out = out.replace(pat, rep);
+  return out;
+}
+
 function InlineMath({ expr }: { expr: string }) {
   const [html, setHtml] = useState("");
   useEffect(() => {
@@ -598,7 +712,12 @@ function InlineMath({ expr }: { expr: string }) {
       } catch {}
     });
   }, [expr]);
-  if (!html) return <span className="font-mono text-amber-300/80">${expr}$</span>;
+  if (!html) {
+    // Fallback: convert the most common LaTeX commands to Unicode so the
+    // user sees "→" instead of "$\rightarrow$" while KaTeX is loading or
+    // if KaTeX silently fails on this expression.
+    return <span className="mx-0.5">{latexLikeToUnicode(expr)}</span>;
+  }
   return <span dangerouslySetInnerHTML={{ __html: html }} className="mx-0.5" />;
 }
 

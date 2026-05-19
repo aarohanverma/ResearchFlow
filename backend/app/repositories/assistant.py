@@ -145,21 +145,35 @@ class AssistantRepository:
     async def patch_session_state(self, session_id: UUID | str, patch: dict) -> None:
         """Shallow-merge ``patch`` into ``AssistantSession.state`` (JSONB).
 
-        Used by the orchestrator to persist rolling history summaries without
-        touching any other state keys (memory, ns_memory, etc.).
+        Used by the orchestrator to persist rolling history summaries (and
+        anything else that touches a single key without disturbing the rest
+        of the state dict).
+
+        Serialisation:
+            Acquires ``session_state_lock(session_id)`` so a concurrent
+            ``consolidate_after_turn`` or ``update_branch_progress_summary``
+            on the same session row cannot read the JSONB before our merge
+            and then overwrite our patch with their own. The read-modify-write
+            also re-fetches the row inside the lock so the merge always
+            applies to the freshest persisted state.
         """
         from sqlalchemy.orm.attributes import flag_modified
+        from app.assistant.state_lock import session_state_lock
 
         sid = UUID(str(session_id)) if not isinstance(session_id, UUID) else session_id
-        result = await self._db.execute(select(AssistantSession).where(AssistantSession.id == sid))
-        row = result.scalar_one_or_none()
-        if row is None:
-            return
-        state = dict(row.state or {})
-        state.update(patch)
-        row.state = state
-        flag_modified(row, "state")
-        await self._db.flush()
+        async with session_state_lock(sid):
+            result = await self._db.execute(select(AssistantSession).where(AssistantSession.id == sid))
+            row = result.scalar_one_or_none()
+            if row is None:
+                return
+            # Force a fresh read of the row's state — the SQLAlchemy identity
+            # map may have a stale snapshot from before we held the lock.
+            await self._db.refresh(row)
+            state = dict(row.state or {})
+            state.update(patch)
+            row.state = state
+            flag_modified(row, "state")
+            await self._db.flush()
 
     async def rename_session(self, user_id: UUID, session_id: UUID, title: str) -> bool:
         """Rename a session — used when the user wants to override the auto-derived title."""

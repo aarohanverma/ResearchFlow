@@ -26,7 +26,18 @@ _MAILTO = "researchflow@example.com"
 
 
 class ResearchTrendsInput(BaseModel):
-    topic: str = Field(min_length=2, max_length=300, description="Research topic, keyword, or concept to analyze")
+    topic: str = Field(
+        min_length=2,
+        max_length=120,
+        description=(
+            "CONCRETE research topic / method name — what OpenAlex would "
+            "index as a concept. Good: 'agentic AI', 'mixture of experts', "
+            "'diffusion model', 'mRNA vaccine'. Bad: 'AI research topics "
+            "feasible for undergraduate projects' (this is a meta-question "
+            "about what to research, not a topic itself — OpenAlex will "
+            "match almost nothing). Keep to 2–5 words naming the field."
+        ),
+    )
     years_back: int = Field(default=8, ge=2, le=20, description="How many years of history to include")
     namespace_key: str = Field(default="")
     namespace_keys: list[str] = Field(default_factory=list)

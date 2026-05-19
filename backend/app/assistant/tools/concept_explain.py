@@ -46,11 +46,18 @@ class ConceptExplainTool:
 
     name = "concept_explain"
     summary = (
-        "Grounded explanation of a single concept/term/method using snippets from "
-        "the user's corpus. Tuned to expertise level (newcomer/practitioner/expert). "
-        "Use when the user asks 'what is X', 'explain Y', 'define Z' or wants a "
-        "concept unpacked rather than a paper list. Returns the explanation plus "
-        "the underlying paper references."
+        "RAG-grounded explanation of a single concept/term/method. Pulls 3-5 "
+        "snippets from the user's corpus, asks the quality LLM to write an "
+        "expertise-tuned explanation (newcomer/practitioner/expert), and "
+        "returns explanation + supporting paper refs + a small concept map.\n\n"
+        "USE WHEN: the user asks 'what is X', 'explain Y', 'define Z', 'how "
+        "does W work' for ONE specific concept they want unpacked.\n"
+        "DO NOT USE WHEN: the user wants a paper list (use deep_search), a "
+        "structured field overview (use literature_survey), or to compare "
+        "multiple concepts/papers side-by-side (use compare_papers).\n\n"
+        "Inputs: concept (2-240 chars, the term itself), namespace_keys, "
+        "optional context (why they're asking). Output: explanation + "
+        "supporting_papers list — those are also surfaced in the Grounded grid."
     )
     cost_class = "moderate"
     side_effects = False
@@ -94,12 +101,11 @@ class ConceptExplainTool:
             orientation=ctx.orientation,
         )
         paper_ids = [str(p.get("paper_id") or "") for p in papers if p.get("paper_id")]
-        # Build a small concept map from the supporting papers' key_concepts.
-        # Pure composition over already-extracted enrichment fields — no
-        # extra LLM call so we can keep this cheap and always-on when
-        # there are enough sources to make a meaningful diagram.
-        await ctx.emit_progress(85, "Drafting concept map")
-        mermaid = _build_concept_map(params.concept, papers)
+        # The mini concept map (central concept → ~5 related concepts) was
+        # surfaced in the RA chat as a Mermaid block but added little value:
+        # it just listed concepts the explanation already names, in a layout
+        # that often looked broken next to the prose. Disabled until we have
+        # a UI placement where a small diagram earns its space.
         await ctx.emit_progress(100, f"Explained '{params.concept}' with {len(paper_ids)} sources")
 
         return ToolResult(
@@ -108,7 +114,7 @@ class ConceptExplainTool:
                 "explanation": explanation,
                 "supporting_paper_ids": paper_ids,
                 "supporting_papers": papers,
-                "mermaid": mermaid,
+                "mermaid": None,
             },
             summary=f"Explained '{params.concept}' grounded in {len(paper_ids)} paper(s)",
             citations=paper_ids,

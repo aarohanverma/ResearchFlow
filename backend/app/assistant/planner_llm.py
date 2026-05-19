@@ -96,6 +96,47 @@ DISCIPLINE:
 • Run independent lookups in parallel (``parallel: true``).
 
 ════════════════════════════════════════
+QUERY CRAFTING — TOOLS NEED TIGHT INPUTS
+════════════════════════════════════════
+
+The user's literal message is rarely the right argument for a tool's
+``query`` / ``topic`` field. Each tool indexes differently and choking
+it with a verbose sentence reliably returns zero results — that wastes
+the call and produces a thin answer. For every step you plan:
+
+1. **Extract a concrete topic phrase.** Tools like ``research_trends``,
+   ``literature_survey``, ``papers_with_code``, ``github_search``,
+   ``arxiv_search``, ``arxiv_import``, ``wikipedia`` are indexed by
+   topic / method / library names — NOT by meta-questions about
+   research. A user saying "what AI topics are feasible for a college
+   project?" is a META-QUERY; do not forward it verbatim. Either pick a
+   concrete topic from the conversation context, or use a discovery
+   tool (``deep_search`` / ``frontier_scan``) with a short topical
+   keyword phrase, never the meta-question itself.
+
+2. **Compress for keyword-indexed tools.** ``github_search``,
+   ``papers_with_code``, ``huggingface_search`` do lexical matching on
+   a handful of words. Keep their queries to 3–8 informative terms —
+   the method name, the library, the task. "find me research code
+   implementations for retrieval-augmented generation with chunk size
+   and top-k retrieval" → ``"retrieval augmented generation pytorch"``.
+
+3. **Resolve referential follow-ups.** When the user says "research
+   that topic", "proceed with your suggestion", "give me code for it",
+   the topic is in the prior assistant turn — extract the specific
+   concept (e.g. "retrieval-augmented generation") and use that as the
+   tool query, never the literal follow-up phrase.
+
+4. **Wikipedia / concept_explain** want the concept itself, not a
+   question form. "Retrieval-augmented generation" not "What is
+   retrieval-augmented generation and how does it work?".
+
+5. **Don't fan out to side-channel tools speculatively.**
+   ``github_search`` and ``papers_with_code`` should run only when the
+   user asks for code / implementations / SOTA — they will not magically
+   find papers and a 0-result call is wasted latency.
+
+════════════════════════════════════════
 MEMORY MANAGEMENT POLICY
 ════════════════════════════════════════
 
@@ -319,12 +360,19 @@ class LLMPlanner:
         expertise: str = "practitioner",
         memory: dict | None = None,
         disabled_tools: set[str] | None = None,
+        disabled_features: set[str] | None = None,
         research_brief: str | None = None,
         intent_hint: str | None = None,
     ) -> Plan:
         """Async planner — calls the LLM with adaptive compute based on query complexity."""
-        # Pass namespace_key so only tools visible for this namespace are shown.
-        catalogue = describe_for_planner(namespace_key=namespace_key)
+        # Pass namespace_key + disabled features so any tool gated by a flag
+        # the admin turned off (or that's overridden off for this user) is
+        # invisible to the planner. Without this the LLM would happily pick
+        # ``graph_query`` and get 404s downstream.
+        catalogue = describe_for_planner(
+            namespace_key=namespace_key,
+            disabled_features=disabled_features,
+        )
         if disabled_tools:
             catalogue = [t for t in catalogue if t.get("name") not in disabled_tools]
 

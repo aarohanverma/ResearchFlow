@@ -142,6 +142,23 @@ class Settings(BaseSettings):
     nvd_api_key: str = ""        # NVD CVE database — improves rate limits; free without key
     github_token: str = ""       # GitHub search — improves rate limits; free personal token works
 
+    # ── Seed accounts (local dev / staging convenience) ───────────────────────
+    # All three exist purely to make a fresh ``docker compose up`` immediately
+    # usable for a developer: log in with these credentials, no signup
+    # required. In production-grade deploys you should either delete the
+    # accounts post-bootstrap or change the passwords through the admin
+    # panel; nothing else in the system depends on them being present.
+    #
+    # Empty values disable the corresponding seed (e.g. set
+    # SEED_ADMIN_EMAIL="" to skip creating the admin seed account on a
+    # fresh boot). Production deploys typically blank all three.
+    seed_guest_email: str = "test@researchflow.ai"
+    seed_guest_password: str = ""
+    seed_admin_email: str = "admin@researchflow.ai"
+    seed_admin_password: str = ""
+    seed_user_email: str = "user@researchflow.ai"
+    seed_user_password: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

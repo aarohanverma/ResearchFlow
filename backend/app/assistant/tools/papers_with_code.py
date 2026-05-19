@@ -25,9 +25,55 @@ log = logging.getLogger(__name__)
 _BASE = "https://paperswithcode.com/api/v1"
 _TIMEOUT = 15.0
 
+_PWC_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "of", "in", "on", "at",
+    "to", "for", "with", "from", "by", "is", "are", "was", "were", "be",
+    "have", "has", "had", "do", "does", "did", "this", "that", "those",
+    "these", "it", "its", "as", "so", "any", "some", "all", "no", "not",
+    "what", "which", "who", "how", "why", "when", "where",
+    "find", "show", "give", "want", "need", "please", "make", "build",
+    "research", "paper", "papers", "project", "implementation", "code",
+})
+
+
+def _compress_pwc_query(raw: str, *, max_words: int = 6) -> str:
+    """Tighten a verbose query into a short keyword phrase for Papers with Code.
+
+    PwC's search treats the query as a substring against titles / method
+    names; long sentences match nothing. We strip stop-words and keep
+    informative tokens, capped at ``max_words``. Short queries pass
+    through unchanged.
+    """
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return cleaned
+    words = cleaned.split()
+    if len(words) <= 5:
+        return cleaned
+    keep: list[str] = []
+    for w in words:
+        tok = w.strip(".,;:?!\"'()[]{}")
+        if not tok or tok.lower() in _PWC_STOPWORDS:
+            continue
+        keep.append(tok)
+        if len(keep) >= max_words:
+            break
+    return " ".join(keep) if len(keep) >= 2 else " ".join(words[:max_words])
+
 
 class PapersWithCodeInput(BaseModel):
-    query: str = Field(min_length=2, max_length=300, description="Search query for papers, methods, datasets, or tasks")
+    query: str = Field(
+        min_length=2,
+        max_length=120,
+        description=(
+            "SHORT canonical name of the ML topic / method / benchmark — "
+            "this index is indexed by paper title + method name, NOT by "
+            "natural-language questions. Good: 'retrieval augmented "
+            "generation', 'mixture of experts', 'ImageNet classification', "
+            "'GraphSAGE'. Bad: 'find me research code for RAG with chunk "
+            "size and top-k retrieval' (returns 0). Keep to 2–6 words."
+        ),
+    )
     search_type: str = Field(
         default="papers",
         description=(
@@ -69,7 +115,13 @@ class PapersWithCodeTool:
     output_schema = PapersWithCodeOutput
 
     async def run(self, ctx: ToolContext, params: PapersWithCodeInput) -> ToolResult:
-        await ctx.emit_progress(15, f"Searching Papers with Code [{params.search_type}]: {params.query[:60]}")
+        # Papers with Code indexes by title / method name. Long natural-
+        # language queries reliably return zero. Compress to keyword form
+        # before issuing the request so verbose planner output still hits.
+        query = _compress_pwc_query(params.query)
+        await ctx.emit_progress(
+            15, f"Searching Papers with Code [{params.search_type}]: {query[:60]}",
+        )
 
         results: list[dict] = []
         total = 0
@@ -79,15 +131,15 @@ class PapersWithCodeTool:
             # some endpoints; following lets us surface whatever the redirect serves.
             async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
                 if params.search_type == "papers":
-                    results, total = await self._search_papers(client, params.query, params.limit)
+                    results, total = await self._search_papers(client, query, params.limit)
                 elif params.search_type == "methods":
-                    results, total = await self._search_methods(client, params.query, params.limit)
+                    results, total = await self._search_methods(client, query, params.limit)
                 elif params.search_type == "datasets":
-                    results, total = await self._search_datasets(client, params.query, params.limit)
+                    results, total = await self._search_datasets(client, query, params.limit)
                 elif params.search_type == "sota":
-                    results, total = await self._search_sota(client, params.query, params.limit)
+                    results, total = await self._search_sota(client, query, params.limit)
                 else:
-                    results, total = await self._search_papers(client, params.query, params.limit)
+                    results, total = await self._search_papers(client, query, params.limit)
         except Exception as exc:
             log.warning("papers_with_code search failed: %s", exc)
             return ToolResult(

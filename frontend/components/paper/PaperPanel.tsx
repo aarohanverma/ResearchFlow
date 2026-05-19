@@ -23,6 +23,7 @@ import { useJobsStore, type StudyJob } from "@/store/jobs";
 import { useBookmarksStore } from "@/store/bookmarks";
 import { BookmarkFolderPicker } from "@/components/bookmarks/BookmarkFolderPicker";
 import { topicLabelFor } from "@/store/namespace";
+import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
 
 interface Props {
   paper: Paper;
@@ -48,6 +49,39 @@ export function PaperPanel({ paper, onClose }: Props) {
   const [queuing, setQueuing] = useState(false);
   const [queued, setQueued] = useState(false);
   const [showChat, setShowChat] = useState(false);
+
+  // Resizable panel width — persists across mounts via localStorage. Bounds
+  // chosen so the panel never disappears (<320px) or eats the whole screen.
+  const [panelWidth, setPanelWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return 460;
+    try {
+      const saved = parseInt(localStorage.getItem("rf_paper_panel_w") || "", 10);
+      if (Number.isFinite(saved) && saved >= 320 && saved <= 1100) return saved;
+    } catch {}
+    return 460;
+  });
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelWidth;
+    const onMove = (ev: MouseEvent) => {
+      // Panel is anchored to the right edge → wider = drag left.
+      const dx = startX - ev.clientX;
+      const w = Math.min(1100, Math.max(320, startW + dx));
+      setPanelWidth(w);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      try { localStorage.setItem("rf_paper_panel_w", String(panelWidth)); } catch {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  useEffect(() => {
+    try { localStorage.setItem("rf_paper_panel_w", String(panelWidth)); } catch {}
+  }, [panelWidth]);
   // Narrow selectors so this panel doesn't re-render on every
   // unrelated jobs-store update (e.g. media generation polls).
   const jobs = useJobsStore((s) => s.jobs);
@@ -117,9 +151,19 @@ export function PaperPanel({ paper, onClose }: Props) {
       animate={{ x: 0, opacity: 1 }}
       exit={{ x: "100%", opacity: 0 }}
       transition={{ type: "spring", damping: 28, stiffness: 320, mass: 0.8 }}
-      className="w-[460px] shrink-0 border-l flex flex-col overflow-hidden"
-      style={{ borderColor: "var(--rf-border2)", background: "var(--rf-surface)" }}
+      className="shrink-0 border-l flex flex-col overflow-hidden relative"
+      style={{
+        borderColor: "var(--rf-border2)",
+        background: "var(--rf-surface)",
+        width: `${panelWidth}px`,
+      }}
     >
+      {/* Resize handle — drag the left edge to widen / narrow */}
+      <div
+        onMouseDown={startResize}
+        className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-indigo-500/30 transition-colors z-20"
+        title="Drag to resize"
+      />
       {/* Sticky header */}
       <div className="sticky top-0 z-10 backdrop-blur-sm border-b px-5 py-3.5 flex items-center justify-between" style={{ background: "var(--rf-surface2)", borderColor: "var(--rf-border)" }}>
         <div className="flex items-center gap-2">
@@ -509,7 +553,13 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
                   : "bg-gray-900 border border-gray-800/60 text-gray-200 rounded-tl-sm"
               }`}
             >
-              <div className="whitespace-pre-wrap">{msg.content}</div>
+              {msg.role === "assistant" ? (
+                <div className="prose-paper-chat">
+                  <MarkdownRenderer content={msg.content} />
+                </div>
+              ) : (
+                <div className="whitespace-pre-wrap">{msg.content}</div>
+              )}
               {msg.streaming && (
                 <span className="inline-block w-1 h-3.5 bg-indigo-400 rounded-sm animate-pulse ml-0.5 align-middle" />
               )}
