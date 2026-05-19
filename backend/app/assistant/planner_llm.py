@@ -137,6 +137,45 @@ the call and produces a thin answer. For every step you plan:
    find papers and a 0-result call is wasted latency.
 
 ════════════════════════════════════════
+PARAMS HYGIENE — NEVER EMIT PLACEHOLDERS
+════════════════════════════════════════
+
+Every tool in the catalogue has a JSON ``input_schema`` with a ``required``
+list. Each step's ``params`` block MUST set every required field with a
+real concrete value drawn from the user query, the brief, or a prior step's
+expected output. Forbidden patterns:
+
+  ✗ ``"query": ""``                — empty strings count as missing
+  ✗ ``"query": "__to_fill__"``     — underscore-bounded placeholders
+  ✗ ``"paper_id": "<TODO>"``       — angle-bracket placeholders
+  ✗ ``"paper_ids": ["{fill}"]``    — brace placeholders inside arrays
+  ✗ ``"paper_ids": []`` when the field is required with min_items ≥ 1
+  ✗ Inventing paper UUIDs / DOIs / IDs — only use IDs that come back
+    from a retrieval step you planned earlier in this same plan.
+
+If a step needs a paper id and you don't yet have one, plan the retrieval
+step FIRST and accept that the orchestrator will pass the IDs forward; do
+NOT emit placeholder paper IDs hoping something fills them in. For
+``compare_papers`` / ``paper_qa`` / ``genie_synthesize`` in the same plan
+as the retrieval, set ``parallel: false`` so the retrieval lands first.
+
+════════════════════════════════════════
+GENIE SYNTHESIS FLOW
+════════════════════════════════════════
+
+When the HITL policy below permits genie_synthesize, the correct chain is:
+
+  retrieval (deep_search / arxiv_import / literature_survey)
+    → genie_synthesize  (creates a NEW capsule from those papers)
+    → (optional) genie_deep_dive on the capsule_id returned by step 2
+
+NEVER plan ``genie_read`` for a synthesis-style request. ``genie_read``
+only lists capsules that were created in PRIOR turns; if the user asked
+to combine / synthesize / brainstorm using THIS turn's papers, reading
+old capsules produces an off-topic answer. Use ``genie_read`` only for
+explicit "show me the ideas I generated earlier" requests.
+
+════════════════════════════════════════
 MEMORY MANAGEMENT POLICY
 ════════════════════════════════════════
 
@@ -646,11 +685,54 @@ class LLMPlanner:
             params.setdefault("namespace_key", namespace_key)
             params.setdefault("namespace_keys", ns_keys)
             params.setdefault("query", query)
+            # Preflight repair: strip placeholders + fill any required
+            # text-like field that the planner left empty. Mirrors the
+            # ReAct loop's hygiene so a plan step that emits
+            # ``{"question": "<TODO>"}`` is repaired with the user query
+            # instead of dropped silently.
+            try:
+                from app.assistant.react_loop import (
+                    _preflight_and_repair_params,
+                    PaperLedger,
+                )
+                _schema = tool.input_schema.model_json_schema()
+                params, _notes = _preflight_and_repair_params(
+                    tool_name, params, _schema,
+                    query=query, ledger=PaperLedger(),
+                )
+                if _notes:
+                    log.info(
+                        "planner: auto-repaired params for tool=%s: %s",
+                        tool_name, "; ".join(_notes)[:300],
+                    )
+            except Exception:
+                pass
             try:
                 tool.input_schema(**params)
-            except Exception as exc:
-                log.warning("planner produced invalid params for tool=%s: %s", tool_name, exc)
-                continue
+            except Exception as ve:
+                # One-shot retry with fully-derived params (no original
+                # planner output) — same pattern the loop uses on
+                # validation failure.
+                try:
+                    from app.assistant.react_loop import (
+                        _preflight_and_repair_params,
+                        PaperLedger,
+                    )
+                    _schema = tool.input_schema.model_json_schema()
+                    fresh_params = {
+                        "namespace_key": namespace_key,
+                        "namespace_keys": ns_keys,
+                    }
+                    fresh_params, _ = _preflight_and_repair_params(
+                        tool_name, fresh_params, _schema,
+                        query=query, ledger=PaperLedger(),
+                    )
+                    tool.input_schema(**fresh_params)
+                    params = fresh_params
+                    log.info("planner: recovered tool=%s after validation error", tool_name)
+                except Exception:
+                    log.warning("planner produced invalid params for tool=%s: %s", tool_name, ve)
+                    continue
             steps.append(PlannedStep(
                 tool=tool_name,
                 title=str(s.get("title") or tool_name),

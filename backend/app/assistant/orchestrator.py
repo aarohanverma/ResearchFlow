@@ -723,6 +723,9 @@ class Orchestrator:
         task._scratchpad = outcome.scratchpad  # type: ignore[attr-defined]
         task._react_iterations = outcome.iterations  # type: ignore[attr-defined]
         task._react_completed_normally = outcome.completed_normally  # type: ignore[attr-defined]
+        task._react_tool_failures = outcome.tool_failures  # type: ignore[attr-defined]
+        task._react_successful_retrievals = outcome.successful_retrievals  # type: ignore[attr-defined]
+        task._react_paper_ledger_size = outcome.paper_ledger_size  # type: ignore[attr-defined]
 
         try:
             self._publish(job_id, "react_done", {
@@ -1385,18 +1388,69 @@ class Orchestrator:
             from app.core.tracking import set_workflow_context
 
             set_workflow_context("assistant", planned.tool)
+            # Retry-with-backoff for transient failures on retrieval-class
+            # tools. The audit trace showed ``arxiv_import`` and
+            # ``deep_search`` failing in lockstep — both reach out to
+            # external services (arXiv MCP, LLM rerank) whose flaky tails
+            # are exactly the failure modes a single retry rescues. We
+            # only retry tools that are idempotent + read-mostly: a tool
+            # with ``side_effects=True`` AND already-written corpus rows
+            # would risk duplicate writes on retry, so we still retry
+            # ``arxiv_import`` (its service already deduplicates by
+            # external_id) but bail out on anything user-visible like
+            # ``media_generate``.
+            _retryable_tools = {
+                "deep_search", "arxiv_import", "arxiv_search",
+                "literature_survey", "frontier_scan", "citation_finder",
+                "pubmed", "inspire_hep", "nasa_ads", "semantic_scholar",
+                "huggingface_search", "github_search", "papers_with_code",
+                "web_search", "wikipedia", "concept_explain",
+            }
+            _max_attempts = 2 if planned.tool in _retryable_tools else 1
+            result = None
+            last_exc: Exception | None = None
             try:
-                result = await asyncio.wait_for(
-                    tool.run(ctx, validated),
-                    timeout=self._MAX_STEP_DURATION_S,
-                )
+                for _attempt in range(_max_attempts):
+                    try:
+                        result = await asyncio.wait_for(
+                            tool.run(ctx, validated),
+                            timeout=self._MAX_STEP_DURATION_S,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        raise
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        last_exc = exc
+                        # Don't sleep between attempts for tools we
+                        # don't retry — they go straight to the failure
+                        # handler below.
+                        if _attempt + 1 >= _max_attempts:
+                            break
+                        # Short bounded backoff: just enough to ride
+                        # past a one-off MCP / rate-limit blip without
+                        # noticeably slowing down the turn.
+                        await asyncio.sleep(0.6 * (_attempt + 1))
+                        log.info(
+                            "retrying tool=%s step=%s after error: %s",
+                            planned.tool, step_id, exc,
+                        )
+                else:
+                    # Loop fell through without a successful break — re-raise
+                    # the last exception so the failure-handling branch
+                    # records it consistently.
+                    if last_exc is not None:
+                        raise last_exc
+                if result is None and last_exc is not None:
+                    raise last_exc
             except asyncio.TimeoutError:
                 log.warning(
                     "guardrail: step timeout (%ds) tool=%s step=%s",
                     self._MAX_STEP_DURATION_S, planned.tool, step_id,
                 )
                 await self._mark_step(step_id, status=AssistantStepStatus.failed,
-                                      error="Step timed out", completed=True)
+                                      error=f"Step timed out after {self._MAX_STEP_DURATION_S}s", completed=True)
                 self._publish(job_id, "step_failed", {
                     "step_id": str(step_id), "tool": planned.tool,
                     "error": f"Step timed out after {self._MAX_STEP_DURATION_S}s", "retryable": False,
@@ -1411,12 +1465,18 @@ class Orchestrator:
                 })
                 raise
             except Exception as exc:
-                log.exception("tool %s failed step=%s", planned.tool, step_id)
+                log.exception("tool %s failed step=%s after %d attempt(s)",
+                              planned.tool, step_id, _max_attempts)
+                # Surface a richer error: include exception class + the
+                # tool name so the UI chip and downstream synthesizer
+                # both know what actually failed (the bare message was
+                # often opaque, e.g. ``ConnectionError: 502``).
+                err_summary = f"{type(exc).__name__}: {str(exc)[:900]}"
                 await self._mark_step(step_id, status=AssistantStepStatus.failed,
-                                      error=str(exc)[:1000], completed=True)
+                                      error=err_summary, completed=True)
                 self._publish(job_id, "step_failed", {
                     "step_id": str(step_id), "tool": planned.tool,
-                    "error": str(exc)[:240], "retryable": True,
+                    "error": err_summary[:240], "retryable": True,
                 })
                 return
 
@@ -1580,6 +1640,9 @@ class Orchestrator:
             iterations=int(getattr(task, "_react_iterations", 0)),
             papers=papers,
             arxiv_results=arxiv_results,
+            tool_failures=int(getattr(task, "_react_tool_failures", 0)),
+            successful_retrievals=int(getattr(task, "_react_successful_retrievals", 0)),
+            paper_ledger_size=int(getattr(task, "_react_paper_ledger_size", 0)),
         )
 
         answer = await synthesize_answer(
@@ -2488,6 +2551,9 @@ def _distill_agent_notes(
     iterations: int,
     papers: list[dict],
     arxiv_results: list[dict],
+    tool_failures: int = 0,
+    successful_retrievals: int = 0,
+    paper_ledger_size: int = 0,
 ) -> dict | None:
     """Distill a ReAct scratchpad into a compact dict for the synthesizer.
 
@@ -2506,10 +2572,15 @@ def _distill_agent_notes(
     ReAct didn't run or there's nothing useful to surface — keeps
     the trivial / single tier prompts unchanged.
     """
-    if scratchpad is None and iterations <= 0:
+    if scratchpad is None and iterations <= 0 and tool_failures <= 0:
         return None
 
-    notes: dict[str, Any] = {"iterations": int(iterations or 0)}
+    notes: dict[str, Any] = {
+        "iterations": int(iterations or 0),
+        "tool_failures": int(tool_failures or 0),
+        "successful_retrievals": int(successful_retrievals or 0),
+        "paper_ledger_size": int(paper_ledger_size or 0),
+    }
 
     # Latest critique, if any.
     if scratchpad is not None:
@@ -2540,7 +2611,12 @@ def _distill_agent_notes(
         notes["thin_evidence"] = True
 
     # Strip empties so the synthesizer prompt's block stays compact.
-    if "critique" not in notes and not notes.get("thin_evidence") and notes.get("iterations", 0) == 0:
+    if (
+        "critique" not in notes
+        and not notes.get("thin_evidence")
+        and notes.get("iterations", 0) == 0
+        and notes.get("tool_failures", 0) == 0
+    ):
         return None
     return notes
 

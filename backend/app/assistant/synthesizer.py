@@ -148,9 +148,28 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
     critique = (agent_notes or {}).get("critique") or {}
     iters = int((agent_notes or {}).get("iterations") or 0)
     thin = bool((agent_notes or {}).get("thin_evidence"))
+    # Evidence-expansion failure signals — set by the ReAct loop when
+    # tool dispatches errored / returned no new papers. We want the
+    # synthesizer to caveat the answer instead of polishing past the
+    # fact that the agent tried to expand evidence and couldn't.
+    tool_failures = int((agent_notes or {}).get("tool_failures") or 0)
+    successful_retrievals = int(
+        (agent_notes or {}).get("successful_retrievals") or 0
+    )
+    paper_ledger_size = int((agent_notes or {}).get("paper_ledger_size") or 0)
+    evidence_expansion_failed = (
+        tool_failures >= 2 and successful_retrievals == 0 and iters > 0
+    )
 
     if iters > 0:
         parts.append(f"- The agent ran {iters} adaptive iteration(s) after the initial plan.")
+    if tool_failures > 0:
+        parts.append(
+            f"- The agent attempted {tool_failures} tool call(s) that FAILED "
+            f"(validation errors / runtime errors / banned-after-repeat-failure). "
+            f"Successful retrievals during the loop: {successful_retrievals}. "
+            f"Paper ledger size: {paper_ledger_size}."
+        )
     if critique:
         v = critique.get("verdict")
         g = critique.get("groundedness")
@@ -174,6 +193,14 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
         parts.append(
             "- Evidence base is THIN. Be honest about uncertainty — say what is and "
             "isn't supported, and recommend follow-up retrieval rather than over-claim."
+        )
+    if evidence_expansion_failed:
+        parts.append(
+            "- EVIDENCE EXPANSION FAILED: the agent tried to expand evidence "
+            "mid-turn but multiple tools errored and no new papers landed. "
+            "Treat the existing evidence as the WHOLE evidence base — do not "
+            "imply you investigated angles you couldn't actually retrieve. "
+            "Label speculative parts of the answer as speculative."
         )
     if not parts:
         return ""
@@ -1192,14 +1219,25 @@ def build_message_blocks(
             "title": "Grounded papers",
             "papers": papers[:10],
         })
-    if arxiv_results and not papers:
+    # External arXiv references — always surfaced when present, regardless
+    # of whether grounded corpus papers exist. The answer text may emit
+    # ``[A1]…[A20]`` citation markers referencing these external papers
+    # alongside ``[1]…[N]`` for the corpus; the frontend's citation map
+    # needs both blocks to render either kind of citation as a clickable
+    # link (corpus → Paper Panel, arXiv → external URL). Suppressing this
+    # block when corpus papers exist left every ``[A*]`` marker visually
+    # styled as a link but functionally inert.
+    if arxiv_results:
+        if papers:
+            title = "External references (arXiv)"
+        elif imported_count:
+            title = f"arXiv candidates ({imported_count} imported)"
+        else:
+            title = "arXiv candidates (browse only)"
         blocks.append({
             "kind": "arxiv_grid",
-            "title": (
-                f"arXiv candidates ({imported_count} imported)"
-                if imported_count else "arXiv candidates (browse only)"
-            ),
-            "papers": arxiv_results[:8],
+            "title": title,
+            "papers": arxiv_results[:20],
             "imported_count": imported_count,
         })
     # Domain-specific paper results (pubmed, inspire_hep, nasa_ads, papers_with_code)

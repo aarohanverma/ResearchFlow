@@ -270,7 +270,16 @@
       "Bash(python -m pytest tests/test_hardening_active_user.py -x -q)",
       "Bash(python -m pytest tests/test_hardening_react_session.py -x -q)",
       "Bash(python -m pytest tests/test_hardening_depth_tier.py -x -q)",
-      "Bash(python -m pytest tests/test_hardening_depth_tier.py -q)"
+      "Bash(python -m pytest tests/test_hardening_depth_tier.py -q)",
+      "Bash(grep -nA 12 \"class.*Input\" /home/av/Projects/ResearchFlow/backend/app/assistant/tools/deep_search.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/literature_survey.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/compare_papers.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/paper_qa.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/citation_finder.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/arxiv_import.py)",
+      "Bash(grep -nA 8 \"class.*Input\" /home/av/Projects/ResearchFlow/backend/app/assistant/tools/genie_read.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/genie_synthesize.py /home/av/Projects/ResearchFlow/backend/app/assistant/tools/genie_deep_dive.py)",
+      "Bash(python -c \"from app.assistant import react_loop; print\\('OK'\\)\")",
+      "Bash(python -c \"from app.assistant import planner_llm, react_loop; print\\('OK'\\)\")",
+      "Bash(python -c \"from app.assistant import orchestrator, planner_llm, react_loop, synthesizer; print\\('OK'\\)\")",
+      "Bash(python -m pytest tests/test_react_param_hardening.py -x --tb=short)",
+      "Bash(python -m pytest --tb=short -q)",
+      "Bash(python -m pytest tests/test_hardening_react_session.py tests/test_react_gaps.py tests/test_react_param_hardening.py --tb=short -q)",
+      "Bash(python -c \"from app.assistant import orchestrator; print\\('OK'\\)\")"
     ],
     "additionalDirectories": [
       "/tmp"

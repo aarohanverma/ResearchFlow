@@ -96,7 +96,85 @@ interface DecorationMatch {
   color?: string;
 }
 
-/** Build the sorted, non-overlapping match list for one text segment. */
+/** Return every exact substring match of ``needle`` inside ``hay``. */
+function _exactHighlightSpans(hay: string, needle: string): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  let cursor = 0;
+  while (true) {
+    const pos = hay.indexOf(needle, cursor);
+    if (pos === -1) break;
+    out.push({ start: pos, end: pos + needle.length });
+    cursor = pos + Math.max(1, needle.length);
+  }
+  return out;
+}
+
+/** Cross-formatting-boundary fallback for highlight matching.
+ *
+ * Markdown renders bold / italic / code / headings / inline math /
+ * citation chips as separate text nodes. A selection that crosses one
+ * of those boundaries produces a highlight whose stored text contains
+ * the joined contents — but no single rendered text node holds the
+ * full string. This helper finds every contiguous slice of ``segment``
+ * that also appears verbatim in ``highlight`` and is at least
+ * ``minLen`` characters long, so each rendered text node still lights
+ * up with the portion of the selection it actually contains.
+ *
+ * The implementation is intentionally greedy from left to right and
+ * never returns overlapping spans — the caller's normal overlap
+ * resolver then deduplicates against search matches.
+ */
+function _fuzzyHighlightSpans(
+  segment: string,
+  highlight: string,
+  minLen: number,
+): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  const segLen = segment.length;
+  const hlLen = highlight.length;
+  if (segLen === 0 || hlLen === 0 || segLen < minLen) return out;
+  let i = 0;
+  while (i + minLen <= segLen) {
+    // Find the longest substring of ``segment`` starting at ``i`` that
+    // also appears inside ``highlight``.  Walk outward from the
+    // longest possible end down to ``minLen``; first hit wins.
+    let bestEnd = -1;
+    for (let end = segLen; end - i >= minLen; end--) {
+      const candidate = segment.slice(i, end);
+      if (highlight.indexOf(candidate) !== -1) {
+        bestEnd = end;
+        break;
+      }
+    }
+    if (bestEnd === -1) {
+      i += 1;
+      continue;
+    }
+    out.push({ start: i, end: bestEnd });
+    i = bestEnd;
+  }
+  return out;
+}
+
+/** Build the sorted, non-overlapping match list for one text segment.
+ *
+ * Highlight matching used to be a pure ``text.indexOf(hl.text)`` so a
+ * selection that spanned ``**bold**``, headings, inline code, LaTeX,
+ * or citation chips never produced any highlight at all — the raw
+ * stored ``hl.text`` ("part of bold part") never appeared verbatim in
+ * a single rendered text node (the bold word lives in a separate node
+ * from its surrounding text). The fix here is a two-stage match:
+ *
+ *   1. Try the exact substring match first — the common case where
+ *      the user selected within a homogeneous text run.
+ *   2. On miss, fall back to the longest contiguous substring of the
+ *      highlight that also appears in this text segment. That covers
+ *      cross-boundary selections: each underlying text node only
+ *      contains its slice of the original selection, and we mark
+ *      whatever slice IS present here. A minimum length of 3 chars
+ *      keeps the fallback from highlighting incidental short tokens
+ *      like " of " that happen to overlap with the stored text.
+ */
 function _findMatches(text: string, dec?: MarkdownDecorations): DecorationMatch[] {
   if (!dec) return [];
   const matches: DecorationMatch[] = [];
@@ -104,18 +182,32 @@ function _findMatches(text: string, dec?: MarkdownDecorations): DecorationMatch[
   // Highlights — case-sensitive (the user selected the exact text).
   for (const hl of dec.highlights || []) {
     if (!hl.text) continue;
-    let cursor = 0;
-    while (true) {
-      const pos = text.indexOf(hl.text, cursor);
-      if (pos === -1) break;
+    const exactSpans = _exactHighlightSpans(text, hl.text);
+    if (exactSpans.length) {
+      for (const sp of exactSpans) {
+        matches.push({
+          start: sp.start,
+          end: sp.end,
+          kind: "highlight",
+          id: hl.id,
+          color: hl.color,
+        });
+      }
+      continue;
+    }
+    // Cross-boundary fallback: locate every chunk of this segment
+    // that exists inside the highlight (and is long enough to be
+    // meaningful), so e.g. a selection of "part **bold** part" still
+    // highlights each of the three rendered text nodes individually.
+    const fuzzy = _fuzzyHighlightSpans(text, hl.text, 3);
+    for (const sp of fuzzy) {
       matches.push({
-        start: pos,
-        end: pos + hl.text.length,
+        start: sp.start,
+        end: sp.end,
         kind: "highlight",
         id: hl.id,
         color: hl.color,
       });
-      cursor = pos + Math.max(1, hl.text.length);
     }
   }
 
@@ -611,20 +703,49 @@ export function InlineText({
           const num = citeMatch[2];
           const label = isArxiv ? `A${num}` : num;
           if (onCitationClick) {
+            const isExt = isArxiv;
             return (
               <span
                 key={i}
-                onClick={() => onCitationClick(label, isArxiv)}
-                title={isArxiv ? `View arXiv candidate ${label}` : `View paper ${label}`}
+                role="link"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onCitationClick(label, isArxiv);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onCitationClick(label, isArxiv);
+                  }
+                }}
+                title={isExt
+                  ? `Open arXiv reference ${label} in a new tab`
+                  : `View grounded paper ${label}`}
                 style={{
-                  color: isArxiv ? "#fbbf24" : "#818cf8",
+                  color: isExt ? "#fbbf24" : "#818cf8",
                   cursor: "pointer",
                   textDecoration: "underline",
                   textDecorationStyle: "dotted",
                   textUnderlineOffset: 2,
                   fontSize: "0.85em",
                   verticalAlign: "super",
-                  fontWeight: 500,
+                  fontWeight: 600,
+                  // A subtle background tint so the citation chip
+                  // reads as an actionable link, not a typographic
+                  // ornament. The corpus and arXiv colours stay
+                  // distinct so users can tell at a glance whether
+                  // clicking will open the Paper Panel or arXiv.
+                  background: isExt
+                    ? "rgba(251,191,36,0.10)"
+                    : "rgba(129,140,248,0.10)",
+                  border: isExt
+                    ? "1px solid rgba(251,191,36,0.28)"
+                    : "1px solid rgba(129,140,248,0.28)",
+                  borderRadius: 4,
+                  padding: "0 3px",
+                  margin: "0 1px",
                 }}
               >
                 [{label}]

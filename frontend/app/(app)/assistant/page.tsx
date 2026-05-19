@@ -2272,6 +2272,25 @@ function Composer({
 }) {
   const [showAttach, setShowAttach] = useState(false);
 
+  // Auto-grow the composer textarea ChatGPT-style: starts at one row,
+  // expands smoothly as the user types, then caps at a max height and
+  // becomes internally scrollable. Reset to 0 before measuring so the
+  // textarea can shrink when content is deleted (otherwise scrollHeight
+  // stays at the previous maximum and the box would never collapse).
+  const COMPOSER_MAX_PX = 280;
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const next = Math.min(el.scrollHeight, COMPOSER_MAX_PX);
+    // Clamp to one line minimum so empty / one-line content keeps the
+    // tidy single-row look — el.scrollHeight reports content + padding,
+    // so a freshly-cleared textarea reads ~30px which is exactly what
+    // we want for the resting state.
+    el.style.height = `${next}px`;
+    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_PX ? "auto" : "hidden";
+  }, [input, inputRef]);
+
   return (
     <footer style={{ padding: "12px 18px 16px", borderTop: "1px solid var(--rf-border)" }}>
       {pendingAttachments.length > 0 && (
@@ -2295,12 +2314,28 @@ function Composer({
           ))}
         </div>
       )}
+      {/* The composer is an auto-expanding bubble: paperclip pinned to
+          bottom-left, send pinned to bottom-right, textarea growing
+          between them. Bottom-anchoring (vs. centred) keeps the send
+          button in a predictable place as the text expands. */}
       <div style={{
         position: "relative",
-        display: "flex", gap: 8, alignItems: "center",
-        background: "var(--rf-surface2)", borderRadius: 10,
-        padding: "8px 10px", border: "1px solid var(--rf-border)",
+        display: "flex", gap: 8, alignItems: "flex-end",
+        background: "var(--rf-surface2)", borderRadius: 14,
+        padding: "8px 10px",
+        border: "1px solid var(--rf-border)",
         minHeight: 56,
+        transition: "border-color 150ms ease, box-shadow 150ms ease",
+      }}
+      onFocusCapture={e => {
+        const host = e.currentTarget as HTMLDivElement;
+        host.style.borderColor = "rgba(139,92,246,0.45)";
+        host.style.boxShadow = "0 0 0 3px rgba(139,92,246,0.10)";
+      }}
+      onBlurCapture={e => {
+        const host = e.currentTarget as HTMLDivElement;
+        host.style.borderColor = "var(--rf-border)";
+        host.style.boxShadow = "none";
       }}>
         <button
           onClick={() => setShowAttach(s => !s)}
@@ -2308,7 +2343,11 @@ function Composer({
           style={{
             padding: 6, borderRadius: 6, background: "none", border: "none",
             color: "var(--rf-text4)", cursor: "pointer", flexShrink: 0,
-            alignSelf: "center",
+            // Sit at the same line as the first row of text — the
+            // textarea may be many rows tall, but we don't want the
+            // paperclip floating up with the first line.
+            alignSelf: "flex-end",
+            marginBottom: 6,
           }}
         >
           <PaperclipIcon size={14} />
@@ -2318,6 +2357,9 @@ function Composer({
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => {
+            // Shift+Enter = newline (multi-line composition).
+            // Enter alone = submit. Holding any other modifier (Ctrl,
+            // Meta, Alt) also submits, which matches most chat UIs.
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSubmit(); }
           }}
           placeholder="Ask, explore, or describe what you want to investigate…"
@@ -2325,25 +2367,33 @@ function Composer({
           style={{
             flex: 1, background: "transparent", border: "none", outline: "none",
             fontSize: "12.5px", color: "var(--rf-text1)", resize: "none",
-            fontFamily: "inherit", lineHeight: 1.5,
-            // Cap initial height to match a single line so the placeholder
-            // sits centered with the paperclip + send buttons; auto-grow on
-            // input is handled by the existing onInput in JobsPanel.
-            maxHeight: 160, overflowY: "auto",
-            padding: "4px 0",
+            fontFamily: "inherit", lineHeight: 1.55,
+            // Caps the height at COMPOSER_MAX_PX so a 50-line paste
+            // doesn't push the rest of the page off-screen. The
+            // useEffect above sets the exact height each render.
+            maxHeight: COMPOSER_MAX_PX,
+            padding: "6px 0",
+            // Smooth growth animation as the user types — keeps the
+            // expansion from feeling jumpy when wrapping a long line
+            // or pasting a paragraph in one shot.
+            transition: "height 80ms ease-out",
           }}
         />
         <button
           onClick={onSubmit}
           disabled={submitting || !input.trim()}
           style={{
-            padding: "8px 14px", borderRadius: 8, border: "none",
+            padding: "8px 14px", borderRadius: 10, border: "none",
             background: submitting || !input.trim()
               ? "var(--rf-surface3)"
               : "linear-gradient(135deg,#6366f1,#8b5cf6)",
             color: "white", fontSize: "12px", fontWeight: 600,
             display: "flex", alignItems: "center", gap: 6,
             cursor: submitting || !input.trim() ? "not-allowed" : "pointer",
+            // Anchor to the bottom so the send button sits next to the
+            // last visible line, the way ChatGPT does it.
+            alignSelf: "flex-end",
+            flexShrink: 0,
           }}
         >
           {submitting ? <Loader2Icon size={13} className="animate-spin" /> : <SendIcon size={13} />}
@@ -2870,23 +2920,7 @@ function ReasoningStrip({
           )}
           {/* DB steps (ground truth — available once steps start writing to DB) */}
           {orderedSteps.length > 0 && orderedSteps.map(s => (
-            <div key={s.id} style={{
-              display: "flex", alignItems: "center", gap: 6, padding: "3px 4px",
-              borderRadius: 4, fontSize: "10px",
-            }}>
-              <StatusIcon status={s.status} small />
-              <span style={{ color: "var(--rf-text2)", fontWeight: 600 }}>{s.tool_name}</span>
-              <span style={{ color: "var(--rf-text4)", flex: 1, overflow: "hidden",
-                              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {s.progress.summary || s.title}
-              </span>
-              {s.cost && (s.cost as { cache_hit?: boolean }).cache_hit && (
-                <span style={{ fontSize: "9px", color: "#22c55e" }} title="Cache hit — no LLM cost">⚡</span>
-              )}
-              {s.error && (
-                <span style={{ color: "#ef4444", fontSize: "9.5px" }} title={s.error}>error</span>
-              )}
-            </div>
+            <StepRow key={s.id} step={s} />
           ))}
           {/* Planned step stubs from SSE plan_committed event — shown before DB steps land */}
           {orderedSteps.length === 0 && liveData?.plannedSteps && liveData.plannedSteps.map((ps, i) => (
@@ -2962,9 +2996,35 @@ function ReasoningStrip({
                 display: "flex", flexDirection: "column", gap: 2,
               }}>
                 <div style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
                   fontSize: "9.5px", fontWeight: 700, color: "#a78bfa",
                   letterSpacing: "0.05em", marginBottom: 2,
-                }}>AGENT SCRATCHPAD (REACT)</div>
+                }}>
+                  <span>AGENT SCRATCHPAD (REACT)</span>
+                  <span style={{ color: "var(--rf-text5)", fontWeight: 500 }}>
+                    {entries.length} entr{entries.length === 1 ? "y" : "ies"}
+                  </span>
+                </div>
+                {/* Fixed-height scroll area so a long ReAct trace
+                    (10+ thoughts/actions/observations) doesn't push the
+                    answer body off-screen. The container scrolls
+                    internally; the outer message bubble stays compact. */}
+                <div style={{
+                  maxHeight: 220,
+                  overflowY: "auto",
+                  overflowX: "hidden",
+                  padding: "4px 6px",
+                  border: "1px solid var(--rf-border)",
+                  borderRadius: 4,
+                  background: "var(--rf-bg2, rgba(0,0,0,0.02))",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 2,
+                  // Custom scrollbar — keep visible footprint small so it
+                  // doesn't fight the dense one-line entry layout.
+                  scrollbarWidth: "thin",
+                  scrollbarColor: "var(--rf-text5) transparent",
+                }}>
                 {(entries as Entry[]).map((e, i) => {
                   const iter = typeof e.iteration === "number" ? `#${e.iteration}` : "";
                   if (e.kind === "thought") return (
@@ -2994,9 +3054,70 @@ function ReasoningStrip({
                   );
                   return null;
                 })}
+                </div>
               </div>
             );
           })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One step row in the workflow strip. Splits the chip and an inline
+ *  expandable error so the user can see WHY a tool failed (arXiv MCP
+ *  unreachable, LLM rate-limited, missing API key, …) without having
+ *  to inspect the DB. Click ``error ▾`` to expand the full message,
+ *  click again to collapse. */
+function StepRow({ step: s }: { step: AssistantStep }) {
+  const [open, setOpen] = useState(false);
+  const hasError = !!s.error;
+  return (
+    <div style={{
+      display: "flex", flexDirection: "column", gap: 2,
+      padding: "3px 4px", borderRadius: 4,
+      background: hasError && open ? "rgba(239,68,68,0.06)" : "transparent",
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 6, fontSize: "10px",
+      }}>
+        <StatusIcon status={s.status} small />
+        <span style={{ color: "var(--rf-text2)", fontWeight: 600 }}>{s.tool_name}</span>
+        <span style={{ color: "var(--rf-text4)", flex: 1, overflow: "hidden",
+                        textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {s.progress.summary || s.title}
+        </span>
+        {s.cost && (s.cost as { cache_hit?: boolean }).cache_hit && (
+          <span style={{ fontSize: "9px", color: "#22c55e" }} title="Cache hit — no LLM cost">⚡</span>
+        )}
+        {hasError && (
+          <button
+            onClick={() => setOpen(o => !o)}
+            style={{
+              color: "#ef4444", fontSize: "9.5px",
+              background: "rgba(239,68,68,0.08)",
+              border: "1px solid rgba(239,68,68,0.30)",
+              borderRadius: 4, padding: "1px 6px",
+              cursor: "pointer",
+              fontWeight: 600,
+            }}
+            title="Click to see the full error"
+          >
+            error {open ? "▴" : "▾"}
+          </button>
+        )}
+      </div>
+      {hasError && open && (
+        <div style={{
+          marginLeft: 18, fontSize: "10px",
+          color: "#fca5a5", lineHeight: 1.45,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          padding: "4px 6px", borderRadius: 4,
+          background: "rgba(239,68,68,0.06)",
+          border: "1px solid rgba(239,68,68,0.20)",
+        }}>
+          {s.error}
         </div>
       )}
     </div>
@@ -3066,26 +3187,57 @@ function MessageBody({
   }), [highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, msg.id, highlightModeActive, onRemoveHighlight]);
   const blocks = (msg.payload?.blocks as Block[] | undefined) || [];
 
-  // Build a 1-based index map for citations: {1: paper_id, A1: paper_id}
+  // Build a 1-based index map for citations.
+  //   [N]  → grounded corpus paper: open Paper Panel by UUID
+  //   [AN] → external arXiv candidate: open the arXiv link in a new tab
+  // We store both shapes so the click handler can pick the right action
+  // per marker without falling back to a broken UUID lookup for arXiv
+  // ids (those are slash-formatted strings, not UUIDs — Paper Panel
+  // can't render them, but the arXiv URL always works).
   const citationMap = useMemo(() => {
-    const map: Record<string, string> = {};
+    const map: Record<string, { paperId?: string; url?: string }> = {};
     for (const b of blocks) {
       if (b.kind === "paper_grid" && b.papers) {
         b.papers.forEach((p: PaperBlock, idx: number) => {
-          if (p.paper_id) map[String(idx + 1)] = p.paper_id;
+          if (p.paper_id) {
+            map[String(idx + 1)] = {
+              paperId: p.paper_id,
+              url: p.source_url || undefined,
+            };
+          }
         });
       } else if (b.kind === "arxiv_grid" && b.papers) {
         b.papers.forEach((p: ArxivCandidate, idx: number) => {
-          if (p.external_id) map[`A${idx + 1}`] = p.external_id;
+          if (p.external_id) {
+            map[`A${idx + 1}`] = {
+              url: `https://arxiv.org/abs/${p.external_id}`,
+            };
+          }
         });
       }
     }
     return map;
   }, [blocks]);
 
-  const handleCitation = useCallback((num: string, _isArxiv: boolean) => {
-    const paperId = citationMap[num];
-    if (paperId) onOpenPaper(paperId);
+  const handleCitation = useCallback((num: string, isArxiv: boolean) => {
+    const entry = citationMap[num];
+    if (!entry) return;
+    // External (arXiv) citations: always open the link in a new tab,
+    // since these aren't grounded corpus papers and the Paper Panel
+    // can't render them by their arXiv id alone.
+    if (isArxiv && entry.url) {
+      window.open(entry.url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    // Grounded corpus citations: open the Paper Panel for inspection.
+    if (entry.paperId) {
+      onOpenPaper(entry.paperId);
+      return;
+    }
+    // Fallback: if we somehow have a URL but no paper id, still open it.
+    if (entry.url) {
+      window.open(entry.url, "_blank", "noopener,noreferrer");
+    }
   }, [citationMap, onOpenPaper]);
 
   // Show live streaming text (synthesis tokens arriving) or Thinking... animation
@@ -3220,15 +3372,54 @@ function PaperGridBlock({
 function ArxivGridBlock({
   title, papers, importedCount,
 }: { title?: string; papers: ArxivCandidate[]; importedCount?: number }) {
+  // Collapsed by default so it reads like a References section at the
+  // bottom of the answer without dominating the visible area. The
+  // ``[A1]…[An]`` markers in the body are what surfaces the references
+  // inline; this block is the index the user expands to inspect them.
+  const [open, setOpen] = useState(false);
+  const heading = title || "External references";
   return (
     <div>
-      {title && <BlockTitle>{title}{importedCount ? ` · ${importedCount} new` : ""}</BlockTitle>}
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: "flex", alignItems: "center", gap: 8, width: "100%",
+          background: "none", border: "none", cursor: "pointer", padding: 0, marginBottom: open ? 6 : 0,
+          textAlign: "left",
+        }}
+      >
+        <BlockTitle style={{ marginBottom: 0, flex: 1 }}>
+          {heading}{importedCount ? ` · ${importedCount} new` : ""}
+        </BlockTitle>
+        <span style={{
+          fontSize: "9px", color: "#fbbf24",
+          padding: "2px 7px", borderRadius: 8,
+          background: "rgba(251,191,36,0.08)",
+          border: "1px solid rgba(251,191,36,0.30)",
+        }}>
+          {papers.length} ref{papers.length === 1 ? "" : "s"} {open ? "−" : "+"}
+        </span>
+      </button>
+      {open && (
       <div style={{ display: "grid", gap: 6 }}>
         {papers.map((p, i) => (
           <a key={p.external_id || i}
              href={p.external_id ? `https://arxiv.org/abs/${p.external_id}` : "#"}
              target="_blank" rel="noopener noreferrer"
              style={{ ...cardStyle(), textDecoration: "none", display: "block" }}>
+            {/* The yellow [A N] index makes it immediately obvious which
+                inline citation marker in the body this card resolves to. */}
+            <div style={{
+              display: "inline-block",
+              fontSize: "10px", fontWeight: 700, color: "#fbbf24",
+              background: "rgba(251,191,36,0.08)",
+              border: "1px solid rgba(251,191,36,0.30)",
+              padding: "1px 6px", borderRadius: 6,
+              marginRight: 6,
+              verticalAlign: "middle",
+            }}>
+              [A{i + 1}]
+            </div>
             <div style={{ color: "var(--rf-text1)", fontWeight: 600, fontSize: "12px" }}>
               {p.title || "Untitled"}
             </div>
@@ -3244,6 +3435,7 @@ function ArxivGridBlock({
           </a>
         ))}
       </div>
+      )}
     </div>
   );
 }

@@ -873,7 +873,76 @@ function UsagePanel() {
     }
     return out;
   }, [data]);
-  const maxDayTotal = Math.max(1, ...filledByDay.map(d => d.total_tokens));
+  // Adaptive binning: the per-day bar chart works for short ranges, but
+  // when the user selects a full year the chart degenerates into 365
+  // hair-thin bars that show no structure. Bin the rows into months,
+  // weeks, or days depending on the window length so the graph stays
+  // readable at every zoom level.
+  type BinUnit = "day" | "week" | "month";
+  const bins = useMemo(() => {
+    const rows = filledByDay;
+    if (rows.length === 0) return { unit: "day" as BinUnit, items: [] as { key: string; label: string; total_tokens: number; subtitle: string }[] };
+    let unit: BinUnit = "day";
+    if (rows.length > 90) unit = "month";
+    else if (rows.length > 14) unit = "week";
+    if (unit === "day") {
+      return {
+        unit,
+        items: rows.map(d => ({
+          key: d.date,
+          label: d.date.slice(5),         // MM-DD
+          total_tokens: d.total_tokens,
+          subtitle: d.date,
+        })),
+      };
+    }
+    if (unit === "week") {
+      // Anchor each week to the ISO Monday so labels are stable across
+      // re-renders and the same date always falls in the same bucket.
+      const bucket: Record<string, { total: number; first: string; last: string }> = {};
+      for (const d of rows) {
+        const dt = new Date(d.date + "T00:00:00Z");
+        const dow = (dt.getUTCDay() + 6) % 7;   // Mon=0 … Sun=6
+        const monday = new Date(dt);
+        monday.setUTCDate(monday.getUTCDate() - dow);
+        const key = monday.toISOString().slice(0, 10);
+        if (!bucket[key]) bucket[key] = { total: 0, first: d.date, last: d.date };
+        bucket[key].total += d.total_tokens;
+        if (d.date < bucket[key].first) bucket[key].first = d.date;
+        if (d.date > bucket[key].last) bucket[key].last = d.date;
+      }
+      return {
+        unit,
+        items: Object.entries(bucket)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, v]) => ({
+            key: k,
+            label: k.slice(5),           // MM-DD of the Monday
+            total_tokens: v.total,
+            subtitle: `Week of ${k} (${v.first} → ${v.last})`,
+          })),
+      };
+    }
+    // unit === "month"
+    const bucket: Record<string, { total: number }> = {};
+    for (const d of rows) {
+      const key = d.date.slice(0, 7);    // YYYY-MM
+      if (!bucket[key]) bucket[key] = { total: 0 };
+      bucket[key].total += d.total_tokens;
+    }
+    return {
+      unit,
+      items: Object.entries(bucket)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => ({
+          key: k,
+          label: k.slice(5),             // MM
+          total_tokens: v.total,
+          subtitle: k,                   // YYYY-MM
+        })),
+    };
+  }, [filledByDay]);
+  const maxBinTotal = Math.max(1, ...bins.items.map(b => b.total_tokens));
 
   return (
     <div className="space-y-5">
@@ -925,38 +994,43 @@ function UsagePanel() {
             <StatCard label="LLM calls"     value={fmtNum(totals.calls)}         tone="amber" />
           </div>
 
-          {/* Per-day mini bar chart — uses the zero-filled range so every
-              day in the window shows up, even ones with no LLM activity. */}
-          {filledByDay.length > 1 && (
+          {/* Adaptive mini bar chart — uses zero-filled days for short
+              ranges, weekly bins for month-scale windows, and monthly
+              bins for year-scale windows. The bar width scales with the
+              bin count so a year of usage shows ~12 month bars instead
+              of 365 hair-thin daily slivers. */}
+          {bins.items.length > 1 && (
             <div className="bg-gray-900/40 border border-gray-800/60 rounded-xl p-4 mb-5">
-              <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">Daily total</p>
+              <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                {bins.unit === "month" ? "Monthly total" : bins.unit === "week" ? "Weekly total" : "Daily total"}
+              </p>
               <div className="flex items-end gap-1.5 h-24">
-                {filledByDay.map(d => {
-                  const h = d.total_tokens === 0
+                {bins.items.map(b => {
+                  const h = b.total_tokens === 0
                     ? 0
-                    : Math.max(2, (d.total_tokens / maxDayTotal) * 100);
+                    : Math.max(2, (b.total_tokens / maxBinTotal) * 100);
                   return (
                     <div
-                      key={d.date}
+                      key={b.key}
                       className="flex-1 h-full flex items-end"
-                      title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
+                      title={`${b.subtitle}: ${fmtNum(b.total_tokens)} tokens`}
                     >
                       <div
-                        className={`w-full ${d.total_tokens === 0 ? "bg-gray-800/30" : "bg-indigo-600/50 hover:bg-indigo-500/80"} rounded-t transition-colors`}
-                        style={{ height: `${h}%`, minHeight: d.total_tokens === 0 ? 0 : 2 }}
+                        className={`w-full ${b.total_tokens === 0 ? "bg-gray-800/30" : "bg-indigo-600/50 hover:bg-indigo-500/80"} rounded-t transition-colors`}
+                        style={{ height: `${h}%`, minHeight: b.total_tokens === 0 ? 0 : 2 }}
                       />
                     </div>
                   );
                 })}
               </div>
               <div className="flex gap-1.5 mt-1.5">
-                {filledByDay.map(d => (
+                {bins.items.map(b => (
                   <span
-                    key={d.date}
-                    className={`flex-1 text-center text-[8px] font-mono ${d.total_tokens === 0 ? "text-gray-700" : "text-gray-600"}`}
-                    title={`${d.date}: ${fmtNum(d.total_tokens)} tokens`}
+                    key={b.key}
+                    className={`flex-1 text-center text-[8px] font-mono ${b.total_tokens === 0 ? "text-gray-700" : "text-gray-600"}`}
+                    title={`${b.subtitle}: ${fmtNum(b.total_tokens)} tokens`}
                   >
-                    {d.date.slice(5)}
+                    {b.label}
                   </span>
                 ))}
               </div>

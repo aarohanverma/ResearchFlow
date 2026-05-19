@@ -40,7 +40,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -93,6 +95,271 @@ _DECISION_SCHEMA = {
 }
 
 
+# ── Param hygiene helpers ───────────────────────────────────────────────────
+#
+# The model frequently emits placeholders like ``__to_fill_from_retrieval__``
+# or leaves the dispatching dict empty entirely, which then trips pydantic
+# validation downstream and produces an opaque "query field required" error
+# instead of a useful retrieval. These helpers (a) render the JSON schema of
+# each tool into the catalog the model sees, (b) detect placeholder values,
+# (c) auto-fill missing required fields from the user query / paper ledger,
+# and (d) get re-applied on validation error so a bad first attempt is
+# repaired rather than discarded.
+
+_PLACEHOLDER_PATTERNS = re.compile(
+    r"""(?ix)              # case-insensitive, verbose
+    ^\s*(?:
+        __[a-z0-9_]+__?                |   # __to_fill_*__ / __fill__
+        <{1,2}\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^>]*>{1,2}? |
+        \{\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^}]*\}    |
+        \[\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^\]]*\]  |
+        (?:n/?a|tbd|todo|fixme|null|none|undefined|fill_me|fill_in|\?{2,})\s*$
+    )
+    """,
+)
+
+
+def _looks_like_placeholder(value: Any) -> bool:
+    """Return True when ``value`` looks like a model-emitted placeholder.
+
+    Caught:
+      - ``"__to_fill_from_retrieval__"`` and ``__like_this__``
+      - ``"<TODO>"`` / ``<<fill>>`` / ``{placeholder}`` / ``[tbd]``
+      - Bare ``"null"`` / ``"None"`` / ``"undefined"`` strings
+      - Empty / whitespace-only strings
+      - Lists where every element is itself a placeholder
+
+    Numbers, bools, and well-formed values pass through unchanged.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return True
+        return bool(_PLACEHOLDER_PATTERNS.match(stripped))
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return False  # empty list is legal default for many fields
+        return all(_looks_like_placeholder(v) for v in value)
+    return False
+
+
+# Field-name heuristics for auto-fill. These are deliberately scoped to the
+# tool input vocabulary we control (every retrieval tool's required text
+# field is named one of these). Adding a new retrieval tool with a different
+# field name is a one-line addition here.
+_QUERY_LIKE_FIELDS: frozenset[str] = frozenset({
+    "query", "question", "claim", "topic", "search_query", "text", "prompt",
+})
+_PAPER_ID_LIST_FIELDS: frozenset[str] = frozenset({"paper_ids", "ids"})
+_PAPER_ID_SINGLE_FIELDS: frozenset[str] = frozenset({"paper_id", "id"})
+
+
+@dataclass
+class PaperLedger:
+    """Running inventory of paper IDs surfaced by retrieval tools this turn.
+
+    The model needs concrete paper IDs to call ``compare_papers`` /
+    ``paper_qa`` / ``genie_synthesize`` etc. Without a ledger it ends up
+    emitting placeholders like ``__to_fill_from_retrieval__`` because it
+    has no way to refer to "the papers we just retrieved".
+
+    Populated by :meth:`add_from_result` after every tool dispatch (cheap
+    no-op for non-retrieval tools) and rendered into the decision prompt
+    so the model can copy concrete IDs into the next ACTION's params.
+    """
+
+    by_id: "OrderedDict[str, dict]" = field(default_factory=OrderedDict)
+
+    def add_from_result(self, result: ToolResult) -> int:
+        """Merge any paper records from ``result.output`` into the ledger.
+
+        Returns the count of NEW IDs added (zero when the tool surfaced no
+        papers or only repeats). Order is preserved so the model gets the
+        most relevant papers first when we render the top-K view.
+        """
+        added = 0
+        try:
+            out = result.output or {}
+            candidates: list = []
+            for key in ("papers", "results", "items", "candidates"):
+                v = out.get(key)
+                if isinstance(v, list):
+                    candidates = v
+                    break
+            for c in candidates:
+                if not isinstance(c, dict):
+                    continue
+                pid = c.get("paper_id") or c.get("id") or c.get("external_id")
+                if not pid:
+                    continue
+                pid = str(pid)
+                if pid in self.by_id:
+                    continue
+                self.by_id[pid] = {
+                    "title": (c.get("title") or "")[:160],
+                    "ns": c.get("namespace_key") or c.get("namespace") or "",
+                }
+                added += 1
+        except Exception:
+            return added
+        return added
+
+    def ids(self, limit: int | None = None) -> list[str]:
+        out = list(self.by_id.keys())
+        return out[:limit] if limit is not None else out
+
+    def render_for_prompt(self, limit: int = 12) -> str:
+        """Compact view for the decision prompt. ``(none)`` when empty so
+        the model knows the ledger is real but has not been populated yet.
+        """
+        if not self.by_id:
+            return "(no papers retrieved yet — call a retrieval tool before compare/paper_qa/synthesize)"
+        items = list(self.by_id.items())
+        head = items[:limit]
+        lines: list[str] = []
+        for pid, info in head:
+            title = (info.get("title") or "(untitled)")[:120]
+            ns = info.get("ns") or ""
+            ns_str = f" [{ns}]" if ns else ""
+            lines.append(f"  - id={pid}{ns_str} title={title}")
+        if len(items) > limit:
+            lines.append(f"  ... and {len(items) - limit} more")
+        return "\n".join(lines)
+
+
+def _render_tool_catalog(catalog: list[dict], limit: int = 30) -> str:
+    """Render the tool catalog with required + optional params from each
+    tool's JSON input schema so the model emits valid ``params`` dicts.
+
+    The screenshots showed the model emitting ``params={}`` to tools
+    requiring a ``query`` field — that was because the catalog only
+    advertised the tool name + summary. Surfacing the schema fields
+    inline removes the guesswork; we keep each tool's block compact
+    (one summary line + one params line) so the prompt stays cheap.
+    """
+    lines: list[str] = []
+    for t in catalog[:limit]:
+        name = t.get("name", "?")
+        summary = (t.get("summary") or "")[:220]
+        schema = t.get("input_schema") or {}
+        props = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+
+        # Required first, then optional, both alphabetised for stability.
+        req_parts: list[str] = []
+        opt_parts: list[str] = []
+        for prop_name in sorted(props.keys()):
+            prop = props[prop_name] or {}
+            ptype = prop.get("type") or _infer_type(prop)
+            desc = (prop.get("description") or "")[:90]
+            default = prop.get("default", _MISSING)
+            piece = f"{prop_name}({ptype}"
+            if prop_name in required:
+                piece += ", required"
+            elif default is not _MISSING:
+                piece += f", default={_compact_default(default)}"
+            piece += ")"
+            if desc:
+                piece += f"—{desc}"
+            (req_parts if prop_name in required else opt_parts).append(piece)
+
+        params_line = ""
+        if req_parts or opt_parts:
+            joined = "; ".join(req_parts + opt_parts)
+            if len(joined) > 600:
+                joined = joined[:597] + "..."
+            params_line = f"\n    params: {joined}"
+        lines.append(f"- {name}: {summary}{params_line}")
+    return "\n".join(lines)
+
+
+_MISSING = object()
+
+
+def _infer_type(prop: dict) -> str:
+    """Best-effort type string for JSON schema entries that use ``anyOf`` /
+    ``allOf`` instead of a plain ``type`` field."""
+    if "anyOf" in prop:
+        inner = [p.get("type") for p in prop["anyOf"] if isinstance(p, dict)]
+        inner = [t for t in inner if t]
+        if inner:
+            return "|".join(sorted(set(inner)))
+    if "$ref" in prop:
+        return prop["$ref"].rsplit("/", 1)[-1]
+    return "any"
+
+
+def _compact_default(value: Any) -> str:
+    """One-line stringification of a default value for the catalog view."""
+    try:
+        s = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        s = str(value)
+    return s if len(s) <= 24 else s[:23] + "…"
+
+
+def _preflight_and_repair_params(
+    action: str,
+    raw_params: dict,
+    schema: dict,
+    *,
+    query: str,
+    ledger: PaperLedger,
+) -> tuple[dict, list[str]]:
+    """Strip placeholders and auto-fill missing required fields.
+
+    Returns ``(repaired, notes)``. ``notes`` is a list of human-readable
+    repair actions ("auto-filled 'query' from user query") that get folded
+    into the action's scratchpad entry so the model can see what got
+    rewritten — without that, the model would re-emit the same broken
+    params on the next iteration.
+
+    Fill rules:
+      * ``query`` / ``question`` / ``claim`` / ``topic`` ← user query
+      * ``paper_ids`` ← ledger.ids()[:3] when ≥2 papers retrieved
+      * ``paper_id`` ← ledger.ids()[0] when ≥1 paper retrieved
+      * Anything else stays None / unset — pydantic will surface the
+        missing-field error and the loop will record it as a clear
+        observation rather than auto-faking a value we don't have.
+    """
+    repaired = dict(raw_params or {})
+    notes: list[str] = []
+    props = schema.get("properties") or {}
+    required = list(schema.get("required") or [])
+
+    # 1. Strip placeholders from every supplied key (keeps real values).
+    for k in list(repaired.keys()):
+        v = repaired[k]
+        if _looks_like_placeholder(v):
+            del repaired[k]
+            preview = (str(v)[:40]) if v is not None else "None"
+            notes.append(f"removed placeholder {k}={preview!r}")
+
+    # 2. Auto-fill missing required fields where we have a fact to fill with.
+    for k in required:
+        if k in repaired and not _looks_like_placeholder(repaired[k]):
+            continue
+        if k in _QUERY_LIKE_FIELDS and query:
+            repaired[k] = query[:480]
+            notes.append(f"auto-filled '{k}' from user query")
+        elif k in _PAPER_ID_LIST_FIELDS:
+            prop = props.get(k) or {}
+            min_items = int(prop.get("minItems") or prop.get("min_length") or 1)
+            ids = ledger.ids(limit=max(min_items, 3))
+            if len(ids) >= min_items:
+                repaired[k] = ids[:max(min_items, 2)]
+                notes.append(f"auto-filled '{k}' from ledger: {repaired[k]}")
+        elif k in _PAPER_ID_SINGLE_FIELDS:
+            ids = ledger.ids(limit=1)
+            if ids:
+                repaired[k] = ids[0]
+                notes.append(f"auto-filled '{k}' from ledger: {ids[0]}")
+
+    return repaired, notes
+
+
 @dataclass
 class ReactConfig:
     """Knobs the orchestrator passes per call.
@@ -116,11 +383,20 @@ class ReactOutcome:
     The orchestrator merges ``new_results`` into its existing ``results``
     dict so the synthesizer sees the full evidence base. ``scratchpad``
     is persisted on the message payload for inspection.
+
+    ``tool_failures`` and ``successful_retrievals`` are the signals the
+    synthesizer reads to decide whether to downgrade confidence — if
+    the loop tried to expand evidence and several tools errored / no
+    new papers landed, the synth must say so out loud instead of
+    polishing past it.
     """
     scratchpad: Scratchpad
     new_results: dict[str, ToolResult]
     completed_normally: bool   # True if model said finalize; False if budget exhausted
     iterations: int
+    tool_failures: int = 0
+    successful_retrievals: int = 0
+    paper_ledger_size: int = 0
 
 
 async def run_react_loop(
@@ -179,6 +455,26 @@ async def run_react_loop(
     deadline = time.monotonic() + max(5.0, config.deadline_seconds)
     completed_normally = False
     iteration_count = 0
+    tool_failures = 0
+    successful_retrievals = 0
+    ledger = PaperLedger()
+    # Per-tool failure counter so a tool that keeps blowing up doesn't
+    # eat every remaining iteration. After two failures with no successes,
+    # the tool gets banned for the rest of the loop and the next decision
+    # prompt advertises that ban explicitly.
+    tool_fail_counts: dict[str, int] = {}
+    banned_tools: set[str] = set()
+    _SAME_TOOL_FAILURE_CAP = 2
+
+    # Pre-populate the ledger from anything the initial plan already
+    # retrieved so the first ReAct iteration can already issue
+    # ``compare_papers`` / ``paper_qa`` with concrete IDs instead of
+    # placeholders.
+    for r in (prior_results or {}).values():
+        try:
+            ledger.add_from_result(r)
+        except Exception:
+            pass
 
     # Seed the scratchpad with what the initial plan already did so the
     # model can reason about gaps without us re-summarising work.
@@ -233,6 +529,8 @@ async def run_react_loop(
                 memory_view=memory_view,
                 research_brief_text=research_brief_text,
                 active_context=active_context,
+                ledger=ledger,
+                banned_tools=banned_tools,
                 config=config,
                 is_last_iteration=is_last_iteration,
             )
@@ -306,6 +604,18 @@ async def run_react_loop(
             )
             continue
 
+        if action in banned_tools:
+            pad.observe(
+                tool=action,
+                summary=(
+                    f"Tool '{action}' has been banned for this turn after "
+                    f"{_SAME_TOOL_FAILURE_CAP}+ consecutive failures. Pick a "
+                    "different tool or finalize."
+                ),
+                output_ref="",
+                error="tool_banned",
+            )
+            continue
         tool = get_tool(action)
         if tool is None:
             pad.observe(tool=action, summary="Unknown tool — skipped.", output_ref="", error="tool_not_found")
@@ -322,7 +632,74 @@ async def run_react_loop(
 
         try:
             input_schema = tool.input_schema
-            validated = input_schema(**params) if isinstance(params, dict) else params  # type: ignore[arg-type]
+            # Preflight: strip placeholders + auto-fill missing required
+            # fields from the user query / paper ledger BEFORE we hand
+            # the dict to pydantic. The production trace showed the
+            # model emitting ``params={}`` to retrieval tools, which
+            # blew up validation with an opaque "query field required"
+            # error and then never recovered — the model just picked
+            # another tool. Now we repair the call before dispatch and,
+            # if validation still fails, retry once with fully-derived
+            # defaults rather than dropping the action on the floor.
+            #
+            # ``model_json_schema`` is only present on pydantic BaseModel
+            # subclasses; mock test doubles sometimes pass a plain
+            # callable. When we can't introspect, skip the preflight
+            # and let pydantic / the lambda fail the normal way.
+            schema_dict: dict = {}
+            try:
+                schema_dict = input_schema.model_json_schema()  # type: ignore[union-attr]
+            except Exception:
+                schema_dict = {}
+            repair_notes: list[str] = []
+            if isinstance(params, dict) and schema_dict:
+                params, repair_notes = _preflight_and_repair_params(
+                    action, params, schema_dict, query=query, ledger=ledger,
+                )
+            try:
+                validated = input_schema(**params) if isinstance(params, dict) else params  # type: ignore[arg-type]
+            except Exception as ve:
+                if not schema_dict:
+                    # No schema to repair against — propagate to the
+                    # outer ``except`` so the existing failure path
+                    # records the observation.
+                    raise
+                # One-shot auto-repair: re-derive params from scratch
+                # using the same fill rules. If THIS also fails, the
+                # tool genuinely lacks information we can supply and we
+                # log a clear observation so the model picks a different
+                # path next iteration.
+                fresh_params, fresh_notes = _preflight_and_repair_params(
+                    action, {}, schema_dict, query=query, ledger=ledger,
+                )
+                repair_notes.extend(f"after error: {n}" for n in fresh_notes)
+                try:
+                    validated = input_schema(**fresh_params)
+                    params = fresh_params
+                except Exception as ve2:
+                    tool_failures += 1
+                    tool_fail_counts[action] = tool_fail_counts.get(action, 0) + 1
+                    if tool_fail_counts[action] >= _SAME_TOOL_FAILURE_CAP:
+                        banned_tools.add(action)
+                    required = list(schema_dict.get("required") or [])
+                    pad.observe(
+                        tool=action,
+                        summary=(
+                            f"Invalid params even after auto-repair. "
+                            f"Required={required}. Tried={json.dumps(fresh_params, default=str)[:200]}. "
+                            f"Error: {str(ve2)[:200]}. "
+                            "Pick a different tool or first run a retrieval tool "
+                            "(deep_search / arxiv_import / literature_survey) "
+                            "to populate the paper ledger."
+                        ),
+                        output_ref="",
+                        error="invalid_params",
+                    )
+                    continue
+            if repair_notes:
+                pad.think(
+                    f"Auto-repaired params for {action}: " + "; ".join(repair_notes)[:600]
+                )
             # Per-action ToolContext — a single shared session held across
             # the whole loop would (a) be killed by cloud Postgres'
             # idle-in-transaction timeout (typically 60s) for any long
@@ -338,6 +715,12 @@ async def run_react_loop(
             else:
                 raise RuntimeError("react_loop: neither ctx nor ctx_factory provided")
             new_results[action] = result
+            # Feed paper IDs into the ledger so the NEXT iteration can
+            # reference them by id in compare_papers / paper_qa /
+            # genie_synthesize without falling back to placeholders.
+            added_ids = ledger.add_from_result(result)
+            if action in _RETRIEVAL_TOOLS and added_ids > 0:
+                successful_retrievals += 1
             pad.observe(
                 tool=action,
                 summary=(result.summary or "(no summary)"),
@@ -368,8 +751,22 @@ async def run_react_loop(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            tool_failures += 1
+            tool_fail_counts[action] = tool_fail_counts.get(action, 0) + 1
+            if tool_fail_counts[action] >= _SAME_TOOL_FAILURE_CAP:
+                banned_tools.add(action)
             log.warning("react_loop: tool '%s' raised: %s", action, exc)
-            pad.observe(tool=action, summary=f"Tool error: {exc}", output_ref="", error=str(exc)[:300])
+            pad.observe(
+                tool=action,
+                summary=(
+                    f"Tool error: {exc}. "
+                    + ("This tool is now banned for the remainder of the turn. "
+                       if action in banned_tools else "")
+                    + "Try a different tool or broaden the query."
+                ),
+                output_ref="",
+                error=str(exc)[:300],
+            )
 
     pad.finish()
     return ReactOutcome(
@@ -377,6 +774,9 @@ async def run_react_loop(
         new_results=new_results,
         completed_normally=completed_normally,
         iterations=iteration_count,
+        tool_failures=tool_failures,
+        successful_retrievals=successful_retrievals,
+        paper_ledger_size=len(ledger.by_id),
     )
 
 
@@ -392,6 +792,8 @@ async def _decide_next_action(
     memory_view: dict[str, Any],
     research_brief_text: str,
     active_context: dict[str, Any] | None,
+    ledger: PaperLedger | None = None,
+    banned_tools: set[str] | None = None,
     config: ReactConfig,
     is_last_iteration: bool,
 ) -> dict[str, Any] | None:
@@ -399,12 +801,18 @@ async def _decide_next_action(
     from app.adapters.llm import get_llm_adapter
 
     # Tool catalog — same view the planner uses, minus tools the loop
-    # can't / shouldn't call (see ``_DISALLOWED_FROM_LOOP``).
+    # can't / shouldn't call (see ``_DISALLOWED_FROM_LOOP``) and any tool
+    # already banned this turn after repeated failures.
     catalog = describe_for_planner(
         namespace_key=config.namespace_key,
         disabled_features=config.disabled_features,
     )
-    catalog = [t for t in catalog if t.get("name") not in _DISALLOWED_FROM_LOOP]
+    banned = set(banned_tools or set())
+    catalog = [
+        t for t in catalog
+        if t.get("name") not in _DISALLOWED_FROM_LOOP
+        and t.get("name") not in banned
+    ]
 
     # Compact "what we already have" view.
     prior_summary = _summarise_results(prior_results) + _summarise_results(new_results)
@@ -428,6 +836,26 @@ async def _decide_next_action(
         "  - A specific claim lacks support and a targeted search/verification helps.\n"
         "  - Prior results were thin, empty, or contradictory.\n"
         "  - The user asked for something the existing tool outputs do not cover.\n\n"
+        "PARAMS RULES (critical — broken params burn an iteration):\n"
+        "  - Every tool's required + optional params are listed in the catalog. "
+        "Send a real value for every 'required' field.\n"
+        "  - NEVER emit placeholders like '__to_fill_*__', '<TODO>', '<fill>', "
+        "'null', 'tbd'. If you don't have a value, either pick a different "
+        "tool or call a retrieval tool first to obtain it.\n"
+        "  - For 'paper_ids' / 'paper_id' params, copy concrete IDs verbatim "
+        "from the PAPER LEDGER block. Never invent IDs and never use the title "
+        "as an ID.\n"
+        "  - For 'query' / 'question' / 'claim' params, write a focused text "
+        "expression of what you actually want — not a copy of the whole user "
+        "turn unless that IS what you want to search.\n\n"
+        "GENIE FLOW (when the user asks you to 'synthesize an idea', "
+        "'combine these papers', 'propose a novel architecture' or similar):\n"
+        "  - Step 1: call 'genie_synthesize' with paper_ids from the LEDGER. "
+        "This creates a NEW idea capsule grounded in those papers.\n"
+        "  - Step 2: (optional) call 'genie_deep_dive' on the capsule_id "
+        "returned by step 1 to expand it.\n"
+        "  - DO NOT call 'genie_read' for a synthesis request — that only "
+        "lists STALE capsules from prior turns and produces off-topic answers.\n\n"
         "DO NOT redo work already done. DO NOT call the same tool with the same params twice. "
         "DO NOT call tools that don't help answer the question.\n\n"
         "Return strict JSON: {thought, action, params, rationale}. "
@@ -439,8 +867,11 @@ async def _decide_next_action(
             "single verification call is critically necessary."
         )
 
-    catalog_text = "\n".join(
-        f"- {t['name']}: {t['summary'][:200]}" for t in catalog[:30]
+    catalog_text = _render_tool_catalog(catalog, limit=30)
+    ledger_text = (
+        ledger.render_for_prompt(limit=12)
+        if ledger is not None
+        else "(ledger unavailable)"
     )
 
     # Active-context block — when the user has uploaded notes / PDFs /
@@ -462,14 +893,23 @@ async def _decide_next_action(
     else:
         active_ctx_block = "ACTIVE CONTEXT: (none — user has not attached any documents this session)"
 
+    banned_note = (
+        f"BANNED THIS TURN (failed repeatedly — do not pick): {sorted(banned)}\n\n"
+        if banned else ""
+    )
     user_msg = (
         f"USER QUERY:\n{query[:1500]}\n\n"
         f"RESEARCH BRIEF:\n{(research_brief_text or '(none)')[:1500]}\n\n"
         f"{active_ctx_block}\n\n"
-        f"TOOL CATALOG (you may call any of these):\n{catalog_text}\n\n"
+        f"{banned_note}"
+        f"TOOL CATALOG (call any of these — read the params carefully):\n{catalog_text}\n\n"
+        f"PAPER LEDGER (concrete IDs you may pass to compare_papers / paper_qa / genie_synthesize):\n{ledger_text}\n\n"
         f"WHAT THE INITIAL PLAN PRODUCED:\n{prior_summary[:2000]}\n\n"
         f"SCRATCHPAD SO FAR:\n{pad.render_for_prompt()}\n\n"
-        "Now decide your next ACTION."
+        "Now decide your next ACTION. Remember: every 'required' param needs a "
+        "concrete value drawn from the user query, the ledger, or the brief — "
+        "never a placeholder. If you can't fill a required param, switch tools "
+        "or finalize."
     )
 
     try:
