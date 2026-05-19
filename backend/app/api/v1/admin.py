@@ -258,6 +258,14 @@ async def delete_user(user_id: UUID, admin_id: AdminUserID, db: DBSession) -> di
         raise HTTPException(status_code=404, detail="User not found")
     await db.delete(user)
     await db.commit()
+    # Bounce any cached "is_active" lookup for this user so an already
+    # issued token can't outlive the row — the auth dep will then see
+    # the missing row and 403 the request as deactivated.
+    try:
+        from app.core.deps import invalidate_active_cache
+        invalidate_active_cache(user_id)
+    except Exception:
+        pass
     return {"deleted": True}
 
 
@@ -431,6 +439,15 @@ async def patch_user(user_id: UUID, body: UserPatch, admin_id: AdminUserID, db: 
         user.is_admin = bool(body.is_admin)
     await db.commit()
     await db.refresh(user)
+    # Invalidate the deps-layer active cache so the user's NEXT request
+    # in any worker sees the new state immediately (rather than waiting
+    # for the 30-second TTL to expire). Idempotent and free when the
+    # user wasn't cached yet.
+    try:
+        from app.core.deps import invalidate_active_cache
+        invalidate_active_cache(user_id)
+    except Exception:
+        pass
     return AdminUserItem.model_validate(user, from_attributes=True)
 
 

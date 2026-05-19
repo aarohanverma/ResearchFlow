@@ -336,12 +336,36 @@ class Orchestrator:
             from app.assistant.planner_llm import _assess_query_complexity
             intent_complexity = (intent.complexity if intent else "") or ""
             heuristic_complexity = _assess_query_complexity(query, history)
+            # Depth-tier resolution:
+            #
+            #   PRIMARY DRIVER: the LLM intent classifier's verdict.
+            #     The intent system prompt was rebalanced so the model
+            #     classifies honestly (no bias toward any tier), so the
+            #     LLM's own judgment owns the decision in the common case.
+            #
+            #   SOFT GUIDANCE / SAFETY NUDGE: the deterministic keyword +
+            #     length heuristic. Allowed to *raise* the tier when it
+            #     detects clear deep-research markers (compare/contrast/
+            #     synthesize/survey/...) that the LLM might still under-
+            #     classify on a borderline turn. Never lowers the LLM's
+            #     verdict — over-investing a single extra turn is cheap;
+            #     under-investing on real research produces shallow
+            #     answers.
+            #
+            # In effect: trust the LLM, but if a heuristic with strong
+            # priors disagrees in the more-work direction, defer to the
+            # heuristic. Either signal missing → the other decides.
             tier_map_intent = {"trivial": "trivial", "single": "single", "deep": "deep"}
-            tier_map_heur = {"simple": "single", "medium": "single", "complex": "deep"}
-            depth_tier = (
-                tier_map_intent.get(intent_complexity)
-                or tier_map_heur.get(heuristic_complexity, "single")
-            )
+            tier_map_heur = {"simple": "trivial", "medium": "single", "complex": "deep"}
+            _TIER_RANK = {"trivial": 0, "single": 1, "deep": 2}
+            _candidates: list[str] = []
+            it = tier_map_intent.get(intent_complexity)
+            if it in _TIER_RANK:
+                _candidates.append(it)
+            ht = tier_map_heur.get(heuristic_complexity)
+            if ht in _TIER_RANK:
+                _candidates.append(ht)
+            depth_tier = max(_candidates, key=_TIER_RANK.__getitem__) if _candidates else "single"
             # Map the depth tier back to the model-routing label the
             # synthesizer already understands.
             query_complexity = {
@@ -475,6 +499,43 @@ class Orchestrator:
                 expertise=expertise,
             )
 
+            # ── ReAct mid-turn loop (depth-driven, deep tier only) ──────
+            # After the initial plan executes, deep-tier turns enter a
+            # bounded THOUGHT/ACTION/OBSERVATION loop so the model can:
+            #   - pivot when evidence is thin / contradictory / off-topic
+            #   - call extra verification / comparison tools mid-turn
+            #   - choose 'finalize' when results are already sufficient
+            # Trivial / single tiers SKIP the loop entirely — adaptivity
+            # is added to deep turns, never forced onto simple queries.
+            # No user toggle: the depth tier already encodes whether the
+            # query needs this. The UI shows an indicator when the loop
+            # runs (via ``react_thought`` / ``react_action`` /
+            # ``react_observation`` published events), so users can SEE
+            # the deeper reasoning happening without controlling it.
+            try:
+                if depth_tier == "deep":
+                    await self._run_react_phase(
+                        job_id=job_id,
+                        task=task,
+                        plan=plan,
+                        results=results,
+                        query=query,
+                        primary_ns=primary_ns,
+                        namespace_keys=namespace_keys,
+                        orientation=orientation,
+                        expertise=expertise,
+                        research_brief=research_brief,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The ReAct loop is enrichment-only. If it falls over for
+                # any reason, fall through to the existing synthesis path
+                # with whatever results the initial plan produced — we
+                # never block the user-facing answer on an enrichment
+                # step that failed.
+                log.warning("react_loop failed (continuing with plan-only results): %s", exc)
+
             # Compose the message + persist outcome.
             await self._finalize_turn(
                 job_id=job_id,
@@ -492,6 +553,186 @@ class Orchestrator:
         except Exception as exc:
             log.exception("assistant turn failed job=%s", job_id)
             await self._handle_failed(job_id, str(exc))
+
+    # ── ReAct mid-turn loop ────────────────────────────────────────────────
+
+    async def _run_react_phase(
+        self,
+        *,
+        job_id: str,
+        task: Any,
+        plan: Plan,
+        results: dict[str, ToolResult],
+        query: str,
+        primary_ns: str,
+        namespace_keys: list[str],
+        orientation: str,
+        expertise: str,
+        research_brief: dict | None,
+    ) -> None:
+        """Run a bounded THOUGHT/ACTION/OBSERVATION loop and merge new results in-place.
+
+        Activation:
+            Only the deep tier reaches this method. Trivial / single tiers
+            bypass it entirely via the ``depth_tier == 'deep'`` gate at the
+            call site. No user toggle — depth encodes the user's intent.
+
+        State:
+            ``results`` is mutated in-place: any new tool outputs the loop
+            produces are merged so the existing synthesis pipeline picks
+            them up without further changes. The scratchpad is stashed on
+            ``task._scratchpad`` so :func:`_finalize_turn` can persist it
+            on the message payload for inspection.
+
+        Memory integration:
+            The loop reads from the same memory snapshot already loaded
+            onto the task. It does NOT mutate durable memory — the
+            ``memory_write`` / ``memory_delete`` tools are explicitly
+            disallowed inside the loop so all durable consolidation
+            stays on the post-turn auto-memory pass (one writer per
+            tier per turn, no contention).
+
+        Failure mode:
+            The caller wraps this in a broad ``except`` and falls through
+            to synthesis with whatever results the initial plan produced.
+            We never block the answer on enrichment.
+
+        Observability:
+            Publishes ``react_thought`` / ``react_action`` /
+            ``react_observation`` events so the live trace can render
+            an "agent thinking" indicator while the loop runs.
+        """
+        from app.assistant.react_loop import ReactConfig, run_react_loop
+        from app.assistant.tools.base import ToolContext
+
+        # Resolve disabled features once so the loop's tool catalog
+        # matches the planner's (e.g. a user with graph disabled won't
+        # see graph_query as a candidate ACTION).
+        disabled_features: set[str] = set()
+        try:
+            from app.services.feature_flags import get_effective_features
+            eff = await get_effective_features(task.user_id)
+            disabled_features = {k for k, v in eff.items() if not v}
+        except Exception:
+            pass
+
+        # Surface a single "react started" event so the UI can show its
+        # indicator immediately, before the first decision LLM call
+        # comes back. Cheap; safe to fire even if no real work happens.
+        try:
+            self._publish(job_id, "react_started", {"depth_tier": "deep"})
+        except Exception:
+            pass
+
+        memory_view = getattr(task, "_assistant_memory", None) or {}
+        brief_text = ""
+        if research_brief:
+            try:
+                from app.assistant.research_brief import format_for_planner
+                brief_text = format_for_planner(research_brief) or ""
+            except Exception:
+                brief_text = ""
+
+        # Build a minimal ToolContext. The loop runs tools the same way
+        # ``_run_step`` does, but without the per-step DB persistence
+        # (the orchestrator's AssistantStep rows are for the planner's
+        # initial plan — the scratchpad is the record for ReAct steps).
+        async def _noop_emit(*_a, **_k):
+            return None
+
+        async def _check_cancel() -> bool:
+            return await self._is_cancelled(job_id)
+
+        # Per-action ToolContext factory. Yields a fresh AsyncSession
+        # per tool invocation so a long loop does not hold one DB
+        # session across multiple iterations (cloud Postgres kills
+        # idle-in-transaction connections after ~60s) and any tool
+        # that flushes-without-commit can have its writes committed
+        # at the per-action boundary instead of being silently rolled
+        # back when the loop exits.
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _ctx_factory():
+            async with async_session_factory() as _db:
+                _ctx = ToolContext(
+                    user_id=task.user_id,
+                    session_id=task.session_id,
+                    namespace_key=primary_ns,
+                    namespace_keys=namespace_keys,
+                    orientation=orientation,
+                    expertise_level=expertise,
+                    job_id=job_id,
+                    parent_message_id=task.assistant_message_id,
+                    db=_db,
+                    should_cancel=_check_cancel,
+                    emit_progress=_noop_emit,
+                )
+                try:
+                    yield _ctx
+                    # Commit per-action so a flush-without-commit tool
+                    # doesn't silently lose its writes when the block exits.
+                    # Tools that opened their own inner sessions / committed
+                    # already are unaffected by this outer commit.
+                    try:
+                        await _db.commit()
+                    except Exception:
+                        await _db.rollback()
+                except Exception:
+                    try:
+                        await _db.rollback()
+                    except Exception:
+                        pass
+                    raise
+
+        # Active-context inventory mirrored onto ``task`` by
+        # ``_load_session_context``. Falls back to ``{}`` when the
+        # inventory wasn't populated (shouldn't happen in normal flow
+        # but we degrade safely if it does).
+        active_context = getattr(task, "_session_active_context", None) or {}
+
+        outcome = await run_react_loop(
+            query=query,
+            initial_plan_actions=list(plan.actions or []),
+            prior_results=results,
+            memory_view=memory_view,
+            research_brief_text=brief_text,
+            active_context=active_context,
+            ctx_factory=_ctx_factory,
+            should_cancel=_check_cancel,
+            config=ReactConfig(
+                namespace_key=primary_ns,
+                expertise=expertise,
+                orientation=orientation,
+                disabled_features=disabled_features,
+            ),
+            publish=lambda kind, payload: self._publish(job_id, kind, payload),
+        )
+
+        # Merge new tool results into the orchestrator's results dict so
+        # the existing synthesis pipeline picks them up. Don't clobber
+        # results the initial plan already produced — the model only
+        # gets to ADD to the evidence base from inside the loop.
+        for name, tr in outcome.new_results.items():
+            results.setdefault(name, tr)
+            if name not in plan.actions:
+                plan.actions.append(f"ReAct: {name}")
+
+        # Stash the scratchpad on the task so ``_finalize_turn`` can
+        # persist it on the message payload + render it in the UI.
+        task._scratchpad = outcome.scratchpad  # type: ignore[attr-defined]
+        task._react_iterations = outcome.iterations  # type: ignore[attr-defined]
+        task._react_completed_normally = outcome.completed_normally  # type: ignore[attr-defined]
+
+        try:
+            self._publish(job_id, "react_done", {
+                "iterations": outcome.iterations,
+                "finalized": outcome.completed_normally,
+                "new_tools": list(outcome.new_results.keys()),
+            })
+        except Exception:
+            pass
+
 
     # ── Tool availability checks ──────────────────────────────────────────
 
@@ -689,6 +930,41 @@ class Orchestrator:
         session._tree_memory = tree_memory  # type: ignore[attr-defined]
         session._ns_memory = ns_memory  # type: ignore[attr-defined]
         session._root_session_id = root_session.id if root_session else session.id  # type: ignore[attr-defined]
+        # ── Active-context inventory ───────────────────────────────────
+        # Cheap aggregate of the session's uploaded attachments (notes /
+        # URLs / PDFs / paper refs / images). The full text lives in
+        # ``AssistantAttachment.content``; we only need counts + labels
+        # here so the planner and the ReAct decision step can see THAT
+        # context exists and choose to call ``parse_context`` when
+        # relevant. Loading the full bodies is the job of
+        # ``parse_context`` itself when actually called.
+        try:
+            from app.models.assistant import AssistantAttachment as _Att
+            att_rows = await repo._db.execute(
+                select(_Att.kind, _Att.label).where(_Att.session_id == session.id)
+            )
+            att_pairs: list[tuple[str, str]] = list(att_rows.all())
+        except Exception:
+            att_pairs = []
+        kinds_count: dict[str, int] = {}
+        labels: list[str] = []
+        for k, lab in att_pairs:
+            kinds_count[k] = kinds_count.get(k, 0) + 1
+            if lab and len(labels) < 8:
+                labels.append(str(lab)[:80])
+        active_context_inventory = {
+            "total": len(att_pairs),
+            "kinds": kinds_count,
+            "labels": labels,
+        }
+        session._active_context = active_context_inventory  # type: ignore[attr-defined]
+        # Mirror onto the task object — the ReAct loop runs in a downstream
+        # call site that receives ``task`` but not the live ``session``
+        # ORM object, and the attribute is in-memory only (not persisted),
+        # so a fresh ``db.get(session)`` later would yield an empty
+        # inventory. The mirror guarantees the loop sees the same numbers
+        # the synthesizer / planner saw.
+        task._session_active_context = active_context_inventory  # type: ignore[attr-defined]
         return task, session, query, namespace_keys, primary_ns, orientation, expertise
 
     async def _build_rolling_history(
@@ -1292,6 +1568,20 @@ class Orchestrator:
         intent_hint = getattr(task, "_intent_hint_text", "") or ""
         shape_hint = getattr(task, "_shape_hint_text", "") or ""
         skip_reflection = bool(getattr(task, "_skip_reflection", False))
+
+        # Distill the ReAct scratchpad into a compact ``agent_notes``
+        # dict so the synthesizer can honor the agent's own
+        # self-assessment when shaping the answer's tone + uncertainty
+        # language. Empty / missing for non-deep turns — the synth
+        # prompt's ``<agent_notes>`` block is then absent and behaviour
+        # is unchanged from before.
+        agent_notes = _distill_agent_notes(
+            scratchpad=getattr(task, "_scratchpad", None),
+            iterations=int(getattr(task, "_react_iterations", 0)),
+            papers=papers,
+            arxiv_results=arxiv_results,
+        )
+
         answer = await synthesize_answer(
             query=query,
             papers=papers,
@@ -1311,6 +1601,7 @@ class Orchestrator:
             namespace_keys=[task.namespace_key] if task.namespace_key else [],
             user_id=task.user_id,
             skip_reflection=skip_reflection,
+            agent_notes=agent_notes,
             on_delta=_on_delta,
         )
 
@@ -1347,6 +1638,39 @@ class Orchestrator:
         # ``payload.workflow.actions`` and friends preserved for backward
         # compatibility with the existing JobsPanel/UI rendering. ``blocks``
         # is the M2-style structured render contract.
+        # Build the per-turn scratchpad payload + claim-level provenance.
+        # Both are inspectable artefacts: the scratchpad lets the UI render
+        # the agent's reasoning trace, and the provenance map ties each
+        # citation marker in the answer back to the paper it references.
+        scratchpad_payload: dict | None = None
+        try:
+            pad = getattr(task, "_scratchpad", None)
+            if pad is not None:
+                scratchpad_payload = pad.to_dict()
+        except Exception:
+            scratchpad_payload = None
+
+        provenance_map: list[dict] = []
+        try:
+            provenance_map = _extract_provenance(answer, papers)
+            # Also fold the provenance entries onto the scratchpad so a
+            # post-hoc inspector sees the full audit trail in one place.
+            if scratchpad_payload is not None and provenance_map:
+                pad = getattr(task, "_scratchpad", None)
+                if pad is not None:
+                    for entry in provenance_map:
+                        pad.provenance(
+                            claim_span=entry.get("claim_span", ""),
+                            sources=entry.get("sources", []),
+                            marker=entry.get("marker", ""),
+                        )
+                    scratchpad_payload = pad.to_dict()
+        except Exception as exc:
+            log.debug("provenance extraction skipped: %s", exc)
+
+        # ``payload.workflow.actions`` and friends preserved for backward
+        # compatibility with the existing JobsPanel/UI rendering. ``blocks``
+        # is the M2-style structured render contract.
         payload = {
             "status": "completed",
             "workflow": {"actions": plan.actions, "trace": plan.trace},
@@ -1365,6 +1689,18 @@ class Orchestrator:
             "code_results": code_results[:8] if code_results else [],
             "suggestions": [],
             "blocks": blocks,
+            # ReAct / agent inspection surfaces. ``react`` is a compact
+            # header the UI can show alongside the existing "Assistant
+            # task completed" trace strip; ``scratchpad`` is the full
+            # entry log for expandable inspection; ``provenance`` maps
+            # citation markers in the answer to their evidence.
+            "react": {
+                "ran": bool(getattr(task, "_scratchpad", None)),
+                "iterations": int(getattr(task, "_react_iterations", 0)),
+                "completed_normally": bool(getattr(task, "_react_completed_normally", False)),
+            },
+            "scratchpad": scratchpad_payload,
+            "provenance": provenance_map,
         }
 
         async with async_session_factory() as db:
@@ -2144,6 +2480,171 @@ class Orchestrator:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+
+def _distill_agent_notes(
+    *,
+    scratchpad: Any,
+    iterations: int,
+    papers: list[dict],
+    arxiv_results: list[dict],
+) -> dict | None:
+    """Distill a ReAct scratchpad into a compact dict for the synthesizer.
+
+    The synthesizer cannot consume the full scratchpad — it would
+    bloat the prompt with the agent's internal reasoning. What it
+    *does* benefit from is the agent's own meta-judgment:
+
+    * The most recent ``Critique`` entry (verdict + scores + issues).
+    * Iteration count (so the model knows how hard the agent worked).
+    * A boolean ``thin_evidence`` flag derived from the union of the
+      retrieved paper sets — a deterministic safety net so the
+      synthesizer hedges honestly even when the model didn't itself
+      call ``critique``.
+
+    Returns ``None`` (skipping the synth-prompt block entirely) when
+    ReAct didn't run or there's nothing useful to surface — keeps
+    the trivial / single tier prompts unchanged.
+    """
+    if scratchpad is None and iterations <= 0:
+        return None
+
+    notes: dict[str, Any] = {"iterations": int(iterations or 0)}
+
+    # Latest critique, if any.
+    if scratchpad is not None:
+        try:
+            latest_crit = None
+            for e in getattr(scratchpad, "entries", []):
+                if getattr(e, "kind", "") == "critique":
+                    latest_crit = e
+            if latest_crit is not None:
+                notes["critique"] = {
+                    "verdict": getattr(latest_crit, "verdict", None),
+                    "groundedness": float(getattr(latest_crit, "groundedness", 0.0) or 0.0),
+                    "completeness": float(getattr(latest_crit, "completeness", 0.0) or 0.0),
+                    "memory_faithfulness": float(getattr(latest_crit, "memory_faithfulness", 0.0) or 0.0),
+                    "issues": list(getattr(latest_crit, "issues", []) or []),
+                }
+        except Exception:
+            pass
+
+    # Thin-evidence heuristic — independent of model judgment so the
+    # synthesizer always sees it when the evidence base is small.
+    total_evidence = len(papers or []) + len(arxiv_results or [])
+    if iterations > 0 and total_evidence < 2:
+        notes["thin_evidence"] = True
+    # Also surface when the critique explicitly said "revise".
+    crit = notes.get("critique") or {}
+    if crit.get("verdict") == "revise":
+        notes["thin_evidence"] = True
+
+    # Strip empties so the synthesizer prompt's block stays compact.
+    if "critique" not in notes and not notes.get("thin_evidence") and notes.get("iterations", 0) == 0:
+        return None
+    return notes
+
+
+def _extract_provenance(answer: str, papers: list[dict]) -> list[dict]:
+    """Walk the synthesized answer and emit claim → source rows.
+
+    The synthesizer already emits inline ``[N]`` citation markers where
+    ``N`` is the 1-based index into the ``papers`` array. This pass walks
+    the answer text, finds every marker, and pairs it with the sentence
+    that contains it plus the paper(s) it references.
+
+    Why this matters:
+        Without a claim-level map, the only thing we persist is a flat
+        list of paper IDs — there's no way to audit whether the
+        ``[3]`` next to "the model achieves 92% accuracy" really points
+        at the paper that reports that number. Storing the spanning
+        text alongside the marker makes the citation faithfulness
+        question answerable downstream.
+
+    Args:
+        answer: The synthesized answer text. May be empty.
+        papers: The ordered ``papers`` list the synthesizer cited from.
+            Each entry must have at least ``paper_id`` and ``title``.
+
+    Returns:
+        A list of dicts with keys ``claim_span`` (the sentence around
+        the marker), ``marker`` (e.g. ``"[3]"``), and ``sources``
+        (list of paper-id strings the marker resolves to).
+        Returns an empty list when the answer has no citations or the
+        papers array is empty.
+    """
+    if not answer or not papers:
+        return []
+
+    import re as _re
+
+    out: list[dict] = []
+    # ``[N]``, ``[N, M]``, and ``[N-M]`` are all valid citation marker
+    # syntaxes the renderer accepts (see MarkdownRenderer's regex). We
+    # parse the same syntaxes here so the audit trail covers them all.
+    re_marker = _re.compile(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]")
+
+    # Sentence-ish boundaries — we use a relaxed split because the
+    # answer is markdown and contains lists / headings / code. The
+    # spanning text is purely informational so soft boundaries are fine.
+    def _surrounding_sentence(text: str, idx: int) -> str:
+        # Find the start: walk back to the nearest ``. `` / ``\n`` / start.
+        start = idx
+        while start > 0 and text[start - 1] not in {".", "!", "?", "\n"}:
+            start -= 1
+        # Find the end: walk forward to the next sentence terminator.
+        end = idx
+        while end < len(text) and text[end] not in {"\n"}:
+            end += 1
+            if end < len(text) and text[end - 1] in {".", "!", "?"} and (end >= len(text) or text[end] in {" ", "\n"}):
+                break
+        return text[start:end].strip()
+
+    seen: set[tuple[str, str]] = set()
+    for m in re_marker.finditer(answer):
+        raw = m.group(1)
+        # Expand "N-M" and "N, M" forms into the explicit list of N.
+        nums: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    a, b = (int(x) for x in part.split("-", 1))
+                    if 0 < a <= b and b - a < 50:
+                        nums.extend(range(a, b + 1))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    nums.append(int(part))
+                except ValueError:
+                    continue
+        if not nums:
+            continue
+
+        sources: list[str] = []
+        for n in nums:
+            if 1 <= n <= len(papers):
+                pid = papers[n - 1].get("paper_id")
+                if pid:
+                    sources.append(str(pid))
+        if not sources:
+            continue
+
+        claim_span = _surrounding_sentence(answer, m.start())[:400]
+        # Dedup by (claim_span, marker) so a marker referenced twice on
+        # the same sentence doesn't produce two rows.
+        marker = m.group(0)
+        key = (claim_span, marker)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "claim_span": claim_span,
+            "marker": marker,
+            "sources": sources,
+        })
+    return out
 
 
 def _suggest_next_steps(plan: Plan, has_genie: bool, has_graph: bool) -> list[dict]:

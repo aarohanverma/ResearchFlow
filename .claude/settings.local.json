@@ -263,7 +263,14 @@
       "Bash(grep -nE \"except\\\\s*:\\\\s*$|except Exception\\\\s*:\\\\s*$|except.*pass$\" backend/app/assistant/recovery.py backend/app/services/research_assistant.py)",
       "Bash(grep -nE \"except\\\\s*:\\\\s*$|except Exception:\\\\s*$\" backend/app/assistant/recovery.py backend/app/services/research_assistant.py)",
       "Bash(awk -F: '{print $1}')",
-      "Bash(python -m pytest tests/test_hardening_memory.py -x -q)"
+      "Bash(python -m pytest tests/test_hardening_memory.py -x -q)",
+      "Bash(python -m pytest tests/test_react_loop.py -x -q)",
+      "Bash(python -m pytest tests/test_react_gaps.py -x -q)",
+      "Bash(python -m pytest tests/test_react_residual_gaps.py -x -q)",
+      "Bash(python -m pytest tests/test_hardening_active_user.py -x -q)",
+      "Bash(python -m pytest tests/test_hardening_react_session.py -x -q)",
+      "Bash(python -m pytest tests/test_hardening_depth_tier.py -x -q)",
+      "Bash(python -m pytest tests/test_hardening_depth_tier.py -q)"
     ],
     "additionalDirectories": [
       "/tmp"

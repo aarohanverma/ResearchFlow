@@ -1,5 +1,6 @@
 """FastAPI dependency injection — DB sessions, current user, adapters."""
 
+import time
 from typing import Annotated
 from uuid import UUID
 
@@ -11,6 +12,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decode_access_token
 from app.core.tracking import current_user_id as _current_user_id_ctx
 from app.db.session import async_session_factory
+
+
+# ── Activity check cache ─────────────────────────────────────────────────────
+# Tiny in-process TTL cache of ``user_id → is_active`` so we don't issue a
+# DB roundtrip on every authenticated request. Admin de-/re-activations
+# take effect within ``_ACTIVE_CACHE_TTL`` seconds across all workers
+# (instant for the worker that handled the PATCH, since we proactively
+# invalidate that user's slot on writes). The cache is bounded in size
+# by an LRU eviction in ``_check_user_active`` so a hostile login burst
+# can't exhaust memory.
+_ACTIVE_CACHE: dict[UUID, tuple[bool, float]] = {}
+_ACTIVE_CACHE_TTL = 30.0
+_ACTIVE_CACHE_MAX = 5000
+
+
+def invalidate_active_cache(user_id: UUID | None = None) -> None:
+    """Drop a single user's cached is_active state, or wipe the whole cache.
+
+    Called by admin endpoints whenever a user's ``is_active`` bit flips so
+    the very next request from that user (or any worker) sees the new
+    value without waiting for the TTL.
+    """
+    if user_id is None:
+        _ACTIVE_CACHE.clear()
+        return
+    _ACTIVE_CACHE.pop(user_id, None)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -25,11 +52,26 @@ DBSession = Annotated[AsyncSession, Depends(get_db)]
 
 
 async def get_current_user_id(token: Annotated[str, Depends(oauth2_scheme)]) -> UUID:
-    """Decodes JWT and returns the user UUID.  Never leaks internal errors."""
+    """Decodes JWT and returns the user UUID, enforcing ``is_active``.
+
+    Beyond JWT validity, this also verifies the user's row still has
+    ``is_active=True``. An admin who flips a user's active bit off via
+    ``PATCH /admin/users/{id}`` must be able to revoke access without
+    waiting for the JWT to expire — without this check, an already-issued
+    7-day token would let a deactivated user keep working.
+
+    The is_active lookup is cached for ``_ACTIVE_CACHE_TTL`` seconds with
+    proactive invalidation from admin write paths, so the cost is one
+    cheap PK lookup per user per TTL window.
+    """
     credentials_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired credentials",
         headers={"WWW-Authenticate": "Bearer"},
+    )
+    deactivated_exc = HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Account is deactivated. Contact your administrator.",
     )
     try:
         payload = decode_access_token(token)
@@ -37,12 +79,51 @@ async def get_current_user_id(token: Annotated[str, Depends(oauth2_scheme)]) -> 
         if user_id_str is None:
             raise credentials_exc
         uid = UUID(user_id_str)
-        # Stash on the request-local contextvar so token-usage tracking can
-        # attribute every LLM call made during this request to this user.
-        _current_user_id_ctx.set(uid)
-        return uid
     except (JWTError, ValueError):
         raise credentials_exc
+
+    if not await _check_user_active(uid):
+        raise deactivated_exc
+
+    # Stash on the request-local contextvar so token-usage tracking can
+    # attribute every LLM call made during this request to this user.
+    _current_user_id_ctx.set(uid)
+    return uid
+
+
+async def _check_user_active(user_id: UUID) -> bool:
+    """Return True iff the user exists and has ``is_active=True``.
+
+    Cached for ``_ACTIVE_CACHE_TTL`` seconds. A missing user row is
+    treated as deactivated so a JWT issued before account deletion
+    can't outlive the row. Failures opening a DB session fail-open
+    (return True) so a transient DB outage doesn't lock everyone out.
+    """
+    now = time.monotonic()
+    cached = _ACTIVE_CACHE.get(user_id)
+    if cached and (now - cached[1]) < _ACTIVE_CACHE_TTL:
+        return cached[0]
+
+    try:
+        from app.models.user import User as UserModel
+        async with async_session_factory() as db:
+            row = await db.get(UserModel, user_id)
+            is_active = bool(row is not None and getattr(row, "is_active", True))
+    except Exception:
+        # Fail-open on transient DB error — a permanent outage will
+        # surface elsewhere; we won't 403 every authenticated user
+        # because the pool blipped.
+        return True
+
+    # Bounded cache — drop the oldest entry when we'd exceed the cap.
+    if len(_ACTIVE_CACHE) >= _ACTIVE_CACHE_MAX:
+        try:
+            oldest = min(_ACTIVE_CACHE.items(), key=lambda kv: kv[1][1])[0]
+            _ACTIVE_CACHE.pop(oldest, None)
+        except ValueError:
+            pass
+    _ACTIVE_CACHE[user_id] = (is_active, now)
+    return is_active
 
 
 CurrentUserID = Annotated[UUID, Depends(get_current_user_id)]

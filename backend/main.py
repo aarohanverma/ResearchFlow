@@ -51,15 +51,42 @@ def _seed_accounts_from_env() -> list[tuple[str, str, str, bool]]:
 
 
 async def _ensure_seed_user() -> None:
-    """Idempotently create the guest / admin / normal seed users on startup.
+    """Idempotently materialise the guest / admin / normal seed accounts.
 
-    All three seed accounts share the same namespace subscriptions and
-    SourceMapping rows so they behave identically out of the box. The only
-    difference is ``is_admin`` on the admin account — and even that only
-    unlocks the admin panel; every other route behaves the same for all
-    three so the dev can switch logins without behavior surprises.
+    Runs on every boot (local *and* cloud — gated only on whether the
+    operator configured ``SEED_*_PASSWORD`` env vars, blank-password
+    means "skip this slot"). Designed to be a deterministic
+    *self-heal* against partial state from prior boots: a previous
+    crash that left only the guest, or a schema bug that rolled back
+    half the inserts, gets repaired here.
+
+    Three properties this routine guarantees post-commit, given the
+    env is configured for all three slots:
+
+    1. ``admin@…`` exists with ``is_admin = True``.
+    2. ``test@…`` (guest) exists with ``is_admin = False``.
+    3. ``user@…`` (normal) exists with ``is_admin = False``.
+
+    Each seed account is created in its **own transaction** so a row
+    failure for one account (e.g. an out-of-date provider_settings
+    schema bringing one INSERT down) doesn't roll back the others —
+    that exact bug is how an earlier install ended up with the guest
+    promoted to admin and no separate admin account at all.
+
+    A final *invariant pass* runs after all seed accounts have been
+    upserted: it demotes every user whose email is NOT
+    ``SEED_ADMIN_EMAIL``, and promotes ``SEED_ADMIN_EMAIL`` if it's
+    present in the DB. This guarantees the admin invariant even when
+    the legacy lockout-bootstrap promoted the wrong user on an
+    earlier boot.
+
+    Failure mode:
+        Any single seed slot that crashes is logged and skipped; the
+        remaining slots are still processed. The invariant pass is
+        wrapped in its own try/except so it never blocks startup.
     """
     from sqlalchemy import select as _select
+    from sqlalchemy import update as _update
     from app.db.session import async_session_factory
     from app.core.security import hash_password
     from app.models.user import User, UserProviderSettings, UserInterestProfile, ExpertiseLevel, Orientation
@@ -76,58 +103,120 @@ async def _ensure_seed_user() -> None:
         log.info("seed accounts: none configured (set SEED_*_PASSWORD env vars to enable)")
         return
 
-    async with async_session_factory() as db:
-        for email, password, display_name, is_admin in seed_accounts:
-            row = await db.execute(_select(User).where(User.email == email))
-            user = row.scalar_one_or_none()
+    # ── Per-account upsert. Each slot opens its own session/transaction
+    # so a row-level failure (schema drift, FK conflict, etc.) cannot
+    # bring down the rest of the seed batch.
+    for email, password, display_name, is_admin in seed_accounts:
+        try:
+            async with async_session_factory() as db:
+                row = await db.execute(_select(User).where(User.email == email))
+                user = row.scalar_one_or_none()
 
-            if not user:
-                user = User(
-                    email=email,
-                    hashed_password=hash_password(password),
-                    display_name=display_name,
-                    expertise_level=ExpertiseLevel.practitioner,
-                    orientation=Orientation.both,
-                    onboarding_complete=True,
-                    is_admin=is_admin,
-                )
-                db.add(user)
-                await db.flush()
-                db.add(UserProviderSettings(user_id=user.id))
-                db.add(UserInterestProfile(user_id=user.id))
-                log.info("seed user created: %s (admin=%s)", email, is_admin)
-            else:
-                # Keep the admin bit aligned on subsequent boots so an
-                # accidental demote in the DB gets repaired automatically
-                # for the seeded admin account.
-                if user.is_admin != is_admin:
-                    user.is_admin = is_admin
-                    log.info("seed user admin bit synced: %s → %s", email, is_admin)
-
-            for ns_key, source_name, arxiv_cat in _DEFAULT_NS:
-                sub = await db.execute(
-                    _select(NamespaceSubscription).where(
-                        NamespaceSubscription.user_id == user.id,
-                        NamespaceSubscription.namespace_key == ns_key,
+                if not user:
+                    user = User(
+                        email=email,
+                        hashed_password=hash_password(password),
+                        display_name=display_name,
+                        expertise_level=ExpertiseLevel.practitioner,
+                        orientation=Orientation.both,
+                        onboarding_complete=True,
+                        is_admin=is_admin,
                     )
-                )
-                if not sub.scalar_one_or_none():
-                    db.add(NamespaceSubscription(user_id=user.id, namespace_key=ns_key))
-
-                mapping = await db.execute(
-                    _select(SourceMapping).where(
-                        SourceMapping.namespace_key == ns_key,
-                        SourceMapping.source_name == source_name,
+                    db.add(user)
+                    await db.flush()
+                    db.add(UserProviderSettings(user_id=user.id))
+                    db.add(UserInterestProfile(user_id=user.id))
+                    log.info("seed user created: %s (admin=%s)", email, is_admin)
+                else:
+                    # Sync the admin bit so a previously-misplaced admin
+                    # flag is repaired automatically without intervention.
+                    if user.is_admin != is_admin:
+                        log.info("seed user admin bit corrected: %s %s → %s",
+                                 email, user.is_admin, is_admin)
+                        user.is_admin = is_admin
+                    # Re-add provider_settings / interest_profile if a
+                    # prior partial-rollback left them missing — both
+                    # are required by downstream code paths.
+                    ps_row = await db.execute(
+                        _select(UserProviderSettings).where(UserProviderSettings.user_id == user.id)
                     )
-                )
-                if not mapping.scalar_one_or_none():
-                    db.add(SourceMapping(
-                        namespace_key=ns_key,
-                        source_name=source_name,
-                        external_category_key=arxiv_cat,
-                    ))
+                    if ps_row.scalar_one_or_none() is None:
+                        db.add(UserProviderSettings(user_id=user.id))
+                        log.info("seed user provider_settings repaired: %s", email)
+                    ip_row = await db.execute(
+                        _select(UserInterestProfile).where(UserInterestProfile.user_id == user.id)
+                    )
+                    if ip_row.scalar_one_or_none() is None:
+                        db.add(UserInterestProfile(user_id=user.id))
+                        log.info("seed user interest_profile repaired: %s", email)
 
-        await db.commit()
+                for ns_key, source_name, arxiv_cat in _DEFAULT_NS:
+                    sub = await db.execute(
+                        _select(NamespaceSubscription).where(
+                            NamespaceSubscription.user_id == user.id,
+                            NamespaceSubscription.namespace_key == ns_key,
+                        )
+                    )
+                    if not sub.scalar_one_or_none():
+                        db.add(NamespaceSubscription(user_id=user.id, namespace_key=ns_key))
+
+                    mapping = await db.execute(
+                        _select(SourceMapping).where(
+                            SourceMapping.namespace_key == ns_key,
+                            SourceMapping.source_name == source_name,
+                        )
+                    )
+                    if not mapping.scalar_one_or_none():
+                        db.add(SourceMapping(
+                            namespace_key=ns_key,
+                            source_name=source_name,
+                            external_category_key=arxiv_cat,
+                        ))
+
+                await db.commit()
+        except Exception as exc:
+            log.warning("seed user upsert failed for %s: %s", email, exc)
+            # Fall through to the next slot — other seeds should still
+            # be created so we don't leave the install in a half-state.
+
+    # ── Invariant pass: enforce admin precedence. Runs in its own
+    # transaction; idempotent; protects against an earlier
+    # lockout-bootstrap promotion that left guest/user as admin.
+    admin_email = (settings.seed_admin_email or "").strip().lower()
+    if not admin_email:
+        return
+    try:
+        async with async_session_factory() as db:
+            # 1) Demote any user with is_admin=True whose email is not
+            #    the canonical admin email. This nukes accidental
+            #    promotions across the board, not just for the seeded
+            #    guest/user — operators who hand-promoted themselves
+            #    via SQL should set SEED_ADMIN_EMAIL accordingly or
+            #    flip is_admin AFTER startup via the admin panel.
+            result = await db.execute(
+                _update(User).where(
+                    User.is_admin.is_(True),
+                    User.email != admin_email,
+                ).values(is_admin=False).returning(User.email)
+            )
+            demoted = [r[0] for r in result.fetchall()]
+            if demoted:
+                log.info("admin invariant: demoted non-canonical admin(s): %s", demoted)
+
+            # 2) Promote the canonical admin if it exists and isn't admin.
+            result = await db.execute(
+                _update(User).where(
+                    User.email == admin_email,
+                    User.is_admin.is_(False),
+                ).values(is_admin=True).returning(User.email)
+            )
+            promoted = [r[0] for r in result.fetchall()]
+            if promoted:
+                log.info("admin invariant: promoted canonical admin: %s", promoted)
+
+            await db.commit()
+    except Exception as exc:
+        log.warning("admin invariant pass skipped: %s", exc)
 
 
 @asynccontextmanager
@@ -341,6 +430,14 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             await conn.execute(_text(
                 "CREATE INDEX IF NOT EXISTS idx_users_tier_slug ON users (tier_slug)"
             ))
+            # ``UserProviderSettings.encrypted_wolfram_key`` was added to
+            # the model after the table was first created in older installs.
+            # An INSERT from /admin/users → create_user fails with
+            # ``UndefinedColumnError`` until we backfill the column.
+            # Idempotent — re-running on already-migrated installs is a no-op.
+            await conn.execute(_text(
+                "ALTER TABLE user_provider_settings ADD COLUMN IF NOT EXISTS encrypted_wolfram_key TEXT"
+            ))
             # Admin precedence: the seeded admin account (configured via
             # SEED_ADMIN_EMAIL) is the canonical admin. Any user that was
             # previously promoted via the legacy earliest-user bootstrap
@@ -481,12 +578,15 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("paper_namespace_hides table creation skipped: %s", exc)
 
-    # Ensure the guest/test user always exists in local dev — idempotent
-    if settings.environment == "local":
-        try:
-            await _ensure_seed_user()
-        except Exception as exc:
-            log.warning("seed user creation skipped: %s", exc)
+    # Materialise the configured seed accounts (guest / admin / normal).
+    # Runs on every boot, local and cloud — gated only on whether the
+    # operator set ``SEED_*_PASSWORD`` env vars (blank password = skip
+    # that slot, which is the right production default for unused
+    # demo accounts). Idempotent and self-healing — see the docstring.
+    try:
+        await _ensure_seed_user()
+    except Exception as exc:
+        log.warning("seed user creation skipped: %s", exc)
 
     # Initialise the LangGraph PostgreSQL checkpoint store so the tables
     # exist before any workflow runs. The checkpointer is a module-level

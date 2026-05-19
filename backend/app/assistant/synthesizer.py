@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -118,6 +119,152 @@ def _self_check_answer(answer: str, *, papers: list[dict], arxiv_results: list[d
     return deterministic_self_check(answer, papers=papers, arxiv_results=arxiv_results)
 
 
+def _render_agent_notes(agent_notes: dict | None) -> str:
+    """Render scratchpad-derived notes as an ``<agent_notes>`` XML block.
+
+    The orchestrator extracts a small dict from the ReAct scratchpad and
+    passes it here. Fields we care about today:
+
+    * ``critique`` — the latest mid-turn critique entry, if any. Tells
+      the synthesizer whether the agent itself judged the evidence
+      sufficient, and which specific gaps it identified.
+    * ``iterations`` — how many ReAct rounds ran. ``0`` means the
+      initial plan was deemed sufficient; higher counts mean the
+      agent worked harder to fill gaps.
+    * ``thin_evidence`` — boolean derived from
+      ``len(papers) + len(arxiv_results) < 2`` AND ``iterations > 0``.
+      A blunt signal that the agent tried and the evidence base is
+      still weak; primary trigger for honest-uncertainty language
+      in the answer.
+
+    Returns the empty string when there is nothing useful to say, so
+    the synthesizer's prompt stays compact on the fast path. The
+    synthesizer-prompt instructions in :func:`_build_prompt` already
+    tell the model how to interpret this block.
+    """
+    if not agent_notes:
+        return ""
+    parts: list[str] = []
+    critique = (agent_notes or {}).get("critique") or {}
+    iters = int((agent_notes or {}).get("iterations") or 0)
+    thin = bool((agent_notes or {}).get("thin_evidence"))
+
+    if iters > 0:
+        parts.append(f"- The agent ran {iters} adaptive iteration(s) after the initial plan.")
+    if critique:
+        v = critique.get("verdict")
+        g = critique.get("groundedness")
+        c = critique.get("completeness")
+        issues = critique.get("issues") or []
+        if v or g is not None or c is not None:
+            scores = []
+            if g is not None:
+                scores.append(f"groundedness={g:.2f}")
+            if c is not None:
+                scores.append(f"completeness={c:.2f}")
+            head = f"- The agent self-critiqued the evidence ({', '.join(scores) or 'no scores'})."
+            if v:
+                head += f" Verdict: {v}."
+            parts.append(head)
+        if issues:
+            parts.append("- Gaps the agent identified:")
+            for issue in issues[:4]:
+                parts.append(f"    • {str(issue)[:240]}")
+    if thin:
+        parts.append(
+            "- Evidence base is THIN. Be honest about uncertainty — say what is and "
+            "isn't supported, and recommend follow-up retrieval rather than over-claim."
+        )
+    if not parts:
+        return ""
+    return "<agent_notes>\n" + "\n".join(parts) + "\n</agent_notes>"
+
+
+def _strip_unresolvable_citations(
+    answer: str,
+    papers: list[dict],
+    arxiv_results: list[dict],
+) -> str:
+    """Remove ``[N]`` / ``[A N]`` markers whose index doesn't resolve.
+
+    Deterministic safety net that runs after every other repair pass.
+    The model is told to cite within the available context; the
+    repair LLM is asked to fix bad citations; but neither is
+    guaranteed. This pass enforces the invariant: ``[N]`` only
+    survives in the answer when ``N`` is a real index into
+    ``papers``, and ``[A N]`` only when ``N`` is a real index into
+    ``arxiv_results``.
+
+    Compound forms are simplified, not nuked:
+
+        Input answer  : "The model achieves SOTA [2-5]. Earlier
+                         work used a simpler baseline [6]."
+        Available    : 3 papers
+        Output answer: "The model achieves SOTA [2,3]. Earlier
+                        work used a simpler baseline."
+
+    A marker that contains *no* resolvable indices is dropped along
+    with any trailing whitespace and orphan punctuation so the
+    sentence reads cleanly.
+    """
+    if not answer:
+        return answer
+
+    n_papers = len(papers or [])
+    n_arxiv = len(arxiv_results or [])
+
+    def _filter_indices(raw: str, ceiling: int) -> list[int]:
+        out: list[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    a, b = (int(x) for x in part.split("-", 1))
+                except ValueError:
+                    continue
+                if a <= b and 0 < a and b - a < 50:
+                    out.extend(i for i in range(a, b + 1) if 1 <= i <= ceiling)
+            else:
+                try:
+                    n = int(part)
+                except ValueError:
+                    continue
+                if 1 <= n <= ceiling:
+                    out.append(n)
+        # Preserve order, drop dups
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for n in out:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        return ordered
+
+    def _replace_paper(m: re.Match) -> str:
+        idxs = _filter_indices(m.group(1), n_papers)
+        if not idxs:
+            return ""  # drop the whole marker
+        return "[" + ",".join(str(i) for i in idxs) + "]"
+
+    def _replace_arxiv(m: re.Match) -> str:
+        idxs = _filter_indices(m.group(1), n_arxiv)
+        if not idxs:
+            return ""
+        return "[A" + ",".join(str(i) for i in idxs) + "]"
+
+    # Paper markers first — ``[A N]`` is more specific so we run it before
+    # the broad ``[N]`` pattern.
+    cleaned = re.sub(r"\[A\s*(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_arxiv, answer)
+    cleaned = re.sub(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_paper, cleaned)
+    # Tidy: orphan punctuation left behind when we dropped a marker
+    # (``"...baseline ." → "...baseline."``, ``"...sentence  ;" → "...sentence;"``).
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
 async def synthesize_answer(
     *,
     query: str,
@@ -138,6 +285,7 @@ async def synthesize_answer(
     namespace_keys: list[str] | None = None,
     user_id: Any | None = None,
     skip_reflection: bool = False,
+    agent_notes: dict | None = None,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Return a grounded research-workspace answer or a deterministic fallback."""
@@ -175,6 +323,15 @@ async def synthesize_answer(
         extra_context = (intent_hint + "\n\n" + extra_context).strip() if extra_context else intent_hint
     if shape_hint:
         extra_context = (shape_hint + "\n\n" + extra_context).strip() if extra_context else shape_hint
+    # ── Agent notes from the ReAct loop ──────────────────────────────
+    # When the mid-turn ReAct loop ran a self-critique or noticed thin
+    # evidence, surface those findings to the synthesizer so the
+    # answer's tone reflects the agent's own assessment instead of
+    # confabulating confidence. Block is intentionally short — the
+    # synthesizer needs a hint, not a transcript.
+    notes_block = _render_agent_notes(agent_notes)
+    if notes_block:
+        extra_context = (notes_block + "\n\n" + extra_context).strip() if extra_context else notes_block
     fallback = _fallback_answer(query, papers, imported_count, graph_result, genie_session_id)
 
     grounded = bool(papers)
@@ -393,6 +550,20 @@ async def synthesize_answer(
                         answer = repaired
             except Exception as exc:
                 log.warning("synthesizer repair pass failed: %s", exc)
+
+        # ── Citation safety net ──────────────────────────────────────
+        # Deterministic final pass. Even when the repair LLM is asked
+        # to fix out-of-range citations, it sometimes leaves them in —
+        # the model judges the issue resolved when the prose changed
+        # but the marker survived. We strip any ``[N]`` marker that
+        # cannot resolve to a paper in the synthesizer's context.
+        # Resolvable markers are preserved verbatim, including
+        # compound forms (``[2,3]``, ``[2-4]``) where only some inner
+        # indices were out of range (we keep the in-range ones).
+        try:
+            answer = _strip_unresolvable_citations(answer, papers, arxiv_results)
+        except Exception as exc:  # noqa: BLE001 — safety net must never raise
+            log.debug("citation strip pass skipped: %s", exc)
 
         return answer
     except Exception as exc:
@@ -950,6 +1121,7 @@ def _build_prompt(
         "• Synthesize ALL available evidence (papers, computations, attachments, web) into one coherent answer.\n"
         "• Cite inline: [1] for indexed papers, [A1] for arXiv candidates, [WA] for Wolfram Alpha, [W] for web sources.\n"
         "• Distinguish fact from hypothesis; acknowledge evidence gaps honestly.\n"
+        "• If an <agent_notes> block is present, treat it as the agent's own self-assessment of the evidence it gathered. When it flags thin evidence, low groundedness, or unresolved gaps, REFLECT that honestly in the answer — caveat claims, name what's missing, and suggest a follow-up rather than over-claiming. The block is metadata; do NOT quote it or reproduce its prose.\n"
         "• Adapt voice and depth to the user's expertise level.\n"
         "• Close with one concrete, stage-appropriate next step (unless the question is fully resolved).\n"
         "• NEVER produce a rigid Takeaway / Evidence / Gaps / Next-moves skeleton. Choose the shape that fits.\n"

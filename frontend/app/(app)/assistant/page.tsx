@@ -294,6 +294,18 @@ export default function AssistantPage() {
     rationale?: string;
     plannedSteps?: { tool: string; title: string }[];
     actions?: string[];
+    react?: {
+      // Live indicator state for the depth-driven ReAct loop. Populated
+      // from ``react_started`` / ``react_thought`` / ``react_action`` /
+      // ``react_observation`` / ``react_done`` server-sent events.
+      active: boolean;
+      iteration?: number;
+      lastThought?: string;
+      lastAction?: { tool: string; rationale?: string };
+      lastObservation?: { tool: string; summary?: string };
+      iterations?: number;
+      finalized?: boolean;
+    };
   }>>({});
   const [streamingContent, setStreamingContent] = useState<Record<string, string>>({});
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -567,6 +579,81 @@ export default function AssistantPage() {
           if (kind === "step_completed" || kind === "step_started" ||
               kind === "step_progress" || kind === "task_completed") {
             if (activeId) loadSession(activeId);
+          }
+          // ── ReAct indicator events ──────────────────────────────
+          // The orchestrator only fires these for depth-tier 'deep'
+          // turns. We patch the per-job liveJobData.react slot so the
+          // ReasoningStrip can render a "Reasoning more deeply"
+          // indicator with the latest thought / action / observation.
+          if (kind === "react_started") {
+            setLiveJobData(prev => ({
+              ...prev,
+              [jobId]: { ...(prev[jobId] || {}), react: { active: true } },
+            }));
+          } else if (kind === "react_thought") {
+            try {
+              const d = JSON.parse(dataPayload);
+              setLiveJobData(prev => ({
+                ...prev,
+                [jobId]: {
+                  ...(prev[jobId] || {}),
+                  react: {
+                    ...(prev[jobId]?.react || { active: true }),
+                    active: true,
+                    iteration: d.iteration,
+                    lastThought: d.text,
+                  },
+                },
+              }));
+            } catch { /* ignore */ }
+          } else if (kind === "react_action") {
+            try {
+              const d = JSON.parse(dataPayload);
+              setLiveJobData(prev => ({
+                ...prev,
+                [jobId]: {
+                  ...(prev[jobId] || {}),
+                  react: {
+                    ...(prev[jobId]?.react || { active: true }),
+                    active: true,
+                    iteration: d.iteration,
+                    lastAction: { tool: d.tool, rationale: d.rationale },
+                  },
+                },
+              }));
+            } catch { /* ignore */ }
+          } else if (kind === "react_observation") {
+            try {
+              const d = JSON.parse(dataPayload);
+              setLiveJobData(prev => ({
+                ...prev,
+                [jobId]: {
+                  ...(prev[jobId] || {}),
+                  react: {
+                    ...(prev[jobId]?.react || { active: true }),
+                    active: true,
+                    iteration: d.iteration,
+                    lastObservation: { tool: d.tool, summary: d.summary },
+                  },
+                },
+              }));
+            } catch { /* ignore */ }
+          } else if (kind === "react_done") {
+            try {
+              const d = JSON.parse(dataPayload);
+              setLiveJobData(prev => ({
+                ...prev,
+                [jobId]: {
+                  ...(prev[jobId] || {}),
+                  react: {
+                    ...(prev[jobId]?.react || { active: false }),
+                    active: false,
+                    iterations: d.iterations,
+                    finalized: d.finalized,
+                  },
+                },
+              }));
+            } catch { /* ignore */ }
           }
           if (kind === "task_completed" || kind === "task_failed" || kind === "task_cancelled") {
             ctrl.abort();
@@ -2655,7 +2742,20 @@ function ReasoningStrip({
   task: AssistantTask;
   steps: AssistantStep[];
   onCancel: () => void;
-  liveData?: { rationale?: string; plannedSteps?: { tool: string; title: string }[]; actions?: string[] };
+  liveData?: {
+    rationale?: string;
+    plannedSteps?: { tool: string; title: string }[];
+    actions?: string[];
+    react?: {
+      active: boolean;
+      iteration?: number;
+      lastThought?: string;
+      lastAction?: { tool: string; rationale?: string };
+      lastObservation?: { tool: string; summary?: string };
+      iterations?: number;
+      finalized?: boolean;
+    };
+  };
   messagePayload?: Record<string, unknown>;
 }) {
   const isInflight = task.status === "running" || task.status === "pending";
@@ -2664,6 +2764,13 @@ function ReasoningStrip({
   // conversation. Users can still expand them manually.
   const [open, setOpen] = useState(isInflight);
   const orderedSteps = [...steps].sort((a, b) => a.step_index - b.step_index);
+
+  // Persisted ReAct artefacts on the message payload — populated after
+  // the loop finishes. The live ``liveData.react`` block reflects
+  // in-flight state; this reflects the audited final state.
+  const persistedReact = ((messagePayload as { react?: { ran?: boolean; iterations?: number; completed_normally?: boolean } } | undefined)?.react) || undefined;
+  const reactActive = !!liveData?.react?.active;
+  const reactRan = !!persistedReact?.ran;
 
   return (
     <div style={{
@@ -2684,6 +2791,35 @@ function ReasoningStrip({
             {task.progress.summary || task.status}
             {task.progress.percent != null && ` · ${task.progress.percent}%`}
           </span>
+          {/* ReAct indicator — shown only on deep-tier turns where the
+              orchestrator engaged the THOUGHT/ACTION/OBSERVATION loop.
+              Live version pulses while the loop is running; once the
+              loop is done, a static badge records that it ran. */}
+          {reactActive && (
+            <span style={{
+              display: "inline-flex", alignItems: "center", gap: 4,
+              fontSize: "9.5px", padding: "1px 7px", borderRadius: 999,
+              background: "rgba(139,92,246,0.12)", color: "#a78bfa",
+              border: "1px solid rgba(139,92,246,0.35)", fontWeight: 700,
+              letterSpacing: "0.03em",
+            }} title="ReAct loop is running — agent is reasoning, acting and observing">
+              <span style={{
+                width: 5, height: 5, borderRadius: "50%",
+                background: "#a78bfa", animation: "rfThinkPulse 1.4s ease-in-out infinite",
+              }} />
+              ReAct
+              {typeof liveData?.react?.iteration === "number" && ` · #${liveData!.react!.iteration}`}
+            </span>
+          )}
+          {!reactActive && reactRan && (
+            <span style={{
+              fontSize: "9.5px", padding: "1px 6px", borderRadius: 999,
+              background: "rgba(139,92,246,0.06)", color: "#a78bfa",
+              border: "1px solid rgba(139,92,246,0.25)", fontWeight: 600,
+            }} title={`ReAct loop ran ${persistedReact?.iterations ?? 0} iteration(s)`}>
+              ReAct · {persistedReact?.iterations ?? 0}
+            </span>
+          )}
         </button>
         {isInflight && (
           <button
@@ -2707,6 +2843,29 @@ function ReasoningStrip({
               borderLeft: "2px solid var(--rf-border)", marginBottom: 2,
             }}>
               {liveData.rationale}
+            </div>
+          )}
+          {/* Live ReAct thought / action / observation — shown only while
+              the loop is active so the user can SEE what the agent is
+              reasoning about, not just that it's "working". */}
+          {liveData?.react?.active && (liveData.react.lastThought
+            || liveData.react.lastAction
+            || liveData.react.lastObservation) && (
+            <div style={{
+              fontSize: "10px", color: "#c4b5fd", padding: "4px 8px",
+              borderRadius: 4, borderLeft: "2px solid #8b5cf6",
+              background: "rgba(139,92,246,0.06)", marginBottom: 2,
+              display: "flex", flexDirection: "column", gap: 2,
+            }}>
+              {liveData.react.lastThought && (
+                <div><span style={{ fontWeight: 700, color: "#a78bfa" }}>THOUGHT</span>: {liveData.react.lastThought.slice(0, 280)}</div>
+              )}
+              {liveData.react.lastAction && (
+                <div><span style={{ fontWeight: 700, color: "#a78bfa" }}>ACTION</span>: {liveData.react.lastAction.tool}{liveData.react.lastAction.rationale ? ` — ${liveData.react.lastAction.rationale.slice(0, 200)}` : ""}</div>
+              )}
+              {liveData.react.lastObservation && (
+                <div><span style={{ fontWeight: 700, color: "#a78bfa" }}>OBSERVATION</span> ({liveData.react.lastObservation.tool}): {(liveData.react.lastObservation.summary || "").slice(0, 240)}</div>
+              )}
             </div>
           )}
           {/* DB steps (ground truth — available once steps start writing to DB) */}
@@ -2788,6 +2947,56 @@ function ReasoningStrip({
               ));
             })()
           }
+          {/* Persisted ReAct scratchpad — rendered for completed turns
+              where the loop actually ran. Lets the user audit the
+              agent's reasoning, including thoughts that were too short
+              for a separate step row but still informed the answer. */}
+          {(() => {
+            const padRaw = (messagePayload as { scratchpad?: { entries?: unknown[] } } | undefined)?.scratchpad;
+            const entries = Array.isArray(padRaw?.entries) ? padRaw!.entries! : [];
+            if (!entries.length) return null;
+            type Entry = { kind?: string; iteration?: number; text?: string; tool?: string; rationale?: string; summary?: string; error?: string | null; verdict?: string; issues?: string[]; claim_span?: string; sources?: string[]; marker?: string };
+            return (
+              <div style={{
+                marginTop: 6, paddingTop: 6, borderTop: "1px dashed var(--rf-border)",
+                display: "flex", flexDirection: "column", gap: 2,
+              }}>
+                <div style={{
+                  fontSize: "9.5px", fontWeight: 700, color: "#a78bfa",
+                  letterSpacing: "0.05em", marginBottom: 2,
+                }}>AGENT SCRATCHPAD (REACT)</div>
+                {(entries as Entry[]).map((e, i) => {
+                  const iter = typeof e.iteration === "number" ? `#${e.iteration}` : "";
+                  if (e.kind === "thought") return (
+                    <div key={i} style={{ fontSize: "10px", color: "var(--rf-text3)" }}>
+                      <span style={{ color: "#a78bfa", fontWeight: 700 }}>{iter} THOUGHT</span>: <span style={{ fontStyle: "italic" }}>{(e.text || "").slice(0, 360)}</span>
+                    </div>
+                  );
+                  if (e.kind === "action") return (
+                    <div key={i} style={{ fontSize: "10px", color: "var(--rf-text3)" }}>
+                      <span style={{ color: "#a78bfa", fontWeight: 700 }}>{iter} ACTION</span>: <span style={{ fontWeight: 600 }}>{e.tool}</span>{e.rationale ? ` — ${e.rationale.slice(0, 200)}` : ""}
+                    </div>
+                  );
+                  if (e.kind === "observation") return (
+                    <div key={i} style={{ fontSize: "10px", color: "var(--rf-text3)" }}>
+                      <span style={{ color: "#a78bfa", fontWeight: 700 }}>{iter} OBSERVATION</span>{e.tool ? ` (${e.tool})` : ""}: {(e.summary || "").slice(0, 280)}{e.error ? ` [error: ${(e.error || "").slice(0, 100)}]` : ""}
+                    </div>
+                  );
+                  if (e.kind === "critique") return (
+                    <div key={i} style={{ fontSize: "10px", color: "var(--rf-text3)" }}>
+                      <span style={{ color: "#a78bfa", fontWeight: 700 }}>{iter} CRITIQUE</span>: verdict={e.verdict}{e.issues?.length ? ` · ${e.issues.slice(0, 3).join("; ").slice(0, 200)}` : ""}
+                    </div>
+                  );
+                  if (e.kind === "provenance") return (
+                    <div key={i} style={{ fontSize: "10px", color: "var(--rf-text4)" }}>
+                      <span style={{ color: "#a78bfa", fontWeight: 700 }}>PROVENANCE</span> {e.marker}: {(e.claim_span || "").slice(0, 180)} → {(e.sources || []).slice(0, 4).join(", ")}
+                    </div>
+                  );
+                  return null;
+                })}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>

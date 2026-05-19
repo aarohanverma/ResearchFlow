@@ -68,6 +68,11 @@ async def login(body: LoginRequest, db: DBSession):
     Uses a uniform error message and a dummy bcrypt verify on the
     user-not-found branch so timing differences do not leak whether an
     email is registered.
+
+    Rejects deactivated accounts with a distinct 403 *after* the
+    password verifies, so deactivation is a real revocation rather
+    than cosmetic. The distinct error code lets the UI tell the user
+    they're deactivated instead of suggesting "wrong password".
     """
     repo = UserRepository(db)
     user = await repo.get_by_email(body.email)
@@ -76,6 +81,11 @@ async def login(body: LoginRequest, db: DBSession):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(body.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(
+            status_code=403,
+            detail="Account is deactivated. Contact your administrator.",
+        )
     return _token_response(str(user.id))
 
 
