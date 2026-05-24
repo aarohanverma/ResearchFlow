@@ -75,7 +75,28 @@ async function request<T>(
       throw new Error("Session expired. Please log in again.");
     }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    // FastAPI / pydantic 422s return ``{ detail: [{loc, msg, type}, ...] }``
+    // rather than a string. Stringifying the array gave us
+    // ``[object Object]`` in the UI; render it as a human-readable
+    // ``field: message`` list instead so the user sees the real cause.
+    let msg: string;
+    const d = (err as { detail?: unknown }).detail;
+    if (typeof d === "string") {
+      msg = d;
+    } else if (Array.isArray(d)) {
+      msg = d
+        .map((e: { loc?: unknown[]; msg?: string; type?: string }) => {
+          const loc = Array.isArray(e?.loc) ? e.loc.slice(1).join(".") : "";
+          return loc ? `${loc}: ${e?.msg || ""}` : (e?.msg || JSON.stringify(e));
+        })
+        .filter(Boolean)
+        .join("; ");
+    } else if (d && typeof d === "object") {
+      msg = JSON.stringify(d);
+    } else {
+      msg = `HTTP ${res.status}`;
+    }
+    throw new Error(msg || `HTTP ${res.status}`);
   }
 
   if (res.status === 204) return undefined as T;

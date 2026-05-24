@@ -607,6 +607,21 @@ class LLMPlanner:
                 "selection only when it clearly applies):\n"
                 + intent_hint + "\n"
             )
+        # Adaptive strategy hint — query-shape classification surfaced
+        # so the planner picks the right tool order, retrieval depth,
+        # and rerank intensity per-query instead of running the same
+        # pipeline regardless of intent. The block is advisory; the
+        # planner can deviate when conversation context argues for it.
+        try:
+            from app.assistant.query_strategy import classify_query
+            strategy = classify_query(query, history=history or [])
+            strategy_blob = (
+                "\nQuery-shape strategy hint (advisory — adjust the plan to "
+                "match the shape unless the conversation context overrides it):\n"
+                + "  " + strategy.render_for_prompt() + "\n"
+            )
+        except Exception:
+            strategy_blob = ""
         return (
             f"User request: {query}\n"
             f"Query complexity: {complexity} — {depth_hint}\n"
@@ -615,6 +630,7 @@ class LLMPlanner:
             f"User profile (soft bias): expertise={expertise}, orientation={orientation}\n"
             f"{pack_blob}"
             f"{intent_blob}"
+            f"{strategy_blob}"
             f"{brief_blob}"
             f"{memory_blob}"
             f"\nConversation history (most recent last):\n{history_blob or '(no prior turns)'}\n"

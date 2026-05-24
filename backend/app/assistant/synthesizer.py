@@ -202,9 +202,166 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
             "imply you investigated angles you couldn't actually retrieve. "
             "Label speculative parts of the answer as speculative."
         )
+    # Retrieval observability — surface aggregate quality so the answer
+    # can honestly caveat thin / rerank-rescued retrievals instead of
+    # presenting them with full confidence.
+    retrieval = (agent_notes or {}).get("retrieval") or {}
+    if retrieval:
+        thin = int(retrieval.get("thin_calls") or 0)
+        rerank_heavy = int(retrieval.get("rerank_heavy_calls") or 0)
+        weakest = str(retrieval.get("weakest") or "").strip()
+        if thin or rerank_heavy or retrieval.get("thin_evidence"):
+            parts.append(
+                f"- Retrieval-quality flags: "
+                f"thin_calls={thin}, rerank_heavy_calls={rerank_heavy}. "
+                + (f"Weakest call: {weakest}. " if weakest else "")
+                + "Caveat any claim whose support comes from a thin call; "
+                "do not present rerank-rescued retrievals as if they were "
+                "strong first-stage matches."
+            )
+    # Contradictions worth surfacing to the synth (already filtered to
+    # confidence ≥ 0.6 in ``_distill_agent_notes``).
+    contras = (agent_notes or {}).get("contradictions") or []
+    if contras:
+        parts.append(
+            "- CONTRADICTIONS detected across retrieved evidence — call them "
+            "out in the answer rather than picking a side silently:"
+        )
+        for c in contras[:4]:
+            span = str(c.get("span") or "").strip()
+            srcs = ", ".join(map(str, c.get("sources") or []))[:120]
+            flag = " (addressed by counter-search)" if c.get("addressed") else " (UN-investigated)"
+            parts.append(f"    • {span[:220]}{flag} [{srcs}]")
+    # Investigation plan — the model's own mid-loop todo list. We
+    # surface OPEN + STUCK items so the answer honestly acknowledges
+    # unfinished investigation rather than pretending the loop
+    # closed every sub-question.
+    plan = (agent_notes or {}).get("investigation_plan") or {}
+    if isinstance(plan, dict) and int(plan.get("total") or 0) > 0:
+        open_items = list(plan.get("open") or [])
+        stuck_items = list(plan.get("stuck_in_progress") or [])
+        completed_items = list(plan.get("completed") or [])
+        if open_items or stuck_items:
+            parts.append(
+                "- INVESTIGATION PLAN had unfinished work at finalize — "
+                "the answer must acknowledge these gaps honestly rather "
+                "than imply the question was fully resolved:"
+            )
+            for item in (stuck_items + open_items)[:5]:
+                parts.append(f"    • {str(item)[:220]} (NOT resolved)")
+            if completed_items:
+                parts.append(
+                    f"    (Completed in-loop: {len(completed_items)} item(s).)"
+                )
     if not parts:
         return ""
     return "<agent_notes>\n" + "\n".join(parts) + "\n</agent_notes>"
+
+
+def _has_low_grounding_signal(
+    *,
+    answer: str,
+    papers: list[dict],
+    arxiv_results: list[dict],
+    agent_notes: dict | None,
+    output: dict | None,
+) -> bool:
+    """Detect when the evidence base behind this answer was meaningfully
+    weak, so we can inform the user.
+
+    This is NOT an abstention gate — RA always answers the user's
+    question to the best of its ability. The detector exists so we
+    can *append* a short footer naming the specific signals (thin
+    retrieval, low critique score, unverified citations, expansion
+    failure). The polished answer is unchanged; the footer is a
+    note, not a warning.
+
+    Fires when ANY of:
+      * Critique groundedness < 0.4 AND total evidence ≤ 3 papers,
+      * Provenance verifier reports < 40% claims supported with at
+        least 3 flagged citations,
+      * ReAct flagged ``evidence_expansion_failed`` (tool retries
+        burned, zero new retrievals),
+      * Retrieval observability reports two or more thin calls.
+
+    Conservative on purpose — a single weak signal triggers the
+    footer; a clean turn passes through silently.
+    """
+    notes = agent_notes or {}
+    n_evidence = len(papers or []) + len(arxiv_results or [])
+    crit = (notes.get("critique") or {}) if isinstance(notes, dict) else {}
+    g = float(crit.get("groundedness") or 1.0) if isinstance(crit, dict) else 1.0
+    retrieval = (notes.get("retrieval") or {}) if isinstance(notes, dict) else {}
+    thin_calls = int((retrieval or {}).get("thin_calls") or 0)
+    expansion_failed = bool((notes or {}).get("evidence_expansion_failed")) or (
+        int((notes or {}).get("tool_failures") or 0) >= 2
+        and int((notes or {}).get("successful_retrievals") or 0) == 0
+    )
+    prov = (output or {}).get("provenance") if isinstance(output, dict) else None
+    prov_low = False
+    if isinstance(prov, dict):
+        total = int(prov.get("total") or 0)
+        supported = int(prov.get("supported") or 0)
+        flagged = len(prov.get("flagged") or [])
+        if total >= 3 and supported / max(1, total) < 0.40 and flagged >= 3:
+            prov_low = True
+
+    signals = sum([
+        g < 0.4 and n_evidence <= 3,
+        thin_calls >= 2,
+        expansion_failed,
+        prov_low,
+    ])
+    return signals >= 1
+
+
+def _low_grounding_notice(
+    *,
+    papers: list[dict],
+    arxiv_results: list[dict],
+    agent_notes: dict | None,
+    output: dict | None,
+) -> str:
+    """Compose a short informational footer naming the specific
+    signals that flagged this turn as low-grounding.
+
+    Tone: informational, not warning. The footer goes at the END of
+    the answer — the user has already read RA's best-effort response.
+    The footer just gives them ground truth about how thin the
+    foundation actually was, so they can decide whether the answer
+    is solid enough for their use or whether a follow-up would help.
+    """
+    reasons: list[str] = []
+    notes = agent_notes or {}
+    n_evidence = len(papers or []) + len(arxiv_results or [])
+    if n_evidence <= 3:
+        reasons.append(f"only {n_evidence} grounded paper(s) reached synthesis")
+    crit = notes.get("critique") if isinstance(notes, dict) else None
+    if isinstance(crit, dict) and float(crit.get("groundedness") or 1.0) < 0.4:
+        reasons.append(f"the agent's own groundedness score was {crit.get('groundedness'):.2f}")
+    retrieval = notes.get("retrieval") if isinstance(notes, dict) else None
+    if isinstance(retrieval, dict) and int(retrieval.get("thin_calls") or 0) >= 2:
+        reasons.append(f"{int(retrieval['thin_calls'])} retrieval calls returned thin coverage")
+    if int((notes or {}).get("tool_failures") or 0) >= 2 and int((notes or {}).get("successful_retrievals") or 0) == 0:
+        reasons.append("evidence-expansion tools errored without recovery")
+    prov = (output or {}).get("provenance") if isinstance(output, dict) else None
+    if isinstance(prov, dict):
+        total = int(prov.get("total") or 0)
+        supported = int(prov.get("supported") or 0)
+        if total >= 3 and supported / max(1, total) < 0.40:
+            reasons.append(
+                f"only {supported}/{total} citations could be verified against the cited paper text"
+            )
+    if not reasons:
+        return ""
+    return (
+        "\n---\n"
+        "*Heads-up on the evidence base behind this answer: "
+        + "; ".join(reasons)
+        + ". The response above is the best read of what was retrievable; "
+        "a more specific follow-up query or a broader corpus would likely "
+        "strengthen it.*"
+    )
 
 
 def _strip_unresolvable_citations(
@@ -314,8 +471,16 @@ async def synthesize_answer(
     skip_reflection: bool = False,
     agent_notes: dict | None = None,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
+    output: dict | None = None,
 ) -> str:
-    """Return a grounded research-workspace answer or a deterministic fallback."""
+    """Return a grounded research-workspace answer or a deterministic fallback.
+
+    ``output`` is an optional dict the caller passes in; on return it
+    carries side-channel reports the synthesizer produced — today
+    ``provenance`` (claim-level verification) and ``drift`` (repair-
+    pass drift). The orchestrator forwards both into ``agent_notes``
+    on the next turn so the UI can render them.
+    """
     context = _build_paper_context(papers, arxiv_results)
     extra_context = _build_extra_context(extra_results or {})
     # Conditional memory injection — only when memory is likely to matter.
@@ -574,6 +739,25 @@ async def synthesize_answer(
                     if not gap_evidence and has_converged(before=answer, after=repaired):
                         log.debug("repair converged with no material change — keeping original")
                     else:
+                        # Drift detection: log any new citation markers /
+                        # newly-cited claims the repair pass introduced.
+                        # We accept the repair but surface the drift into
+                        # ``output['drift']`` so the orchestrator can
+                        # render it in agent_notes; the synth answer
+                        # itself is unchanged. Reverting risks
+                        # re-introducing the very issue the repair fixed.
+                        try:
+                            from app.assistant.repair_drift import detect_repair_drift
+                            drift = detect_repair_drift(pre=answer, post=repaired)
+                            if drift.has_drift and isinstance(output, dict):
+                                output["drift"] = {
+                                    "new_markers": drift.new_markers,
+                                    "new_claims": drift.new_claims[:6],
+                                    "changed_claims": drift.changed_claims[:6],
+                                    "summary": drift.summary,
+                                }
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("repair drift detector skipped: %s", exc)
                         answer = repaired
             except Exception as exc:
                 log.warning("synthesizer repair pass failed: %s", exc)
@@ -591,6 +775,109 @@ async def synthesize_answer(
             answer = _strip_unresolvable_citations(answer, papers, arxiv_results)
         except Exception as exc:  # noqa: BLE001 — safety net must never raise
             log.debug("citation strip pass skipped: %s", exc)
+
+        # ── Claim-level provenance verification ───────────────────────
+        # For every surviving ``[N]`` / ``[A N]`` marker, check that the
+        # cited paper's text actually overlaps with the claim it's
+        # attached to. Deterministic + cheap; flagged claims land in
+        # ``output['provenance']`` so the orchestrator/synthesizer can
+        # caveat unverified citations honestly in the final answer.
+        try:
+            from app.assistant.provenance_verification import (
+                escalate_unverified_with_llm,
+                verify_claims,
+            )
+            report = verify_claims(
+                answer=answer, papers=papers, arxiv_results=arxiv_results,
+            )
+            # LLM escalation on borderline cases. Only the
+            # ``unverified`` subset gets escalated — typically a small
+            # fraction of total claims, so the cost stays bounded.
+            # Failures (LLM unavailable, schema mismatch, etc.) leave
+            # the deterministic verdicts intact.
+            if any(c.verdict == "unverified" for c in report.claims):
+                try:
+                    report = await escalate_unverified_with_llm(
+                        report=report, papers=papers,
+                        arxiv_results=arxiv_results,
+                    )
+                except Exception as _exc:
+                    log.debug("provenance LLM escalation skipped: %s", _exc)
+            if isinstance(output, dict) and report.total:
+                output["provenance"] = {
+                    "total": report.total,
+                    "supported": report.supported,
+                    "unverified": report.unverified,
+                    "unsupported": report.unsupported,
+                    "verified_ratio": report.verified_ratio,
+                    "flagged": [
+                        {
+                            "marker": c.marker, "verdict": c.verdict,
+                            "paper_title": c.paper_title[:120],
+                            "claim": c.claim[:240],
+                            "missing_salient": c.missing_salient[:4],
+                            "overlap_score": c.overlap_score,
+                        }
+                        for c in report.claims
+                        if c.verdict in ("unsupported", "unverified")
+                    ][:10],
+                }
+        except Exception as exc:  # noqa: BLE001 — verification must never raise
+            log.debug("claim verification skipped: %s", exc)
+
+        # ── Chunk-level provenance evidence ──────────────────────────
+        # Deepen the per-claim verdict from "supported by paper [3]"
+        # to "supported by paper [3], chunk #4: <excerpt>". The
+        # frontend renders chunks as hover-previews / click-through
+        # from inline citation markers so the user can audit "did the
+        # cited paper actually say this?" in one click. Bounded by
+        # MAX_CLAIMS_PER_TURN; supported claims win the budget.
+        try:
+            from app.assistant.provenance_evidence import attach_chunk_evidence
+            from app.db.session import async_session_factory
+
+            # We need a DB session — the synthesizer's caller hasn't
+            # threaded one in, so open a short-lived one here. Read-
+            # only; we never commit.
+            async with async_session_factory() as _evidence_db:
+                chunk_links = await attach_chunk_evidence(
+                    db=_evidence_db,
+                    claim_verdicts=report.claims,
+                    papers=papers,
+                )
+            if chunk_links and isinstance(output, dict):
+                # Stash on the existing ``provenance`` dict if present
+                # so the orchestrator persists it in one payload pass.
+                prov_block = output.setdefault("provenance", {})
+                prov_block["chunk_evidence"] = [link.to_dict() for link in chunk_links]
+        except Exception as exc:  # noqa: BLE001 — chunk evidence is best-effort
+            log.debug("chunk-level provenance skipped: %s", exc)
+
+        # ── Low-grounding informational notice (NOT abstention) ──────
+        # When the evidence base is weak (thin retrieval AND low
+        # groundedness OR critique flagged unresolved issues), we
+        # APPEND a short informational footer naming the specific
+        # signals that triggered it. We do NOT prepend a warning,
+        # we do NOT replace the polished answer, and we do NOT
+        # caveat the prose itself — the user still gets RA's best
+        # effort at answering the question. The footer just tells
+        # them HOW thin the foundation is so they can decide whether
+        # to follow up.
+        try:
+            if _has_low_grounding_signal(
+                answer=answer, papers=papers, arxiv_results=arxiv_results,
+                agent_notes=agent_notes, output=output,
+            ):
+                notice = _low_grounding_notice(
+                    papers=papers, arxiv_results=arxiv_results,
+                    agent_notes=agent_notes, output=output,
+                )
+                if notice and notice not in answer:
+                    answer = answer.rstrip() + "\n\n" + notice
+                if isinstance(output, dict):
+                    output["low_grounding"] = True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("low-grounding notice skipped: %s", exc)
 
         return answer
     except Exception as exc:
@@ -1054,12 +1341,24 @@ def _build_extra_context(results: dict) -> str:
 
 
 def _build_paper_context(papers: list[dict], arxiv_results: list[dict]) -> str:
+    """Build the per-paper context block, neutralising prompt-injection
+    attempts in the retrieved prose.
+
+    Paper titles + abstracts are external untrusted data. A paper whose
+    abstract contains an "ignore previous instructions" stanza would
+    otherwise be obeyed by the synthesizer. :func:`sanitize_untrusted`
+    quote-escapes those phrases so the model still sees the text but
+    can't be steered by it.
+    """
+    from app.assistant.prompt_safety import sanitize_untrusted
+
     sections: list[str] = []
     if papers:
         sections.append("\n\n".join(
-            f"[{i + 1}] {p.get('title')}\nAuthors: {', '.join(p.get('authors') or [])}\n"
+            f"[{i + 1}] {sanitize_untrusted(p.get('title'))}\n"
+            f"Authors: {sanitize_untrusted(', '.join(p.get('authors') or []))}\n"
             f"Namespace: {p.get('namespace_key', '')}\n"
-            f"Abstract/TLDR: {p.get('tldr') or p.get('abstract', '')[:900]}"
+            f"Abstract/TLDR: {sanitize_untrusted((p.get('tldr') or p.get('abstract', ''))[:900])}"
             for i, p in enumerate(papers[:8])
         ))
     if arxiv_results:
@@ -1068,8 +1367,9 @@ def _build_paper_context(papers: list[dict], arxiv_results: list[dict]) -> str:
         deduped = [p for p in arxiv_results if p.get("title", "").lower() not in corpus_titles]
         if deduped:
             sections.append("\n\n".join(
-                f"[A{i + 1}] {p.get('title')}\nAuthors: {', '.join(p.get('authors') or [])}\n"
-                f"Abstract: {p.get('abstract', '')[:900]}"
+                f"[A{i + 1}] {sanitize_untrusted(p.get('title'))}\n"
+                f"Authors: {sanitize_untrusted(', '.join(p.get('authors') or []))}\n"
+                f"Abstract: {sanitize_untrusted(p.get('abstract', '')[:900])}"
                 for i, p in enumerate(deduped[:6])
             ))
     return "\n\n".join(sections)
@@ -1130,8 +1430,10 @@ def _build_prompt(
 
     evidence_block = "\n\n".join(evidence_parts)
 
+    from app.assistant.prompt_safety import untrusted_block_preamble
     return (
         "You are ResearchFlow's AI-native research collaborator — brilliant, warm, precise, and deeply useful.\n\n"
+        f"{untrusted_block_preamble()}\n\n"
         "<evidence>\n"
         f"{evidence_block}\n"
         "</evidence>\n\n"
@@ -1154,7 +1456,31 @@ def _build_prompt(
         "• NEVER produce a rigid Takeaway / Evidence / Gaps / Next-moves skeleton. Choose the shape that fits.\n"
         "• NEVER reproduce XML/section tags from the evidence block (like <wolfram_computation>, <concept_background>, etc.) in your response — those are internal context markers only.\n"
         "• Use proper markdown: bold key terms, use headers sparingly, bullet points for lists, italics for emphasis.\n"
-        "• Write a complete answer — NEVER cut off mid-sentence or truncate.\n\n"
+        "• Write a complete answer — NEVER cut off mid-sentence or truncate.\n"
+        "\n"
+        "DEPTH DISCIPLINE — when the user asks for an architecture, a novel "
+        "idea, a synthesis, or a research direction (NOT for a definition / "
+        "lookup / quick overview), do not stop at impressive prose. Convert "
+        "the answer into something falsifiable and implementable:\n"
+        "  • PRIMITIVES — name the building blocks (state, inputs, outputs, "
+        "control policy) so a reader could begin implementing.\n"
+        "  • MECHANISM — explain how the parts compose, where the load-"
+        "bearing assumptions sit, and what the data path looks like.\n"
+        "  • STRONGEST FAIR BASELINE — name the strongest existing system "
+        "the new idea must beat, and say why that baseline (not a strawman) "
+        "is the right comparison.\n"
+        "  • NOVELTY VS BORROWED — for each major component, label it "
+        "borrowed (from which prior work) or genuinely new. Mark anything "
+        "you can't place as 'unattributed' rather than implying novelty.\n"
+        "  • EVIDENCE TIER — separate established results, justified "
+        "inference, and speculation. Don't promote inferences to facts.\n"
+        "  • FALSIFIERS / MINIMAL EXPERIMENT — name at least one concrete "
+        "ablation or experiment whose negative result would invalidate the "
+        "idea. If you can't name one, the idea is not yet falsifiable.\n"
+        "These sub-points should NOT become rigid section headers — weave "
+        "them into the prose where they fit the question's shape. The goal "
+        "is for the reader to know what to implement and what would prove "
+        "the design wrong.\n\n"
         "Write your response now:"
     )
 

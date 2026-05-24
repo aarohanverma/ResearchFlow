@@ -92,15 +92,29 @@ def _make_ctx():
 
 
 @pytest.mark.asyncio
-async def test_react_loop_finalizes_on_first_decision(monkeypatch):
-    """If the model says 'finalize' immediately, the loop ends cleanly."""
+async def test_react_loop_finalizes_after_forced_critique(monkeypatch):
+    """An immediate ``finalize`` no longer exits on iteration 1.
+
+    The loop intercepts a finalize that would otherwise leave with
+    fewer than ``_MIN_ITERS_BEFORE_FREE_FINALIZE`` iterations and no
+    self-critique recorded, runs the critique pseudo-action, then
+    accepts a subsequent finalize. This stops the agent from shipping
+    a low-confidence answer that never saw any adversarial pressure.
+    """
     from app.assistant import react_loop as rl
 
-    # Patch the decision step to always return 'finalize'.
     async def _decide(**_kw):
         return {"thought": "Initial results are sufficient.", "action": "finalize"}
 
+    async def _fake_critique(**kwargs):
+        pad = kwargs["pad"]
+        pad.critique(
+            groundedness=0.8, completeness=0.7, memory_faithfulness=1.0,
+            issues=[], verdict="ship",
+        )
+
     monkeypatch.setattr(rl, "_decide_next_action", _decide)
+    monkeypatch.setattr(rl, "_run_self_critique", _fake_critique)
 
     outcome = await rl.run_react_loop(
         query="why does ReAct work?",
@@ -112,8 +126,12 @@ async def test_react_loop_finalizes_on_first_decision(monkeypatch):
         config=rl.ReactConfig(max_iterations=4, deadline_seconds=10),
     )
     assert outcome.completed_normally is True
-    assert outcome.iterations == 1
+    # Forced critique → second iteration → final exit. Not iteration 1.
+    assert outcome.iterations >= 2
     assert outcome.new_results == {}
+    # Critique entry was forced before the loop accepted finalize.
+    kinds = [getattr(e, "kind", "") for e in outcome.scratchpad.entries]
+    assert "critique" in kinds, kinds
     # First iteration's THOUGHT is recorded on the pad.
     thoughts = outcome.scratchpad.thoughts()
     assert any("sufficient" in t.text.lower() for t in thoughts)

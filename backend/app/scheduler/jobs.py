@@ -156,6 +156,34 @@ async def _run_cross_namespace_links() -> None:
     pass
 
 
+async def _run_memory_consolidation() -> None:
+    """Weekly background pass that clusters + merges related memory
+    entries across every user's chat / tree / namespace tiers.
+
+    The per-tier eviction caps in ``app.assistant.tools.memory`` keep
+    the stores bounded, but eviction loses information. Consolidation
+    compresses it instead: a cluster of related entries (e.g. five
+    "user prefers terse answers" / "user is a senior researcher" /
+    "user dislikes long preambles" notes) becomes ONE rollup that
+    captures the gestalt with provenance pointing back to the
+    originals.
+
+    Bounded cost: at most ``_MAX_CLUSTERS_PER_SCOPE`` LLM merges per
+    (user, scope) per pass. Pathological stores get consolidated
+    over multiple cycles, not all at once.
+    """
+    log.info("scheduler.memory_consolidation: starting")
+    try:
+        from app.assistant.memory_consolidation import consolidate_all_users
+        from app.db.session import async_session_factory
+
+        async with async_session_factory() as db:
+            report = await consolidate_all_users(db)
+        log.info("scheduler.memory_consolidation: done — %s", report.summary())
+    except Exception as exc:  # noqa: BLE001 — never let a cron crash propagate
+        log.error("scheduler.memory_consolidation: failed err=%s", exc)
+
+
 def start_scheduler() -> None:
     """Initialise and start the APScheduler instance with all configured cron jobs.
 
@@ -234,6 +262,21 @@ def start_scheduler() -> None:
         day_of_week="sun",
         hour=3,
         minute=0,
+        misfire_grace_time=3600,
+    )
+
+    # Weekly memory consolidation — clusters + merges related entries
+    # across every user's chat/tree/namespace tiers so the store grows
+    # by *summary*, not by raw event accumulation. Runs Sunday at
+    # 04:30 UTC so it finishes well before the morning ingestion + the
+    # bookmark rebuild kick in.
+    sched.add_job(
+        _run_memory_consolidation,
+        "cron",
+        id="memory_consolidation_weekly",
+        day_of_week="sun",
+        hour=4,
+        minute=30,
         misfire_grace_time=3600,
     )
 

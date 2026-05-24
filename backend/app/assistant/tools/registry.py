@@ -43,6 +43,12 @@ def describe_for_planner(
     hidden from the planner so it never tries to call into a route that's
     gated 404 / short-circuited.
 
+    Per-call tool hides are also supported via the ``"tool:<name>"``
+    prefix in ``disabled_features``. This lets a caller (e.g. a
+    subagent runner) scope the catalog to a tool subset without
+    inventing a new feature flag per tool. The prefix never persists
+    to the global feature-flag store — it's interpreted in-call only.
+
     Never includes implementation details — only what the planner needs to
     pick a tool and produce valid params.
     """
@@ -64,10 +70,20 @@ def describe_for_planner(
         "arxiv_import": "arxiv_ingest_enabled",
     }
     disabled = disabled_features or set()
+    # Split ``disabled_features`` into proper feature flags vs the
+    # ``"tool:<name>"`` per-call hide prefix used by subagent scoping.
+    _TOOL_HIDE_PREFIX = "tool:"
+    per_call_tool_hides: set[str] = {
+        flag[len(_TOOL_HIDE_PREFIX):]
+        for flag in disabled
+        if isinstance(flag, str) and flag.startswith(_TOOL_HIDE_PREFIX)
+    }
 
     out = []
     for tool in list_tools():
         if visible is not None and tool.name not in visible:
+            continue
+        if tool.name in per_call_tool_hides:
             continue
         gated_by = TOOL_FEATURE_GATE.get(tool.name)
         if gated_by and gated_by in disabled:

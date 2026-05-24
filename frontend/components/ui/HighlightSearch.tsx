@@ -29,6 +29,13 @@ export interface Highlight {
   /** Free-form locator for the host page — e.g. section key, block index. */
   scope: string;
   text: string;
+  /** Per-text-node slices of the original selection. Populated when the
+   *  selection spans multiple rendered text nodes (bold / italic /
+   *  heading / inline math / citation chips). The renderer matches
+   *  each entry exactly against the text node it lives in, instead of
+   *  doing a fuzzy LCS search that would over-highlight short tokens
+   *  like "the" or " of " across the entire document. */
+  segments?: string[];
   color?: string;
 }
 
@@ -56,6 +63,43 @@ export interface UseHighlightSearchResult {
     clearHighlights: () => void;
   };
 }
+
+/** Walk every ``Text`` node intersecting a Range and return each
+ *  node's in-range substring as a separate anchor.
+ *
+ *  When the user drags a selection across formatting boundaries
+ *  (bold, italic, headings, inline math, citation chips, list items),
+ *  ``Selection.toString()`` joins them into a single string — but
+ *  the renderer sees each fragment as its own ``Text`` node. Storing
+ *  one anchor per fragment lets the renderer mark each fragment with
+ *  an exact substring match instead of a fuzzy search that would
+ *  over-highlight short common tokens. We ignore anchors shorter than
+ *  3 chars to keep noise out, and we ignore anchors that don't fall
+ *  inside the host scroll container (e.g. the user dragged outside
+ *  the chat into the page chrome).
+ */
+function _collectSelectionSegments(range: Range, container: HTMLElement): string[] {
+  const segments: string[] = [];
+  const walker = (typeof document !== "undefined" && typeof document.createTreeWalker === "function")
+    ? document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null)
+    : null;
+  if (!walker) return segments;
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (!range.intersectsNode(node)) continue;
+    const nodeStart = node === range.startContainer ? range.startOffset : 0;
+    const nodeEnd = node === range.endContainer ? range.endOffset : (node.data?.length || 0);
+    if (nodeEnd <= nodeStart) continue;
+    const piece = (node.data || "").slice(nodeStart, nodeEnd);
+    // Trim trailing whitespace per fragment so a selection's "soft"
+    // edges (extra newlines / spaces caught at boundaries) don't
+    // produce phantom anchors that fail to match anywhere.
+    const trimmed = piece.replace(/\s+$/u, "").replace(/^\s+/u, "");
+    if (trimmed.length >= 3) segments.push(trimmed);
+  }
+  return segments;
+}
+
 
 /**
  * Build the highlight + search state for a single scrollable region.
@@ -142,6 +186,13 @@ export function useHighlightSearch(
         el = el.parentElement;
       }
       if (!inside) return;
+      // Walk every text node intersecting the selection range and
+      // collect its in-range substring. These anchors let the
+      // renderer mark just the visible slices when the selection
+      // spans bold / italic / heading / inline-math / citation
+      // chips, without resorting to a fuzzy substring search that
+      // would over-highlight across the whole document.
+      const segments = _collectSelectionSegments(range, container);
       setHighlights(prev => {
         const existing = prev.find(h => h.text === text);
         if (existing) return prev.filter(h => h.id !== existing.id);
@@ -151,6 +202,7 @@ export function useHighlightSearch(
             : `h-${Date.now()}-${Math.random().toString(36).slice(2)}`,
           scope: scopeKey,
           text,
+          segments: segments.length > 1 ? segments : undefined,
           color: "#fef08a",
         }];
       });
@@ -224,7 +276,12 @@ export function useHighlightSearch(
   const clearHighlights = useCallback(() => setHighlights([]), []);
 
   const decorations: MarkdownDecorations = useMemo(() => ({
-    highlights: highlights.map(h => ({ id: h.id, text: h.text, color: h.color || "#fef08a" })),
+    highlights: highlights.map(h => ({
+      id: h.id,
+      text: h.text,
+      segments: h.segments,
+      color: h.color || "#fef08a",
+    })),
     searchQuery,
     searchCaseSensitive: caseSensitive,
     searchWholeWord: wholeWord,

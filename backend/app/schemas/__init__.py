@@ -420,12 +420,16 @@ class AssistantSessionCreateRequest(BaseModel):
 class AssistantMessageRequest(BaseModel):
     """Request body for submitting a message to a Research Assistant session.
 
-    Bounds: ``namespace_key`` 1–120 chars; up to 32 topic keys per turn; up to
+    Bounds: ``content`` up to 32k chars — long-form research prompts and
+    multi-paragraph architecture briefs routinely run several pages, and the
+    previous 6000-char cap was tripping legitimate complex queries with an
+    opaque 422 the frontend rendered as ``[object Object]``.
+    ``namespace_key`` 1–120 chars; up to 32 topic keys per turn; up to
     16 attachment refs. These caps mirror the implicit DB column lengths so an
     overflow trips validation before reaching the orchestrator.
     """
 
-    content: str = Field(min_length=1, max_length=6000)
+    content: str = Field(min_length=1, max_length=32000)
     namespace_key: str = Field(min_length=1, max_length=120)
     topic_keys: list[str] = Field(default_factory=list, max_length=32)
     attachments: list[dict] = Field(default_factory=list, max_length=16)

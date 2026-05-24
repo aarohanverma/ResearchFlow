@@ -139,6 +139,44 @@ def _entry_ts(entry: object) -> str:
     return ""
 
 
+def _memory_is_stale(entry: object, *, now_iso: str | None = None) -> bool:
+    """Return True when ``entry`` has a ``ttl_days`` and that window
+    has expired.
+
+    Entries without a TTL are evergreen — definitions, durable user
+    preferences, names — and never go stale on their own. The TTL is
+    advisory: a stale entry is still readable, but the write gate
+    treats it as safe to overwrite even when ``overwrite_policy``
+    would otherwise reject a conflicting new value, and recall surfaces
+    a "stale" flag so the synthesizer can caveat the recalled fact.
+    """
+    if not isinstance(entry, dict):
+        return False
+    ttl = entry.get("ttl_days")
+    if not ttl:
+        return False
+    try:
+        ttl_days = int(ttl)
+    except (TypeError, ValueError):
+        return False
+    ts_raw = entry.get("ts") or ""
+    if not ts_raw:
+        return False
+    try:
+        ts = datetime.fromisoformat(ts_raw)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    now = (
+        datetime.fromisoformat(now_iso) if now_iso else datetime.now(timezone.utc)
+    )
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age_days = (now - ts).total_seconds() / 86400.0
+    return age_days > ttl_days
+
+
 def _normalize_key(raw: str) -> str:
     """Coerce arbitrary planner-emitted keys into stable snake_case slugs.
 
@@ -274,6 +312,33 @@ class MemoryWriteInput(BaseModel):
             "  'long' / 'namespace' / 'ns' — every session in this namespace."
         ),
     )
+    ttl_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=365,
+        description=(
+            "Optional freshness window in days. After this many days the "
+            "entry is treated as stale: recalls flag it, and any new write "
+            "to the same key with conflicting content is allowed even if it "
+            "would otherwise be rejected as a duplicate. Leave unset (None) "
+            "for evergreen facts (user preferences, definitions); set 14–30 "
+            "for time-sensitive research findings; set 7 for fast-moving "
+            "frontier work."
+        ),
+    )
+    overwrite_policy: str = Field(
+        default="prefer_fresh",
+        pattern="^(prefer_fresh|append|skip_if_exists|force)$",
+        description=(
+            "How to handle an existing entry with the SAME key:\n"
+            "  'prefer_fresh' (default) — overwrite only when the new value "
+            "differs AND the old entry is stale OR conflicts with the new one.\n"
+            "  'append' — keep both; new value becomes the canonical one but "
+            "the prior value is preserved in ``history``.\n"
+            "  'skip_if_exists' — never overwrite. Safe for first-write-wins facts.\n"
+            "  'force' — always overwrite (caller takes responsibility)."
+        ),
+    )
     memory_type: str = Field(
         default="context",
         description=(
@@ -304,6 +369,14 @@ class MemoryWriteOutput(BaseModel):
     scope: str
     key: str
     memory_type: str
+    # Reason a write was rejected / skipped / overwritten. The agent
+    # reads this to know whether its write actually landed, and the
+    # synthesizer surfaces a warning when a high-confidence overwrite
+    # was blocked by a fresh conflicting entry.
+    decision: str = ""    # 'written' | 'noop' | 'skipped_existing' | 'conflict_blocked' | 'overwrote_stale'
+    version: int = 1
+    stale: bool = False
+    conflict_with: str = ""
 
 
 class MemoryWriteTool:
@@ -369,25 +442,116 @@ class MemoryWriteTool:
                 state = dict(target.state or {})
                 mem = dict(state.get(bucket) or {})
 
-                # Idempotency: skip the write entirely when the existing entry
-                # already records the same value + type. Without this, every
-                # turn that recalls and re-asserts a known fact bumps the
-                # timestamp and burns a flush, polluting recency ordering.
+                # ── Write gate: freshness + versioning + conflict ─────
                 existing = mem.get(norm_key)
+                policy = params.overwrite_policy
+                now_iso = _now_iso()
+                existing_value = ""
+                existing_version = 0
+                existing_is_stale = False
+                if isinstance(existing, dict):
+                    existing_value = str(existing.get("value") or "")
+                    existing_version = int(existing.get("version") or 1)
+                    existing_is_stale = _memory_is_stale(existing, now_iso=now_iso)
+
+                # Idempotent re-write of identical content — preserved for
+                # backwards compatibility; ``written`` flag stays True so
+                # callers see success.
                 if isinstance(existing, dict) \
                         and existing.get("value") == params.value \
                         and existing.get("type") == mem_type:
                     return ToolResult(
-                        output={"stored": True, "scope": tier, "key": norm_key, "memory_type": mem_type, "noop": True},
-                        summary=f"Already stored — no-op: {norm_key!r}",
+                        output={
+                            "stored": True, "scope": tier, "key": norm_key,
+                            "memory_type": mem_type, "noop": True,
+                            "decision": "noop", "version": existing_version,
+                            "stale": existing_is_stale,
+                        },
+                        summary=f"Already stored — no-op: {norm_key!r}"
+                                + (" (stale entry — value unchanged)" if existing_is_stale else ""),
                     )
+
+                # Policy gate.
+                if existing is not None and policy == "skip_if_exists":
+                    return ToolResult(
+                        output={
+                            "stored": False, "scope": tier, "key": norm_key,
+                            "memory_type": mem_type,
+                            "decision": "skipped_existing",
+                            "version": existing_version,
+                            "stale": existing_is_stale,
+                            "conflict_with": existing_value[:200],
+                        },
+                        summary=f"Skipped (entry exists; policy=skip_if_exists): {norm_key!r}",
+                    )
+                if (
+                    isinstance(existing, dict)
+                    and policy == "prefer_fresh"
+                    and not existing_is_stale
+                    and existing_value
+                    and existing_value != params.value
+                ):
+                    # Fresh existing entry with conflicting content. Block
+                    # the overwrite unless the caller explicitly asked
+                    # for ``force`` — preserves prior verified facts from
+                    # being clobbered by a single uncertain new write.
+                    return ToolResult(
+                        output={
+                            "stored": False, "scope": tier, "key": norm_key,
+                            "memory_type": mem_type,
+                            "decision": "conflict_blocked",
+                            "version": existing_version,
+                            "stale": False,
+                            "conflict_with": existing_value[:200],
+                        },
+                        summary=(
+                            f"Write blocked: a FRESH conflicting entry exists at {norm_key!r}. "
+                            "Either use overwrite_policy='force' if you intend to replace it, "
+                            "or pick a more specific key to record the new fact alongside."
+                        ),
+                    )
+
+                history: list[dict] = []
+                if isinstance(existing, dict):
+                    history = list(existing.get("history") or [])
+                    if policy == "append" and existing_value:
+                        history.append({
+                            "value": existing_value,
+                            "ts": existing.get("ts") or "",
+                            "version": existing_version,
+                        })
+                        # Keep history bounded to avoid unbounded growth.
+                        history = history[-5:]
 
                 # Trace ``written_from`` for medium writes so we know which
                 # branch contributed a fact when surfacing the tree memory.
-                entry: dict = {"value": params.value, "type": mem_type, "ts": _now_iso()}
+                new_version = existing_version + 1 if isinstance(existing, dict) else 1
+                entry: dict = {
+                    "value": params.value, "type": mem_type, "ts": now_iso,
+                    "version": new_version,
+                }
+                if params.ttl_days:
+                    entry["ttl_days"] = int(params.ttl_days)
+                if history:
+                    entry["history"] = history
                 if tier == "medium" and target.id != current.id:
                     entry["origin_session"] = str(current.id)
+                # Provenance: tag every write with the message the
+                # caller is currently producing so a downstream recall
+                # can show "this fact came from turn X" and the user
+                # can click through to verify. ``parent_message_id``
+                # is the assistant message the orchestrator is
+                # composing — same id the scratchpad lives on.
+                try:
+                    if getattr(ctx, "parent_message_id", None):
+                        entry["origin_message_id"] = str(ctx.parent_message_id)
+                except Exception:
+                    pass
                 mem[norm_key] = entry
+                decision = (
+                    "overwrote_stale" if existing_is_stale and isinstance(existing, dict)
+                    else ("written" if existing is None else "overwritten")
+                )
                 cap = {
                     "short": _MAX_SHORT_ENTRIES,
                     "medium": _MAX_MEDIUM_ENTRIES,
@@ -408,8 +572,17 @@ class MemoryWriteTool:
 
         await ctx.emit_progress(100, f"Saved {tier}-tier memory [{mem_type}]")
         return ToolResult(
-            output={"stored": True, "scope": tier, "key": norm_key, "memory_type": mem_type},
-            summary=f"Stored {tier}-tier [{mem_type}] memory: {norm_key!r}",
+            output={
+                "stored": True, "scope": tier, "key": norm_key,
+                "memory_type": mem_type,
+                "decision": decision,
+                "version": new_version,
+                "stale": False,
+            },
+            summary=(
+                f"Stored {tier}-tier [{mem_type}] memory: {norm_key!r} "
+                f"(v{new_version}{', overwrote stale' if decision == 'overwrote_stale' else ''})"
+            ),
         )
 
 
@@ -522,6 +695,14 @@ class MemoryRecallTool:
             t = (params.memory_type or "").lower().strip()
 
             def _matches(k: str, entry: object) -> bool:
+                # Hide entries that have been consolidated into a
+                # rollup — the rollup IS the authoritative view; the
+                # originals stay in DB for provenance audit but
+                # shouldn't surface alongside their summary (that's
+                # bandwidth bloat AND it risks the model treating
+                # them as independent facts).
+                if isinstance(entry, dict) and entry.get("consolidated_into"):
+                    return False
                 if t and _entry_type(entry) != t:
                     return False
                 if q:
@@ -585,6 +766,8 @@ class MemoryRecallTool:
                 except Exception as exc:
                     log.debug("semantic recall blend skipped: %s", exc)
 
+            now_for_stale = _now_iso()
+
             def _fmt(item: tuple[str, object]) -> dict:
                 k, v = item
                 t = _entry_type(v)
@@ -594,8 +777,26 @@ class MemoryRecallTool:
                     "category": memory_category(t),
                     "ts": _entry_ts(v),
                 }
-                if isinstance(v, dict) and v.get("origin_session"):
-                    base["origin_session"] = v["origin_session"]
+                if isinstance(v, dict):
+                    if v.get("origin_session"):
+                        base["origin_session"] = v["origin_session"]
+                    if v.get("origin_message_id"):
+                        # Provenance link — the UI uses this to make
+                        # recalled-memory citations clickable back to
+                        # the turn that produced the fact, so the user
+                        # can audit instead of trusting blindly.
+                        base["origin_message_id"] = v["origin_message_id"]
+                    if v.get("version"):
+                        base["version"] = v["version"]
+                    if v.get("ttl_days"):
+                        base["ttl_days"] = v["ttl_days"]
+                    if _memory_is_stale(v, now_iso=now_for_stale):
+                        # Surface stale flag so the synthesizer can caveat
+                        # any answer that quotes this entry, and so the
+                        # write gate's "fresh conflicting entry" check
+                        # behaves correctly when this entry is later
+                        # examined for overwrite.
+                        base["stale"] = True
                 return base
 
             short_out = {k: _fmt((k, v)) for k, v in short_items}

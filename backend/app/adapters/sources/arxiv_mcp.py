@@ -65,6 +65,15 @@ class ArXivMcpSource(BaseSource):
 
     source_name = "arxiv_mcp"
 
+    # MCP subprocess spawn / init timeout. When ``arxiv-mcp-server`` isn't
+    # installed in the venv (or the SSE URL is unreachable) the MCP client's
+    # ``__aenter__`` blocks indefinitely waiting for a stdio handshake that
+    # never arrives, eating the entire orchestrator step budget. Cap it
+    # short so the Atom-API fallback kicks in within a few seconds — Atom
+    # is itself a sufficient retrieval path; MCP is only a quality-of-life
+    # accelerator when the server is actually available.
+    _MCP_SEARCH_TIMEOUT_S = 8.0
+
     async def search(
         self,
         query: str,
@@ -85,7 +94,18 @@ class ArXivMcpSource(BaseSource):
             Normalized ``RawPaper`` rows suitable for feed import.
         """
         try:
-            papers = await self._search_mcp(query, max_results=max_results)
+            import asyncio
+            papers = await asyncio.wait_for(
+                self._search_mcp(query, max_results=max_results),
+                timeout=self._MCP_SEARCH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "arxiv_mcp search timed out after %.0fs; falling back to Atom API. "
+                "If MCP is intentional, install arxiv-mcp-server in the backend venv.",
+                self._MCP_SEARCH_TIMEOUT_S,
+            )
+            papers = []
         except Exception as exc:
             log.warning("arxiv_mcp search failed; falling back to Atom API: %s", exc)
             papers = []
@@ -113,17 +133,33 @@ class ArXivMcpSource(BaseSource):
             from app.adapters.sources.arxiv_rss import ArXivRssSource
             return await ArXivRssSource().fetch(external_category_key)
 
-        async with MultiServerMCPClient(_server_config()) as client:
-            tools = client.get_tools()
-            search_tool = next((t for t in tools if t.name == "search_papers"), None)
-            if not search_tool:
-                log.error("MCP server missing search_papers tool")
-                return []
+        import asyncio as _aio
 
-            # SECURITY: invoke tool with a safe, bounded query — not user-supplied text
-            result = await search_tool.ainvoke(
-                {"query": external_category_key, "max_results": 50}
+        async def _mcp_fetch() -> list[dict]:
+            async with MultiServerMCPClient(_server_config()) as client:
+                tools = client.get_tools()
+                search_tool = next((t for t in tools if t.name == "search_papers"), None)
+                if not search_tool:
+                    log.error("MCP server missing search_papers tool")
+                    return []
+                # SECURITY: invoke tool with a safe, bounded query — not user-supplied text
+                return await search_tool.ainvoke(
+                    {"query": external_category_key, "max_results": 50}
+                )
+
+        try:
+            result = await _aio.wait_for(_mcp_fetch(), timeout=self._MCP_SEARCH_TIMEOUT_S)
+        except _aio.TimeoutError:
+            log.warning(
+                "arxiv_mcp fetch timed out after %.0fs; falling back to RSS",
+                self._MCP_SEARCH_TIMEOUT_S,
             )
+            from app.adapters.sources.arxiv_rss import ArXivRssSource
+            return await ArXivRssSource().fetch(external_category_key)
+        except Exception as exc:
+            log.warning("arxiv_mcp fetch failed: %s; falling back to RSS", exc)
+            from app.adapters.sources.arxiv_rss import ArXivRssSource
+            return await ArXivRssSource().fetch(external_category_key)
 
         papers: list[RawPaper] = []
         for item in result if isinstance(result, list) else []:

@@ -103,6 +103,11 @@ type Highlight = {
   id: string;
   messageId: string;
   text: string;
+  /** Per-text-node anchors captured at selection time. Populated when the
+   *  selection spans multiple rendered text nodes; lets the renderer match
+   *  each anchor exactly inside the node it belongs to, instead of fuzzy-
+   *  searching the highlight string across the document. */
+  segments?: string[];
   color: string;
 };
 
@@ -905,7 +910,18 @@ export default function AssistantPage() {
       // even if session creation or any subsequent await fails or hangs.
       const sid = await ensureSession();
       if (!sid) return;
-      if (!text) setInput("");
+      if (!text) {
+        setInput("");
+        // Explicit collapse — the auto-grow effect would do this on
+        // its next tick, but clearing the height inline avoids the
+        // one-frame "submit while still tall" flicker the user sees
+        // when sending a long query.
+        const el = inputRef.current;
+        if (el) {
+          el.style.height = "auto";
+          el.style.overflowY = "hidden";
+        }
+      }
       const res = await api.post<SubmitResponse>(
         `/assistant/sessions/${sid}/messages`,
         {
@@ -3177,7 +3193,9 @@ function MessageBody({
   // emits <mark> JSX elements for each match, so React owns them and they
   // survive every re-render — no DOM mutation, no observer loop.
   const decorations = useMemo(() => ({
-    highlights: (highlightsForMessage || []).map(h => ({ id: h.id, text: h.text, color: h.color })),
+    highlights: (highlightsForMessage || []).map(h => ({
+      id: h.id, text: h.text, segments: h.segments, color: h.color,
+    })),
     searchQuery: searchQuery || "",
     searchCaseSensitive: !!searchCaseSensitive,
     searchWholeWord: !!searchWholeWord,

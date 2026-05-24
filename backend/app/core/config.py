@@ -110,8 +110,11 @@ class Settings(BaseSettings):
     langchain_tracing_v2: bool = True
 
     # ── Web Search (LLM tool) ─────────────────────────────────────────────────
-    web_search_provider: Literal["duckduckgo", "tavily"] = "duckduckgo"
+    # ``auto`` (default): factory picks best-available LLM-optimised
+    # provider whose key is present — Exa > Tavily > DuckDuckGo.
+    web_search_provider: Literal["auto", "duckduckgo", "tavily", "exa"] = "auto"
     tavily_api_key: str = ""
+    exa_api_key: str = ""
 
     # ── Wolfram Alpha (RA computation tool) ───────────────────────────────────
     # MCP: docker run -i --rm -e WOLFRAM_ALPHA_APP_ID=<key> mcp/wolfram-alpha

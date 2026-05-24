@@ -726,6 +726,9 @@ class Orchestrator:
         task._react_tool_failures = outcome.tool_failures  # type: ignore[attr-defined]
         task._react_successful_retrievals = outcome.successful_retrievals  # type: ignore[attr-defined]
         task._react_paper_ledger_size = outcome.paper_ledger_size  # type: ignore[attr-defined]
+        task._react_retrieval_metrics = outcome.retrieval_metrics  # type: ignore[attr-defined]
+        task._react_contradictions = outcome.contradiction_signals  # type: ignore[attr-defined]
+        task._react_investigation_plan = outcome.investigation_plan  # type: ignore[attr-defined]
 
         try:
             self._publish(job_id, "react_done", {
@@ -1643,8 +1646,20 @@ class Orchestrator:
             tool_failures=int(getattr(task, "_react_tool_failures", 0)),
             successful_retrievals=int(getattr(task, "_react_successful_retrievals", 0)),
             paper_ledger_size=int(getattr(task, "_react_paper_ledger_size", 0)),
+            retrieval_metrics=getattr(task, "_react_retrieval_metrics", None) or {},
+            contradictions=getattr(task, "_react_contradictions", None) or [],
+            investigation_plan=getattr(task, "_react_investigation_plan", None),
         )
 
+        # Side-channel output dict the synthesizer fills with
+        # provenance / drift reports. We thread these into the message
+        # payload's ``agent_notes`` so the UI can render them next to
+        # the answer. Initialise agent_notes to {} when distillation
+        # returned None — without this, trivial/single-tier turns
+        # would have nowhere to land the new reports.
+        if agent_notes is None:
+            agent_notes = {}
+        synth_output: dict[str, Any] = {}
         answer = await synthesize_answer(
             query=query,
             papers=papers,
@@ -1666,7 +1681,15 @@ class Orchestrator:
             skip_reflection=skip_reflection,
             agent_notes=agent_notes,
             on_delta=_on_delta,
+            output=synth_output,
         )
+        # Merge synth side-channel reports into the persisted agent_notes
+        # so they round-trip to the UI and to future-turn diagnostics.
+        if isinstance(agent_notes, dict):
+            if synth_output.get("provenance"):
+                agent_notes["provenance"] = synth_output["provenance"]
+            if synth_output.get("drift"):
+                agent_notes["repair_drift"] = synth_output["drift"]
 
         citations = [str(p["paper_id"]) for p in papers if p.get("paper_id")]
         artifact_refs: list[dict] = []
@@ -1764,6 +1787,12 @@ class Orchestrator:
             },
             "scratchpad": scratchpad_payload,
             "provenance": provenance_map,
+            # Agent observability bundle — surfaced into the UI as a
+            # distinct section so the user can see the system's
+            # honest self-assessment alongside the answer (retrieval
+            # quality, detected contradictions, claim verification
+            # results, repair-pass drift).
+            "agent_notes": agent_notes or {},
         }
 
         async with async_session_factory() as db:
@@ -2173,11 +2202,70 @@ class Orchestrator:
 
     @staticmethod
     def _arxiv_results_from_results(results: dict[str, ToolResult]) -> list[dict]:
+        """Aggregate every external arXiv candidate any tool surfaced this turn.
+
+        The synthesizer prompt advertises ``[A1]…[A20]`` markers when this
+        list is non-empty; if a tool emits arXiv candidates (deep_search's
+        MCP top-up, frontier_scan, literature_survey's internal grow path,
+        citation_finder) we want them all here so the answer can cite them
+        AND the frontend's ``arxiv_grid`` block can render them as a
+        clickable References section. Deduplicate by external_id (or title
+        as a fallback) to avoid the same arXiv id showing up twice when
+        multiple retrieval tools rediscovered it.
+        """
+        merged: list[dict] = []
+        seen: set[str] = set()
+
+        def _take(items: list[dict] | None) -> None:
+            if not items:
+                return
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                key = str(
+                    it.get("external_id")
+                    or it.get("arxiv_id")
+                    or it.get("paper_id")
+                    or it.get("title")
+                    or ""
+                ).strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                # Normalise the minimal shape the frontend needs.
+                merged.append({
+                    "external_id": it.get("external_id") or it.get("arxiv_id") or "",
+                    "title": it.get("title") or "",
+                    "authors": it.get("authors") or [],
+                    "abstract": it.get("abstract") or it.get("tldr") or "",
+                })
+
         ai = results.get("arxiv_import")
-        if ai and ai.output.get("arxiv_results"):
-            return list(ai.output["arxiv_results"])
+        if ai:
+            _take(list(ai.output.get("arxiv_results") or []))
         asch = results.get("arxiv_search")
-        return list(asch.output.get("results") or []) if asch else []
+        if asch:
+            _take(list(asch.output.get("results") or asch.output.get("papers") or []))
+        ds = results.get("deep_search")
+        if ds:
+            # deep_search can return arXiv MCP candidates either inline on
+            # papers (when ``match_type=arxiv``) or as a separate field.
+            _take(list(ds.output.get("arxiv_results") or []))
+            inline_arxiv = [
+                p for p in (ds.output.get("papers") or [])
+                if isinstance(p, dict) and (p.get("match_type") == "arxiv" or p.get("source") == "arxiv")
+            ]
+            _take(inline_arxiv)
+        fs = results.get("frontier_scan")
+        if fs:
+            _take(list(fs.output.get("arxiv_results") or fs.output.get("papers") or []))
+        ls = results.get("literature_survey")
+        if ls:
+            _take(list(ls.output.get("arxiv_results") or []))
+        cf = results.get("citation_finder")
+        if cf:
+            _take(list(cf.output.get("arxiv_results") or cf.output.get("papers") or []))
+        return merged
 
     @staticmethod
     def _imported_from_results(results: dict[str, ToolResult]) -> int:
@@ -2554,6 +2642,9 @@ def _distill_agent_notes(
     tool_failures: int = 0,
     successful_retrievals: int = 0,
     paper_ledger_size: int = 0,
+    retrieval_metrics: dict | None = None,
+    contradictions: list[dict] | None = None,
+    investigation_plan: dict | None = None,
 ) -> dict | None:
     """Distill a ReAct scratchpad into a compact dict for the synthesizer.
 
@@ -2581,6 +2672,23 @@ def _distill_agent_notes(
         "successful_retrievals": int(successful_retrievals or 0),
         "paper_ledger_size": int(paper_ledger_size or 0),
     }
+    if retrieval_metrics:
+        notes["retrieval"] = dict(retrieval_metrics)
+    if contradictions:
+        # Only carry contradictions that genuinely matter into the synth
+        # prompt — soft signals (<0.6 confidence) stay in the scratchpad
+        # but don't show up in the answer-shaping notes.
+        notable = [c for c in contradictions if float(c.get("confidence") or 0) >= 0.6]
+        if notable:
+            notes["contradictions"] = notable[:5]
+    if investigation_plan and isinstance(investigation_plan, dict):
+        # The plan goes into ``agent_notes`` whenever the model
+        # actually used ``write_todos`` (i.e. there's at least one
+        # todo). The synthesizer's ``<agent_notes>`` rendering will
+        # surface ``open`` and ``stuck_in_progress`` so unfinished
+        # work shows up as an honest caveat in the answer.
+        if int(investigation_plan.get("total") or 0) > 0:
+            notes["investigation_plan"] = investigation_plan
 
     # Latest critique, if any.
     if scratchpad is not None:
