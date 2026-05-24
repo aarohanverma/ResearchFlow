@@ -1365,6 +1365,24 @@ async def list_capsules(
     user_id: CurrentUserID,
     db: DBSession,
     namespace_keys: str | None = Query(default=None, description="Comma-separated namespace filter"),
+    source: str | None = Query(
+        default=None,
+        description=(
+            "Optional origin filter. Accepts a comma-separated list of "
+            "source_mode values (manual, auto, query, combined, ra_assistant). "
+            "When omitted, all sources are returned. Use 'ra_assistant' to "
+            "fetch only capsules produced by the Research Assistant ReAct "
+            "loop — backing the Genie 'From Assistant' section."
+        ),
+    ),
+    originating_session_id: str | None = Query(
+        default=None,
+        description=(
+            "Optional UUID of an AssistantSession. When set, returns only "
+            "capsules whose originating chat session matches — used to "
+            "group RA-originated ideas by conversation in the UI."
+        ),
+    ),
 ):
     """Return non-dismissed idea capsules for the current user, optionally filtered by namespace.
 
@@ -1397,13 +1415,32 @@ async def list_capsules(
         IdeaCapsule.source_mode,
         IdeaCapsule.source_query,
         IdeaCapsule.namespace_key,
+        IdeaCapsule.originating_session_id,
         IdeaCapsule.deep_dive_status,
         IdeaCapsule.created_at,
         IdeaCapsule.seed_element_ids,
     )
+    base_filters = [
+        IdeaCapsule.user_id == user_id,
+        IdeaCapsule.status != "dismissed",
+    ]
+    if source:
+        wanted = {s.strip() for s in source.split(",") if s.strip()}
+        if wanted:
+            base_filters.append(IdeaCapsule.source_mode.in_(wanted))
+    if originating_session_id:
+        try:
+            sess_uuid = uuid.UUID(originating_session_id)
+            base_filters.append(IdeaCapsule.originating_session_id == sess_uuid)
+        except (ValueError, AttributeError):
+            # Bad UUID — collapse to an empty result rather than 400ing;
+            # the UI typically passes a stale/cached value when the user
+            # navigates around, and a hard error would surface as an
+            # opaque red banner. An empty list is clearer.
+            base_filters.append(IdeaCapsule.id == uuid.UUID(int=0))
     result = await db.execute(
         select(*list_cols)
-        .where(IdeaCapsule.user_id == user_id, IdeaCapsule.status != "dismissed")
+        .where(*base_filters)
         .order_by(IdeaCapsule.created_at.desc())
     )
     rows = result.all()

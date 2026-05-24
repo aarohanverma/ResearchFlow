@@ -65,16 +65,23 @@ class PaperQATool:
 
         await ctx.emit_progress(15, f"Locating paper: {params.paper_title or params.paper_id}")
 
-        # Step 1: Resolve paper
+        # Step 1: Resolve paper.
+        #
+        # Papers are global (no per-user ownership column on the Paper
+        # model) — access is gated upstream by namespace subscription
+        # rather than row-level ownership. Previously this query filtered
+        # by ``Paper.user_id == ctx.user_id``, which raised
+        # ``AttributeError`` at column access (the attribute simply does
+        # not exist); the loop swallowed the exception as a tool failure,
+        # so paper_qa silently never returned a paper. The full-paper
+        # verification gate forces this tool, so the silent failure also
+        # blocked every forced strong-claim verification round.
         paper = None
         if params.paper_id.strip():
             try:
                 pid = UUID(params.paper_id.strip())
                 result = await ctx.db.execute(
-                    select(Paper).where(
-                        Paper.id == pid,
-                        Paper.user_id == ctx.user_id,
-                    )
+                    select(Paper).where(Paper.id == pid)
                 )
                 paper = result.scalar_one_or_none()
             except Exception as exc:
@@ -83,10 +90,12 @@ class PaperQATool:
         if paper is None and params.paper_title.strip():
             title_lower = params.paper_title.strip().lower()
             words = title_lower.split()[:4]
+            # Title fallback: bound the candidate scan to a recent slice
+            # so a global title search stays cheap. The lookup is only
+            # used when the model could not produce a paper_id from the
+            # ledger.
             result = await ctx.db.execute(
-                select(Paper).where(
-                    Paper.user_id == ctx.user_id,
-                ).limit(200)
+                select(Paper).order_by(Paper.ingested_at.desc()).limit(200)
             )
             all_papers = result.scalars().all()
             # Score by word overlap with title

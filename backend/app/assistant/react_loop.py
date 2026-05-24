@@ -469,6 +469,13 @@ class ReactOutcome:
     # synthesizer reads ``open`` and ``stuck_in_progress`` to surface
     # unfinished work honestly in the answer.
     investigation_plan: dict[str, Any] = field(default_factory=dict)
+    # Strong-claim verification ledger summary. Populated by the
+    # FullPaperVerificationMiddleware; carries the count of verified
+    # vs unverifiable claims plus the verbatim provisional / verified
+    # spans so the synthesizer can label evidence vs RA inference
+    # correctly. Empty dict when the gate didn't fire (no strong
+    # claims detected this turn).
+    claim_ledger: dict[str, Any] = field(default_factory=dict)
 
 
 async def run_react_loop(
@@ -650,6 +657,7 @@ async def run_react_loop(
                 retrieval_obs=state.retrieval_obs,
                 banned_tools=state.banned_tools,
                 plan=state.plan,
+                claim_ledger=state.claim_ledger,
                 config=config,
                 is_last_iteration=state.is_last_iteration,
                 subagent_depth=state.subagent_depth,
@@ -1037,6 +1045,7 @@ async def run_react_loop(
             for s in state.contradictions.signals[:8]
         ],
         investigation_plan=state.plan.summarize_for_synth(),
+        claim_ledger=state.claim_ledger.summarize(),
     )
 
 
@@ -1057,6 +1066,7 @@ async def _decide_next_action(
     retrieval_obs: RetrievalObservability | None = None,
     banned_tools: set[str] | None = None,
     plan: Any = None,                # InvestigationPlan | None
+    claim_ledger: Any = None,        # ClaimLedger | None
     config: ReactConfig,
     is_last_iteration: bool,
     subagent_depth: int = 0,
@@ -1183,7 +1193,60 @@ async def _decide_next_action(
         "  - When evidence is thin or conflicting, prefer an honest "
         "abstention over a confident-sounding synthesis. Use 'critique' to "
         "score groundedness/completeness; if either is below 0.5, gather "
-        "more evidence rather than finalizing.\n\n"
+        "more evidence rather than finalizing.\n"
+        "  - Iterate like a real researcher: reformulate the search query "
+        "when results are off-target, compare COMPETING HYPOTHESES side-by-"
+        "side (don't anchor on the first plausible explanation), and verify "
+        "load-bearing claims before they become part of the answer.\n\n"
+        "FULL-PAPER VERIFICATION (this rule is enforced — read the STRONG-"
+        "CLAIM LEDGER block):\n"
+        "  - Abstracts are fine for initial triage. They are NOT sufficient "
+        "for strong claims (SOTA, numeric performance, causal statements, "
+        "method-vs-baseline comparisons).\n"
+        "  - When the ledger shows a PROVISIONAL strong claim you intend to "
+        "rely on in the answer, call ``paper_qa`` with the claim as the "
+        "question to verify it against the paper's body. If you don't, the "
+        "full_paper_gate middleware will force one paper_qa round at "
+        "finalize per claim until its per-turn cap; remaining claims will "
+        "be labelled UNVERIFIABLE in the answer.\n"
+        "  - If a strong claim CANNOT be verified (paper body unavailable, "
+        "paper_qa returns ambiguous), do not promote it as proven. The "
+        "synthesizer will label it as abstract-only — soften the wording "
+        "you build around it accordingly.\n\n"
+        "EVIDENCE VALIDATION (don't trust a result just because it's in a "
+        "paper):\n"
+        "  - Before relying on a claimed improvement, ask whether the "
+        "paper's evaluation actually supports it: realistic dataset? "
+        "strong baselines? ablations isolating the proposed mechanism? "
+        "metrics aligned with the claim?\n"
+        "  - Flag weak evidence: narrow benchmarks, missing ablations, "
+        "small-scale experiments, unclear baselines, only-qualitative "
+        "arguments. Call this out in scratchpad thoughts so the synth can "
+        "caveat it.\n\n"
+        "NOVELTY DELTA (when proposing a research direction or comparing "
+        "approaches):\n"
+        "  - Explicitly compare against the closest prior work. State: "
+        "what is already known, what is being reused, what is genuinely "
+        "new, why the combination matters, and what the hardest baseline "
+        "to beat would be.\n"
+        "  - 'Combining two known techniques' is a valid contribution only "
+        "if the combination has a non-obvious mechanism or unlocks a "
+        "regime neither technique reaches alone — say which.\n\n"
+        "FALSIFIABILITY (every proposed direction needs a disproof "
+        "criterion):\n"
+        "  - Specify a result that would FALSIFY the proposal: a negative "
+        "control, an ablation that should preserve the effect but "
+        "doesn't, a metric value that would invalidate the hypothesis.\n"
+        "  - 'How would we know if this is wrong?' is a load-bearing "
+        "question — gather evidence on what failure would look like, not "
+        "only on why it might work.\n\n"
+        "RANKING COMPETING EXPLANATIONS (when multiple bottlenecks / "
+        "hypotheses are on the table):\n"
+        "  - Rank them using explicit criteria: evidence strength, causal "
+        "plausibility, practical impact, generality, testability, "
+        "production relevance.\n"
+        "  - Do not anchor on the explanation most papers happen to "
+        "mention — popularity is not evidence.\n\n"
         "PARAMS RULES (critical — broken params burn an iteration):\n"
         "  - Every tool's required + optional params are listed in the catalog. "
         "Send a real value for every 'required' field.\n"
@@ -1265,6 +1328,11 @@ async def _decide_next_action(
         if plan is not None
         else "(plan unavailable)"
     )
+    claim_ledger_text = (
+        claim_ledger.render_for_prompt(limit=8)
+        if claim_ledger is not None
+        else "(claim ledger unavailable)"
+    )
     user_msg = (
         f"USER QUERY:\n{query[:1500]}\n\n"
         f"RESEARCH BRIEF:\n{(research_brief_text or '(none)')[:1500]}\n\n"
@@ -1276,6 +1344,7 @@ async def _decide_next_action(
         f"RETRIEVAL QUALITY (coverage/dispersion/rerank-disagreement per retrieval — thin or rerank-heavy calls are a flag to broaden the next search):\n{retrieval_text}\n\n"
         f"ADAPTIVE STRATEGY HINT (advisory — query-shape router's recommendation):\n  {strategy_text}\n\n"
         f"INVESTIGATION PLAN (your durable mid-loop task list — use 'write_todos' to add/update/complete entries; entries persist across iterations):\n{plan_text}\n\n"
+        f"STRONG-CLAIM LEDGER (verification state of every strong claim retrieved so far; PROVISIONAL claims sourced from abstract/snippet will trigger a forced paper_qa at finalize — verify them yourself first by calling paper_qa with the claim as the question, OR pivot the answer to use less-strong language):\n{claim_ledger_text}\n\n"
         f"WHAT THE INITIAL PLAN PRODUCED:\n{prior_summary[:2000]}\n\n"
         f"SCRATCHPAD SO FAR:\n{pad.render_for_prompt()}\n\n"
         "Now decide your next ACTION. Remember: every 'required' param needs a "

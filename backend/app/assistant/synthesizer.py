@@ -232,6 +232,50 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
             srcs = ", ".join(map(str, c.get("sources") or []))[:120]
             flag = " (addressed by counter-search)" if c.get("addressed") else " (UN-investigated)"
             parts.append(f"    • {span[:220]}{flag} [{srcs}]")
+    # Strong-claim ledger — full-paper verification verdicts. The
+    # synthesizer reads this to distinguish "verified against paper
+    # body" claims (safe to quote firmly) from "provisional / abstract-
+    # only" claims (must be labelled). This block is the structural
+    # anchor for the user's hard requirement: RA must not lean on
+    # abstracts for strong claims without flagging them.
+    claims = (agent_notes or {}).get("claim_ledger") or {}
+    if isinstance(claims, dict) and int(claims.get("total") or 0) > 0:
+        v = int(claims.get("verified_count") or 0)
+        c = int(claims.get("contradicted_count") or 0)
+        u = int(claims.get("unverifiable_count") or 0)
+        p = int(claims.get("provisional_count") or 0)
+        parts.append(
+            f"- STRONG-CLAIM LEDGER: {claims['total']} strong claim(s) tracked — "
+            f"{v} verified against the paper body, {c} contradicted, "
+            f"{u} unverifiable (full-paper check unavailable), {p} still provisional. "
+            "When an answer uses a verified claim it may be stated firmly. "
+            "When an answer uses a provisional / unverifiable claim, you MUST "
+            "explicitly label it as ABSTRACT-ONLY or PROVISIONAL — do not "
+            "present it as if the full paper confirmed it."
+        )
+        if claims.get("contradicted"):
+            parts.append("    Contradicted strong claims (DO NOT repeat without flagging):")
+            for item in claims["contradicted"][:4]:
+                parts.append(
+                    f"      • paper={str(item.get('paper_id',''))[:12]} "
+                    f"claim={str(item.get('span',''))[:200]!r}"
+                )
+        if claims.get("provisional"):
+            parts.append("    Provisional / abstract-only claims (label clearly in the answer):")
+            for item in claims["provisional"][:4]:
+                parts.append(
+                    f"      • paper={str(item.get('paper_id',''))[:12]} "
+                    f"src={item.get('source','?')} "
+                    f"claim={str(item.get('span',''))[:200]!r}"
+                )
+        if claims.get("verified"):
+            parts.append("    Verified strong claims (safe to quote firmly):")
+            for item in claims["verified"][:4]:
+                parts.append(
+                    f"      • paper={str(item.get('paper_id',''))[:12]} "
+                    f"claim={str(item.get('span',''))[:200]!r}"
+                )
+
     # Investigation plan — the model's own mid-loop todo list. We
     # surface OPEN + STUCK items so the answer honestly acknowledges
     # unfinished investigation rather than pretending the loop
@@ -1481,6 +1525,58 @@ def _build_prompt(
         "them into the prose where they fit the question's shape. The goal "
         "is for the reader to know what to implement and what would prove "
         "the design wrong.\n\n"
+        "EVIDENCE vs INFERENCE LABELLING — the reader must always be able "
+        "to tell which is which. Use one of these inline markers when the "
+        "distinction is non-obvious:\n"
+        "  • \"Directly shown by [N]:\" — a claim the cited paper states.\n"
+        "  • \"Reasonable inference from [N], [M]:\" — your synthesis from "
+        "    cited evidence, not a direct quote.\n"
+        "  • \"RA hypothesis (no direct citation):\" — your own speculation "
+        "    beyond what sources show.\n"
+        "  • \"Uncertain:\" — the evidence is mixed / thin and you can't "
+        "    confidently land on either side.\n"
+        "Do not bury a hypothesis inside source-summary prose. A reader "
+        "skimming the answer should be able to identify in two seconds "
+        "what is sourced vs what is RA's own read.\n\n"
+        "PROVISIONAL CLAIMS (full-paper verification gate — read <agent_notes> "
+        "STRONG-CLAIM LEDGER block when present):\n"
+        "  • If a claim is in the PROVISIONAL or UNVERIFIABLE list, do NOT "
+        "    state it as if the cited paper's full body confirms it. Label "
+        "    it: \"(abstract-only)\" or \"(provisional — full-paper "
+        "    verification unavailable)\". The full sentence stays — the "
+        "    label tells the reader the strength of the support.\n"
+        "  • If a claim is in the CONTRADICTED list, do not repeat the "
+        "    original claim without flagging the contradiction; either "
+        "    drop the sentence or write it as \"X was claimed but the full "
+        "    paper's body did not support it\".\n"
+        "  • If a claim is in the VERIFIED list, you may state it firmly.\n\n"
+        "COMPETING EXPLANATIONS — when the evidence surfaced multiple "
+        "candidate bottlenecks / explanations / methods, RANK them by "
+        "EXPLICIT criteria, not by how many papers mention each:\n"
+        "  • Evidence strength (direct + ablation > suggestive + indirect).\n"
+        "  • Causal plausibility (mechanism articulated vs hand-wavy).\n"
+        "  • Practical impact (degree of improvement on realistic tasks).\n"
+        "  • Generality (works across domains / settings vs narrow).\n"
+        "  • Testability (cleanly falsifiable vs vague).\n"
+        "  • Production relevance (only when the question is applied).\n"
+        "State the winning candidate and WHY it ranks above the others on "
+        "these axes. Popularity in retrieved papers is NOT a criterion.\n\n"
+        "PRODUCTION-AWARENESS (only when relevant — DO NOT bolt on a generic "
+        "deployment checklist):\n"
+        "  • If the question is about an applied / deployed AI system "
+        "(serving in production, user-facing, regulated, or under "
+        "operational constraints), discuss the relevant deployment "
+        "concerns: latency, compute, data collection cost, safety, "
+        "monitoring, human override, failure recovery, maintainability, "
+        "evaluation drift — but ONLY the ones that actually matter for "
+        "THIS method on THIS use case. Be specific.\n"
+        "  • If the question is pure research / theory / explanation / "
+        "literature, do NOT inject a production checklist. It is "
+        "off-topic and dilutes the answer.\n"
+        "  • When the user's orientation hint says 'research', lean "
+        "further away from production framing. When it says "
+        "'production', lean further toward it. 'Both' splits the "
+        "difference based on the question shape itself.\n\n"
         "Write your response now:"
     )
 

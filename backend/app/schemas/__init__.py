@@ -250,8 +250,9 @@ class IdeaCapsuleResponse(BaseModel):
     seed_element_ids: list[str]
     status: str
     is_scout_generated: bool = False
-    source_mode: str = "manual"   # "manual" | "auto" | "query"
+    source_mode: str = "manual"   # "manual" | "auto" | "query" | "combined" | "ra_assistant"
     source_query: str | None = None
+    originating_session_id: str | None = None
     deep_dive_content: str | None = None
     deep_dive_status: str = "none"
     created_at: datetime
@@ -283,6 +284,10 @@ class IdeaCapsuleListItem(BaseModel):
     source_mode: str = "manual"
     source_query: str | None = None
     namespace_key: str | None = None
+    # AssistantSession backlink for capsules where ``source_mode ==
+    # "ra_assistant"``. Lets the "From Assistant" view link straight
+    # back to the conversation that produced the idea.
+    originating_session_id: str | None = None
     deep_dive_status: str = "none"
     created_at: datetime
     # Direct parents (only set for combined ideas) — used client-side to

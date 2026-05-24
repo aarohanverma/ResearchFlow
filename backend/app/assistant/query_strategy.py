@@ -38,17 +38,17 @@ from dataclasses import dataclass, field
 class QueryStrategy:
     """Strategy hint surfaced to planner + ReAct loop.
 
-    Fields:
-      shape:           short label for the query class (used in prompts).
-      preferred_tools: ordered list of tool names worth trying first.
-      avoid_tools:     tools that are usually a poor fit for this shape.
-      retrieval_limit: recommended top-N for retrieval calls. Larger for
-                       survey/comparison, smaller for factual lookups.
-      rerank_intensity: "light" | "standard" | "heavy". Lookups need
-                       almost no rerank; comparisons / surveys benefit
-                       from heavy rerank because the long-tail matters.
-      max_iterations:  recommended ReAct iteration cap override.
-      rationale:       one-line explanation for the human reader.
+    Attributes:
+        shape: Short label for the query class (used in prompts).
+        preferred_tools: Ordered list of tool names worth trying first.
+        avoid_tools: Tools that are usually a poor fit for this shape.
+        retrieval_limit: Recommended top-N for retrieval calls. Larger
+            for survey/comparison, smaller for factual lookups.
+        rerank_intensity: ``"light"`` | ``"standard"`` | ``"heavy"``.
+            Lookups need almost no rerank; comparisons / surveys
+            benefit from heavy rerank because the long-tail matters.
+        max_iterations: Recommended ReAct iteration cap override.
+        rationale: One-line explanation for the human reader.
     """
 
     shape: str

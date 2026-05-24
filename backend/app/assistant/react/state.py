@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.assistant.claim_ledger import ClaimLedger
 from app.assistant.contradiction import ContradictionLedger
 from app.assistant.react.investigation_plan import InvestigationPlan
 from app.assistant.retrieval_observability import RetrievalObservability
@@ -79,6 +80,18 @@ class LoopState:
     new_results: dict[str, ToolResult] = field(default_factory=dict)
     ledger: Any = None                # PaperLedger — set in driver
     contradictions: ContradictionLedger = field(default_factory=ContradictionLedger)
+    # Strong-claim ledger powering full-paper verification. Populated
+    # incrementally by FullPaperVerificationMiddleware.after_tool and
+    # consulted at finalize to force paper_qa rounds on any strong
+    # claim whose source is the abstract/snippet (not the chunked
+    # body). See app.assistant.claim_ledger for the data model.
+    claim_ledger: ClaimLedger = field(default_factory=ClaimLedger)
+    # One-shot per turn: the full-paper gate forces at most this many
+    # paper_qa rounds at finalize before giving up and labelling the
+    # remaining strong claims as ``unverifiable`` so the synth can
+    # caveat them. Bounded so a torrent of strong claims can't blow
+    # the iteration budget at the end of a turn.
+    forced_paper_qa: int = 0
     retrieval_obs: RetrievalObservability = field(default_factory=RetrievalObservability)
     tool_fail_counts: dict[str, int] = field(default_factory=dict)
     banned_tools: set[str] = field(default_factory=set)

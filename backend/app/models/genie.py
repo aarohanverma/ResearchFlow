@@ -81,10 +81,22 @@ class IdeaCapsule(Base):
     # Discovery mode
     is_scout_generated: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Origin tag: "manual" | "auto" | "query" | "combined"
+    # Origin tag: "manual" | "auto" | "query" | "combined" | "ra_assistant"
+    # ``ra_assistant`` marks capsules created via the Research Assistant
+    # ReAct loop (genie_synthesize tool) so the Genie Ideas page can
+    # surface a dedicated "From Assistant" section. The originating chat
+    # session is recorded on ``originating_session_id`` so the user can
+    # navigate back to the conversation that produced the idea.
     source_mode: Mapped[str] = mapped_column(String(20), server_default="manual")
     # For query mode: the natural-language query the user typed
     source_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # For ra_assistant mode: the AssistantSession this capsule was
+    # synthesized within. NULL for capsules created outside the RA flow.
+    # Indexed so the "From Assistant" view can list capsules per session
+    # without a sequential scan over the full table.
+    originating_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True,
+    )
 
     # Namespace this capsule belongs to. Stamped at creation so the Ideas
     # list can filter directly per-namespace without traversing seed →

@@ -324,7 +324,27 @@
       "Bash(timeout 120 python -m pytest tests/ -x --tb=line -q)",
       "Bash(timeout 180 python -m pytest tests/ --tb=line -q)",
       "Bash(timeout 60 python -m pytest tests/test_retrieval_observability.py tests/test_provenance_evidence.py tests/test_react_loop.py -v --tb=short)",
-      "Bash(timeout 60 python -m pytest tests/test_hardening_audit3.py -v --tb=short)"
+      "Bash(timeout 60 python -m pytest tests/test_hardening_audit3.py -v --tb=short)",
+      "Bash(.venv/bin/pytest tests/test_react_middleware_chain.py tests/test_react_middleware_units.py tests/test_react_subagents.py tests/test_react_audit_fixes.py tests/test_investigation_plan.py tests/test_contradiction_detection.py -q --no-header)",
+      "Bash(.venv/bin/python -m pytest tests/test_react_middleware_chain.py tests/test_react_middleware_units.py tests/test_react_subagents.py tests/test_react_audit_fixes.py tests/test_investigation_plan.py tests/test_contradiction_detection.py -q --no-header)",
+      "Bash(.venv/bin/python -m pytest tests/ -q --no-header -x --timeout=60)",
+      "Bash(.venv/bin/python -m pytest tests/ -q --no-header -x)",
+      "Bash(.venv/bin/python -m pytest tests/test_hitl_inbox.py tests/test_claim_ledger.py -v --no-header)",
+      "Bash(.venv/bin/python -m pytest tests/test_hitl_inbox.py tests/test_claim_ledger.py -q --no-header)",
+      "Bash(.venv/bin/python -m pytest tests/ -q --no-header)",
+      "Bash(npx --offline tsc --noEmit -p tsconfig.json)",
+      "Bash(awk 'NR<=2752 && /^function /{f=NR\" \"$0} END{print f}' /home/av/Projects/ResearchFlow/frontend/app/\\\\\\(app\\\\\\)/assistant/page.tsx)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, '.'\\); from app.models.paper import Paper; print\\(hasattr\\(Paper, 'user_id'\\)\\)\")",
+      "Bash(timeout 240 python -m pytest tests/test_hitl_inbox.py tests/test_claim_ledger.py -q)",
+      "Bash(timeout 360 python -m pytest -q --tb=no)",
+      "Bash(timeout 300 python -m pytest -q --tb=short)",
+      "Bash(timeout 90 python -m pytest tests/test_claim_ledger.py tests/test_hitl_inbox.py -q)",
+      "Bash(timeout 90 python -m pytest tests/test_full_paper_gate.py tests/test_claim_ledger.py tests/test_hitl_inbox.py -q)",
+      "Bash(awk -F'.' '{print $1}')",
+      "Bash(grep -vE \"^\\(__future__|app|asyncio|abc|base64|collections|contextlib|contextvars|dataclasses|datetime|decimal|enum|functools|hashlib|io|json|logging|math|os|pathlib|random|re|shlex|shutil|tempfile|time|typing|urllib|uuid|weakref|xml|a|an|and|introducing|bookmarked\\)$\")",
+      "Bash(pip3 show *)",
+      "Bash(/usr/bin/python3 -c \"import sphinx; print\\(sphinx.__version__\\); import sphinx_rtd_theme; print\\(sphinx_rtd_theme.__version__\\)\")",
+      "Bash(/usr/bin/python3 -m sphinx -b html docs/sphinx/source /tmp/sphinx_test_out2)"
     ],
     "additionalDirectories": [
       "/tmp"

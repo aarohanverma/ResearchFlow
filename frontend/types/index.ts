@@ -99,8 +99,12 @@ export interface IdeaCapsule {
   seed_element_ids: string[];
   status: "draft" | "saved" | "dismissed";
   is_scout_generated: boolean;
-  source_mode: "manual" | "auto" | "query" | "combined";
+  source_mode: "manual" | "auto" | "query" | "combined" | "ra_assistant";
   source_query: string | null;
+  // Set when the capsule originates from the Research Assistant ReAct
+  // loop. Backlinks to the AssistantSession that produced the idea so
+  // the Genie Ideas "From Assistant" view can navigate back.
+  originating_session_id?: string | null;
   deep_dive_content?: string | null;
   deep_dive_status?: string;
   created_at: string;

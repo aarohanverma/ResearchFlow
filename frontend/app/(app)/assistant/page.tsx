@@ -311,6 +311,24 @@ export default function AssistantPage() {
       iterations?: number;
       finalized?: boolean;
     };
+    // Soft preview + ack gate state for high-impact tools (today:
+    // genie_synthesize). Populated by ``react_hitl_pending`` and
+    // cleared by ``react_hitl_resolved`` / ``react_hitl_timeout``. The
+    // inline card renders only while a pending request exists.
+    hitl?: {
+      requestId: string;
+      tool: string;
+      preview: {
+        summary?: string;
+        intent?: string;
+        seeds?: { paper_id: string; title: string; namespace?: string }[];
+        seed_count?: number;
+      };
+      ackWindowSec: number;
+      expiresAt: number;   // Date.now() epoch ms
+      resolving?: boolean;
+      resolvedAs?: "approve" | "skip" | "modify" | "timeout";
+    };
   }>>({});
   const [streamingContent, setStreamingContent] = useState<Record<string, string>>({});
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -658,6 +676,64 @@ export default function AssistantPage() {
                   },
                 },
               }));
+            } catch { /* ignore */ }
+          } else if (kind === "react_hitl_pending") {
+            // Soft preview + ack gate for genie_synthesize. The loop
+            // is paused server-side for ``ack_window_sec`` seconds —
+            // we render an inline card with Approve / Skip. Doing
+            // nothing lets the loop proceed automatically.
+            try {
+              const d = JSON.parse(dataPayload);
+              const ackWindow = typeof d.ack_window_sec === "number" ? d.ack_window_sec : 10;
+              setLiveJobData(prev => ({
+                ...prev,
+                [jobId]: {
+                  ...(prev[jobId] || {}),
+                  hitl: {
+                    requestId: String(d.request_id),
+                    tool: String(d.tool),
+                    preview: d.preview || {},
+                    ackWindowSec: ackWindow,
+                    expiresAt: Date.now() + ackWindow * 1000,
+                  },
+                },
+              }));
+            } catch { /* ignore */ }
+          } else if (kind === "react_hitl_resolved" || kind === "react_hitl_timeout") {
+            try {
+              const d = JSON.parse(dataPayload);
+              const status = kind === "react_hitl_timeout" ? "timeout" : String(d.status || "approve");
+              setLiveJobData(prev => {
+                const existing = prev[jobId]?.hitl;
+                // Don't blow away a fresh slot with a stale event from
+                // a previous request_id — the gate can fire more than
+                // once per turn if the model emits multiple genie
+                // synthesise calls.
+                if (!existing || existing.requestId !== String(d.request_id)) {
+                  return prev;
+                }
+                return {
+                  ...prev,
+                  [jobId]: {
+                    ...(prev[jobId] || {}),
+                    hitl: {
+                      ...existing,
+                      resolvedAs: status as "approve" | "skip" | "modify" | "timeout",
+                    },
+                  },
+                };
+              });
+              // Card fades after a short delay so the user sees the resolution.
+              setTimeout(() => {
+                setLiveJobData(prev => {
+                  const existing = prev[jobId]?.hitl;
+                  if (!existing || existing.requestId !== String(d.request_id)) {
+                    return prev;
+                  }
+                  const { hitl: _drop, ...rest } = prev[jobId] || {};
+                  return { ...prev, [jobId]: rest };
+                });
+              }, 2400);
             } catch { /* ignore */ }
           }
           if (kind === "task_completed" || kind === "task_failed" || kind === "task_cancelled") {
@@ -1407,6 +1483,7 @@ export default function AssistantPage() {
                 onOpenPaper={openPaperById}
                 liveJobData={liveJobData}
                 streamingContent={streamingContent}
+                sessionId={activeId ?? ""}
                 stickyNotes={stickyNotes.filter(n => n.messageId === msg.id)}
                 onAddNote={() => addStickyNote(msg.id)}
                 onUpdateNote={updateStickyNote}
@@ -2587,7 +2664,7 @@ function popoverSubmitStyle(enabled: boolean): React.CSSProperties {
 
 function MessageBlock({
   msg, steps, tasks, onSuggestionClick, onBranch, onCancel, onOpenPaper,
-  liveJobData, streamingContent,
+  liveJobData, streamingContent, sessionId,
   stickyNotes = [], onAddNote, onUpdateNote, onDeleteNote,
   highlightsForMessage, searchQuery, searchCaseSensitive, searchWholeWord, highlightModeActive, onRemoveHighlight,
   onEditUser, onRegenerate,
@@ -2600,6 +2677,11 @@ function MessageBlock({
   onCancel: (jobId: string) => void;
   onOpenPaper: (paperId: string) => void;
   liveJobData: Record<string, { rationale?: string; plannedSteps?: { tool: string; title: string }[]; actions?: string[] }>;
+  // Active session id — threaded so the HITL ack card can POST to
+  // ``/assistant/sessions/{sessionId}/hitl/{requestId}``. Empty string
+  // when no session is selected (the strip renders without the card
+  // in that case).
+  sessionId: string;
   streamingContent: Record<string, string>;
   stickyNotes?: StickyNote[];
   onAddNote?: () => void;
@@ -2673,6 +2755,7 @@ function MessageBlock({
               onCancel={() => onCancel(taskForMsg.job_id)}
               liveData={liveJobData[taskForMsg.job_id]}
               messagePayload={msg.payload}
+              sessionId={sessionId}
             />
           )}
           {isUser && editing ? (
@@ -2802,8 +2885,167 @@ function MessageBlock({
   );
 }
 
+function HitlAckCard({
+  sessionId,
+  hitl,
+}: {
+  sessionId: string;
+  hitl: {
+    requestId: string;
+    tool: string;
+    preview: {
+      summary?: string;
+      intent?: string;
+      seeds?: { paper_id: string; title: string; namespace?: string }[];
+      seed_count?: number;
+    };
+    ackWindowSec: number;
+    expiresAt: number;
+    resolving?: boolean;
+    resolvedAs?: "approve" | "skip" | "modify" | "timeout";
+  };
+}) {
+  // Live countdown — recomputed every ~250ms so the card shows a
+  // ticking number rather than a stale snapshot. Caps at 0 visually
+  // (the loop's timeout already fires server-side; this is cosmetic).
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, []);
+  const [busy, setBusy] = useState(false);
+  const [errored, setErrored] = useState<string | null>(null);
+  const remainingMs = Math.max(0, hitl.expiresAt - now);
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  const resolved = hitl.resolvedAs;
+
+  async function send(status: "approve" | "skip") {
+    if (busy || resolved) return;
+    setBusy(true);
+    setErrored(null);
+    try {
+      await api.post(
+        `/assistant/sessions/${sessionId}/hitl/${hitl.requestId}`,
+        { status },
+      );
+    } catch (exc: unknown) {
+      const msg = exc instanceof Error ? exc.message : String(exc);
+      setErrored(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const resolvedLabel: Record<string, string> = {
+    approve: "Approved — running synthesis…",
+    skip: "Skipped — dropping the call.",
+    modify: "Approved (modified params) — running synthesis…",
+    timeout: "No response — proceeding with original params.",
+  };
+
+  return (
+    <div style={{
+      fontSize: "11px",
+      padding: "8px 10px",
+      borderRadius: 6,
+      borderLeft: "3px solid #f59e0b",
+      background: "rgba(245,158,11,0.06)",
+      marginBottom: 4,
+      display: "flex", flexDirection: "column", gap: 6,
+      color: "var(--rf-text2)",
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        fontWeight: 700, color: "#f59e0b",
+      }}>
+        <span>
+          Approval requested · {hitl.tool}
+          {resolved ? ` · ${resolved}` : ""}
+        </span>
+        {!resolved && (
+          <span style={{ fontSize: "10px", color: "var(--rf-text4)", fontWeight: 500 }}>
+            auto-proceeds in {remainingSec}s
+          </span>
+        )}
+      </div>
+      {hitl.preview.summary && (
+        <div style={{ color: "var(--rf-text3)" }}>
+          {hitl.preview.summary}
+        </div>
+      )}
+      {hitl.preview.intent && (
+        <div style={{
+          fontStyle: "italic", color: "var(--rf-text4)", fontSize: "10.5px",
+          padding: "3px 6px", borderRadius: 4, background: "var(--rf-surface3)",
+        }}>
+          Intent: {hitl.preview.intent}
+        </div>
+      )}
+      {hitl.preview.seeds && hitl.preview.seeds.length > 0 && (
+        <div style={{
+          display: "flex", flexDirection: "column", gap: 2,
+          fontSize: "10.5px", color: "var(--rf-text3)",
+        }}>
+          <div style={{ fontWeight: 600 }}>
+            Seed papers ({hitl.preview.seed_count ?? hitl.preview.seeds.length}):
+          </div>
+          {hitl.preview.seeds.slice(0, 5).map((s, i) => (
+            <div key={s.paper_id || i} style={{
+              paddingLeft: 8, color: "var(--rf-text4)",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+              • {s.title || "(untitled)"}
+              {s.namespace ? <span style={{ color: "var(--rf-text5)" }}> [{s.namespace}]</span> : null}
+            </div>
+          ))}
+          {hitl.preview.seeds.length > 5 && (
+            <div style={{ paddingLeft: 8, color: "var(--rf-text5)" }}>
+              … and {hitl.preview.seeds.length - 5} more
+            </div>
+          )}
+        </div>
+      )}
+      {!resolved && (
+        <div style={{ display: "flex", gap: 6, marginTop: 2 }}>
+          <button
+            onClick={() => send("approve")}
+            disabled={busy}
+            style={{
+              fontSize: "10.5px", padding: "4px 10px", borderRadius: 4,
+              background: "rgba(34,197,94,0.15)", color: "#22c55e",
+              border: "1px solid rgba(34,197,94,0.4)", cursor: busy ? "wait" : "pointer",
+              fontWeight: 700,
+            }}
+          >Approve</button>
+          <button
+            onClick={() => send("skip")}
+            disabled={busy}
+            style={{
+              fontSize: "10.5px", padding: "4px 10px", borderRadius: 4,
+              background: "rgba(239,68,68,0.1)", color: "#ef4444",
+              border: "1px solid rgba(239,68,68,0.3)", cursor: busy ? "wait" : "pointer",
+              fontWeight: 700,
+            }}
+          >Skip</button>
+          <span style={{ flex: 1 }} />
+          {errored && (
+            <span style={{ color: "#ef4444", fontSize: "10px" }}>
+              {errored.slice(0, 80)}
+            </span>
+          )}
+        </div>
+      )}
+      {resolved && (
+        <div style={{ color: "var(--rf-text4)", fontSize: "10.5px", fontStyle: "italic" }}>
+          {resolvedLabel[resolved]}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ReasoningStrip({
-  task, steps, onCancel, liveData, messagePayload,
+  task, steps, onCancel, liveData, messagePayload, sessionId,
 }: {
   task: AssistantTask;
   steps: AssistantStep[];
@@ -2821,8 +3063,23 @@ function ReasoningStrip({
       iterations?: number;
       finalized?: boolean;
     };
+    hitl?: {
+      requestId: string;
+      tool: string;
+      preview: {
+        summary?: string;
+        intent?: string;
+        seeds?: { paper_id: string; title: string; namespace?: string }[];
+        seed_count?: number;
+      };
+      ackWindowSec: number;
+      expiresAt: number;
+      resolving?: boolean;
+      resolvedAs?: "approve" | "skip" | "modify" | "timeout";
+    };
   };
   messagePayload?: Record<string, unknown>;
+  sessionId: string;
 }) {
   const isInflight = task.status === "running" || task.status === "pending";
   // Open while a task is in-flight so the user can see progress; collapse
@@ -2933,6 +3190,12 @@ function ReasoningStrip({
                 <div><span style={{ fontWeight: 700, color: "#a78bfa" }}>OBSERVATION</span> ({liveData.react.lastObservation.tool}): {(liveData.react.lastObservation.summary || "").slice(0, 240)}</div>
               )}
             </div>
+          )}
+          {liveData?.hitl && sessionId && (
+            <HitlAckCard
+              sessionId={sessionId}
+              hitl={liveData.hitl}
+            />
           )}
           {/* DB steps (ground truth — available once steps start writing to DB) */}
           {orderedSteps.length > 0 && orderedSteps.map(s => (

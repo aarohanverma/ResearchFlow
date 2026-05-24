@@ -1106,6 +1106,14 @@ async def _save_capsule(state: GenieState) -> GenieState:
             source_mode=state.get("source_mode", "manual"),
             source_query=state.get("source_query", "") or None,
             namespace_key=(state.get("namespace_key") or "").strip() or None,
+            # When the synthesis was kicked off by the Research Assistant
+            # ReAct loop, record the originating chat session so the Genie
+            # Ideas "From Assistant" view can backlink to the conversation.
+            originating_session_id=(
+                UUID(state["originating_session_id"])
+                if state.get("originating_session_id")
+                else None
+            ),
             status="draft",
         )
         db.add(capsule)
@@ -1166,6 +1174,7 @@ async def run_genie_background(
     sem_threshold: float = 0.25,
     source_mode: str = "manual",
     source_query: str = "",
+    originating_session_id: str | None = None,
 ) -> None:
     """Background synthesis — runs pipeline, updates GenieSession on completion.
 
@@ -1192,6 +1201,7 @@ async def run_genie_background(
         "expertise_level": expertise_level,
         "source_mode": source_mode,
         "source_query": source_query,
+        "originating_session_id": originating_session_id,
         "context_chunks": [],
         "bridge_concepts": [],
         "candidate_hypotheses": [],

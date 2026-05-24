@@ -255,6 +255,66 @@ async def cancel_task(job_id: str, user_id: CurrentUserID):
     return {"status": "cancelled", "job_id": job_id}
 
 
+class HitlDecisionRequest(BaseModel):
+    """User decision on a paused RA HITL gate.
+
+    ``status`` is one of:
+
+    * ``approve``  — proceed with the tool's original params.
+    * ``skip``     — drop the dispatch; the loop records the veto
+                     and continues.
+    * ``modify``   — proceed with ``params`` overriding the originals
+                     (e.g. user edited the seed paper set).
+    """
+
+    status: str
+    params: dict | None = None
+    note: str | None = None
+
+
+@router.post("/sessions/{session_id}/hitl/{request_id}", status_code=200)
+async def resolve_hitl(
+    session_id: UUID,
+    request_id: str,
+    body: HitlDecisionRequest,
+    user_id: CurrentUserID,
+):
+    """Resolve a paused HITL approval slot.
+
+    The RA's HITL gate middleware registered ``request_id`` and is
+    currently awaiting a decision. Once we resolve here, the loop
+    fans out to approve / skip / modify and continues.
+
+    Returns a single uniform 404 ("HITL slot unknown or expired")
+    whenever the slot cannot be resolved — whether it never existed,
+    has already been resolved, has timed out, or is owned by a
+    different (session, user). Distinct error strings would let a
+    caller probe for the existence of request_ids belonging to other
+    sessions; the request_id is a UUID so brute-force enumeration is
+    infeasible, but we collapse the responses for defence-in-depth.
+    """
+    from app.assistant.hitl_inbox import HitlDecision, resolve
+
+    status = (body.status or "").strip().lower()
+    if status not in {"approve", "skip", "modify"}:
+        raise HTTPException(status_code=400, detail="status must be approve|skip|modify")
+
+    decision = HitlDecision(
+        status=status,
+        params=(body.params if status == "modify" else None),
+        note=(body.note or "")[:240],
+    )
+    ok = resolve(
+        request_id=request_id,
+        session_id=str(session_id),
+        user_id=str(user_id),
+        decision=decision,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="HITL slot unknown or expired")
+    return {"status": "ok", "decision": status}
+
+
 class AssistantReplayRequest(BaseModel):
     """Edit a user turn (``content`` set) or regenerate an assistant turn (``content`` omitted)."""
 

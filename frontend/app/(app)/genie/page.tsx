@@ -213,6 +213,15 @@ export default function GeniePage() {
   // Hybrid client-side search over the Ideas list — filters on title,
   // hypothesis, open_questions, and source_query as the user types.
   const [ideaSearch, setIdeaSearch] = useState("");
+  // Source filter — chip row on the Ideas tab. ``all`` shows
+  // everything; ``ra_assistant`` shows only capsules originated from
+  // the Research Assistant ReAct loop (the "From Assistant" view the
+  // RA overhaul exposes); ``manual`` / ``auto`` / ``combined``
+  // discriminate the other origins for users who want to triage by
+  // how the idea was produced. Client-side filter so the SWR cache
+  // and the namespace filter stay untouched.
+  type SourceFilter = "all" | "ra_assistant" | "manual" | "auto" | "combined";
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const toggleCombineSelect = useCallback((capsuleId: string) => {
     setCombineSelected(prev => {
       if (prev.includes(capsuleId)) return prev.filter(id => id !== capsuleId);
@@ -1352,23 +1361,66 @@ export default function GeniePage() {
                 questions, and source_query. Matches the Feed search UX —
                 instant filter as the user types, no extra round-trip. */}
             {!capsulesLoading && capsules.length > 0 && (
-              <div className="mb-5 relative">
-                <SearchIcon size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600 pointer-events-none" />
-                <input
-                  value={ideaSearch}
-                  onChange={(e) => setIdeaSearch(e.target.value)}
-                  placeholder="Search ideas by title, hypothesis, question…"
-                  className="w-full bg-gray-900/60 border border-white/8 rounded-xl pl-9 pr-9 py-2.5 text-sm text-gray-100 placeholder:text-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
-                />
-                {ideaSearch && (
-                  <button
-                    onClick={() => setIdeaSearch("")}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
-                    title="Clear search"
-                  >
-                    <XIcon size={13} />
-                  </button>
-                )}
+              <div className="mb-5 flex flex-col gap-2">
+                <div className="relative">
+                  <SearchIcon size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600 pointer-events-none" />
+                  <input
+                    value={ideaSearch}
+                    onChange={(e) => setIdeaSearch(e.target.value)}
+                    placeholder="Search ideas by title, hypothesis, question…"
+                    className="w-full bg-gray-900/60 border border-white/8 rounded-xl pl-9 pr-9 py-2.5 text-sm text-gray-100 placeholder:text-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
+                  />
+                  {ideaSearch && (
+                    <button
+                      onClick={() => setIdeaSearch("")}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                      title="Clear search"
+                    >
+                      <XIcon size={13} />
+                    </button>
+                  )}
+                </div>
+                {/* Source filter chips. The 'From Assistant' chip is the
+                    primary lever the RA overhaul exposes — it surfaces
+                    capsules produced by the Research Assistant ReAct
+                    loop, with the originating chat session reachable
+                    from each card. */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {([
+                    { key: "all" as SourceFilter, label: "All sources",
+                      count: capsules.length },
+                    { key: "ra_assistant" as SourceFilter, label: "From Assistant",
+                      count: capsules.filter(c => c.source_mode === "ra_assistant").length },
+                    { key: "manual" as SourceFilter, label: "Manual",
+                      count: capsules.filter(c => c.source_mode === "manual").length },
+                    { key: "auto" as SourceFilter, label: "Auto",
+                      count: capsules.filter(c => c.source_mode === "auto" || c.is_scout_generated).length },
+                    { key: "combined" as SourceFilter, label: "Combined",
+                      count: capsules.filter(c => c.source_mode === "combined").length },
+                  ]).filter(o => o.key === "all" || o.count > 0).map(opt => {
+                    const active = sourceFilter === opt.key;
+                    return (
+                      <button
+                        key={opt.key}
+                        onClick={() => setSourceFilter(opt.key)}
+                        className={
+                          "text-[11px] px-2.5 py-1 rounded-full border transition-colors " +
+                          (active
+                            ? "bg-indigo-600/30 text-indigo-100 border-indigo-500/60"
+                            : "bg-gray-900/40 text-gray-400 border-white/8 hover:text-gray-200 hover:border-white/20")
+                        }
+                        title={opt.key === "ra_assistant"
+                          ? "Show only ideas synthesised by the Research Assistant"
+                          : `Filter by ${opt.label}`}
+                      >
+                        {opt.label}
+                        <span className={"ml-1 font-mono " + (active ? "text-indigo-300/80" : "text-gray-600")}>
+                          {opt.count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             )}
             {capsulesLoading ? (
@@ -1448,8 +1500,17 @@ export default function GeniePage() {
 
                 {(() => {
                   const searchQ = ideaSearch.trim().toLowerCase();
+                  // Source-filter chip first, then keyword search.
+                  // Both are client-side so the namespace SWR cache
+                  // stays untouched.
+                  const sourceFiltered = capsules.filter((c) => {
+                    if (sourceFilter === "all") return true;
+                    if (sourceFilter === "ra_assistant") return c.source_mode === "ra_assistant";
+                    if (sourceFilter === "auto") return c.source_mode === "auto" || c.is_scout_generated;
+                    return c.source_mode === sourceFilter;
+                  });
                   const filtered = searchQ
-                    ? capsules.filter((c) => {
+                    ? sourceFiltered.filter((c) => {
                         const hay = [
                           c.title,
                           c.hypothesis,
@@ -1462,7 +1523,7 @@ export default function GeniePage() {
                           .toLowerCase();
                         return hay.includes(searchQ);
                       })
-                    : capsules;
+                    : sourceFiltered;
                   // Build ancestor sets so combined ideas can't be re-fused with
                   // any of their own ancestors (or vice-versa). Walks
                   // `parent_capsule_ids` transitively over the visible capsules.
@@ -1892,8 +1953,22 @@ function CapsuleCard({
                   ✓ Saved
                 </span>
               )}
-              {/* Mode tag — Manual / Auto / Query / Combined */}
-              {capsule.source_mode === "combined" ? (
+              {/* Mode tag — Manual / Auto / Query / Combined / From Assistant */}
+              {capsule.source_mode === "ra_assistant" ? (
+                capsule.originating_session_id ? (
+                  <a
+                    href={`/assistant?session=${capsule.originating_session_id}`}
+                    className="text-[10px] bg-amber-900/40 text-amber-300 border border-amber-700/40 px-2 py-0.5 rounded-full font-semibold hover:bg-amber-900/60 transition-colors"
+                    title="Open the chat session that produced this idea"
+                  >
+                    🤖 From Assistant
+                  </a>
+                ) : (
+                  <span className="text-[10px] bg-amber-900/40 text-amber-300 border border-amber-700/40 px-2 py-0.5 rounded-full font-semibold">
+                    🤖 From Assistant
+                  </span>
+                )
+              ) : capsule.source_mode === "combined" ? (
                 <span className="text-[10px] bg-fuchsia-900/40 text-fuchsia-300 border border-fuchsia-700/30 px-2 py-0.5 rounded-full font-semibold">
                   🔗 Combined
                 </span>

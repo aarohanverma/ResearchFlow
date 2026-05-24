@@ -25,6 +25,8 @@ from app.assistant.react.middlewares.base import NoopMiddleware
 from app.assistant.react.middlewares.contradiction_mw import ContradictionMiddleware
 from app.assistant.react.middlewares.critic_gate import CriticGateMiddleware
 from app.assistant.react.middlewares.diminishing_returns import DiminishingReturnsMiddleware
+from app.assistant.react.middlewares.full_paper_gate import FullPaperVerificationMiddleware
+from app.assistant.react.middlewares.hitl_gate import HitlGateMiddleware
 from app.assistant.react.middlewares.observability_mw import RetrievalObservabilityMiddleware
 from app.assistant.react.middlewares.paper_ledger import PaperLedgerMiddleware
 from app.assistant.react.middlewares.param_preflight import ParamPreflightMiddleware
@@ -58,11 +60,23 @@ def default_chain_factory(
     return [
         ParamPreflightMiddleware(),
         ToolBanMiddleware(),
+        # HITL gate sits after param-fixing / tool-ban so it never
+        # pauses the user on a dispatch the downstream chain would
+        # have aborted anyway. Runs before redundancy/ledger so the
+        # ledger view in the gate preview is the same the model saw.
+        HitlGateMiddleware(),
         DiminishingReturnsMiddleware(),
         PaperLedgerMiddleware(),
         RetrievalObservabilityMiddleware(),
         CriticGateMiddleware(),
         ContradictionMiddleware(enable_semantic_llm=enable_semantic_contradiction),
+        # Full-paper verification fires at finalize: it inspects every
+        # strong claim the loop is about to ship and forces a
+        # ``paper_qa`` round on any that lack chunk-level evidence.
+        # Lives at the end so contradiction-forced counter-searches
+        # land first (they may resolve a strong claim outright,
+        # avoiding a redundant paper_qa pass).
+        FullPaperVerificationMiddleware(),
     ]
 
 
@@ -70,6 +84,8 @@ __all__ = [
     "ContradictionMiddleware",
     "CriticGateMiddleware",
     "DiminishingReturnsMiddleware",
+    "FullPaperVerificationMiddleware",
+    "HitlGateMiddleware",
     "NoopMiddleware",
     "PaperLedgerMiddleware",
     "ParamPreflightMiddleware",

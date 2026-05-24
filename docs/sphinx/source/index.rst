@@ -18,12 +18,15 @@ module, class, and function in the backend.
    api/workflows.study
    api/workflows.rag
    api/workflows.genie
+   api/workflows.genie_combine
+   api/workflows.folder_consolidation
 
 .. toctree::
    :maxdepth: 3
    :caption: Workflows — Media Generation
 
    api/workflows._generation_runtime
+   api/workflows._generation_prompts
    api/workflows.podcast
    api/workflows.slides
 
@@ -43,10 +46,12 @@ module, class, and function in the backend.
    api/api.v1.settings
    api/api.v1.generate
    api/api.v1.assistant
+   api/api.v1.admin
+   api/api.v1.dev
 
 .. toctree::
    :maxdepth: 3
-   :caption: Research Assistant
+   :caption: Research Assistant — Orchestration
 
    api/assistant.orchestrator
    api/assistant.planner
@@ -58,6 +63,40 @@ module, class, and function in the backend.
    api/assistant.step_cache
    api/assistant.session_metadata
    api/assistant.interest_updater
+   api/assistant.intent
+   api/assistant.persona
+   api/assistant.prompt_safety
+   api/assistant.query_strategy
+   api/assistant.research_brief
+   api/assistant.branch_context
+   api/assistant.state_lock
+   api/assistant.telemetry
+   api/assistant.tuning
+   api/assistant.clarify
+   api/assistant.reflection
+   api/assistant.repair_drift
+   api/assistant.provenance
+   api/assistant.auto_memory
+   api/assistant.semantic_memory
+   api/assistant.memory_consolidation
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Research Assistant — ReAct loop & middlewares
+
+   api/assistant.react_loop
+   api/assistant.react
+   api/assistant.react.middlewares
+   api/assistant.scratchpad
+   api/assistant.retrieval_observability
+   api/assistant.contradiction
+   api/assistant.claim_ledger
+   api/assistant.hitl_inbox
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Research Assistant — Tools
+
    api/assistant.tools.base
    api/assistant.tools.registry
 
@@ -86,6 +125,10 @@ module, class, and function in the backend.
    api/services.content_loader
    api/services.job_store
    api/services.research_assistant
+   api/services.arxiv_import
+   api/services.semantic_chunker
+   api/services.feature_flags
+   api/services.admin_settings
 
 .. toctree::
    :maxdepth: 3
@@ -114,6 +157,8 @@ module, class, and function in the backend.
    api/models.workflow
    api/models.artifact
    api/models.assistant
+   api/models.admin
+   api/models.rbac
 
 .. toctree::
    :maxdepth: 2

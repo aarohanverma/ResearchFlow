@@ -87,17 +87,22 @@ class MediaGenerateTool:
 
         await ctx.emit_progress(15, f"Validating {len(params.paper_ids)} paper(s) for {params.media_type} generation…")
 
-        # Validate all paper IDs belong to this user
+        # Validate every supplied paper id resolves to an existing Paper
+        # row. Papers are global rather than user-scoped (the model has
+        # no user_id column), so the gate here is mere existence — access
+        # control happens upstream via namespace subscription and HITL
+        # confirmation in the assistant flow. The previous form filtered
+        # by ``Paper.user_id == ctx.user_id``, which raised
+        # ``AttributeError`` at SQLAlchemy attribute access; the
+        # exception was caught here and surfaced as "no valid papers
+        # found", silently disabling media generation entirely.
         valid_paper_ids: list[str] = []
         paper_titles: list[str] = []
         for pid_str in params.paper_ids:
             try:
                 pid = UUID(pid_str.strip())
                 result = await ctx.db.execute(
-                    select(Paper.id, Paper.title).where(
-                        Paper.id == pid,
-                        Paper.user_id == ctx.user_id,
-                    )
+                    select(Paper.id, Paper.title).where(Paper.id == pid)
                 )
                 row = result.one_or_none()
                 if row:

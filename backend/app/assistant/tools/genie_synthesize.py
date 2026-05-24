@@ -139,8 +139,13 @@ class GenieSynthesizeTool:
                 gid,
                 seed_element_ids,
                 ctx.namespace_key,
-                source_mode="query",
+                # ``ra_assistant`` is the canonical origin tag for capsules
+                # created via the Research Assistant ReAct loop. The Genie
+                # Ideas page filters on this to render a dedicated "From
+                # Assistant" section grouped by originating session.
+                source_mode="ra_assistant",
                 source_query=params.query,
+                originating_session_id=str(ctx.session_id),
             ),
             name=f"ra:genie:{gid}",
         )

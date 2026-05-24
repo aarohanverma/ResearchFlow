@@ -85,7 +85,7 @@ It runs entirely on your own infrastructure — local Docker for development, fo
 | **Audio Podcast** | One-click podcast generation from any paper or Genie capsule. Multi-speaker HOST/EXPERT teaching conversation, expertise-adapted depth, orientation-shaped emphasis, OpenAI TTS voices. Runs in background; embeds in-page audio player when complete. |
 | **Slide Deck** | Marp-based slide deck generation. LLM plans and writes a presentation-grade deck (12–18 slides) with equations, results tables, diagrams, and methodology breakdown. Density guards prevent overflow. Rendered to standalone HTML via marp-cli (falls back to raw Markdown). |
 | **Annotations** | Highlight text in any paper and attach personal notes, accessible from the Paper Detail panel. |
-| **Research Assistant** | Persistent AI-native research workspace. Each session is a long-running investigation: messages, branching, background tool execution, retrieved papers, and synthesized artifacts all attached to one durable session. The assistant uses an LLM planner (with heuristic fallback) that selects from 30+ registered tools per turn — deep search, arXiv import, frontier scan, Genie synthesis, concept explanation, paper comparison, web search, domain-specific tools (PubMed, NASA ADS, INSPIRE HEP, FRED, NVD CVE, ClinicalTrials, GitHub, HuggingFace, Wolfram Alpha), and more. Each tool call writes a checkpointed `AssistantStep` row; a crashed worker resumes from the last completed step on restart. Sessions can be branched (up to 3 levels deep) from any message. Rolling conversation history is lazily compressed via LLM summarization. File uploads (PDF, image, DOCX, plain text, code) are parsed and attached as session-scoped context. Every assistant turn streams typed `AssistantEvent` objects over SSE. |
+| **Research Assistant** | Persistent AI-native research workspace. Each session is a long-running investigation: messages, branching, background tool execution, retrieved papers, and synthesized artifacts all attached to one durable session. The assistant uses an LLM planner (with heuristic fallback) that selects from **41 registered tools** per turn — deep search, arXiv import, frontier scan, Genie synthesis (with **HITL approval gate**), concept explanation, paper comparison, web search, domain-specific tools (PubMed, NASA ADS, INSPIRE HEP, FRED, NVD CVE, ClinicalTrials, GitHub, HuggingFace, Wolfram Alpha), and more. On deep-tier turns a **ReAct mid-turn loop** (max 8 iterations, 90 s deadline) lets the model fan out, spawn context-quarantined subagents, run inline critique, and force full-paper verification on strong numeric / SOTA / causal claims through a 9-step middleware chain (param hygiene → tool ban → HITL gate → diminishing returns → paper ledger → retrieval observability → critic gate → contradiction detector → full-paper claim gate). Each tool call writes a checkpointed `AssistantStep` row; a crashed worker resumes from the last completed step on restart (tasks younger than 2 h are resumed automatically; older are marked failed). Sessions can be branched (up to 3 levels deep) from any message. Rolling conversation history is lazily compressed via LLM summarization (verbatim window: last 10 messages; summary regenerated only when older messages fall out of the window). File uploads (PDF, image, DOCX, plain text, code; 25 MB cap) are parsed and attached as session-scoped context. Every assistant turn streams typed `AssistantEvent` objects over SSE (plan, step, ReAct, HITL, message_delta). |
 | **Token Usage** | Per-call accounting of every LLM completion (input/output tokens, model, cost estimate, latency). Settings → **Token Usage** tab shows totals, daily bar chart, per-workflow and per-model breakdowns. Defaults to today; supports custom date ranges with quick presets (7 days, 30 days, year). |
 | **Settings** | Provider config, topic subscriptions, notifications, manual RSS refresh. |
 
@@ -158,27 +158,44 @@ is cut off.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Frontend  — Next.js App Router (TypeScript, React, Framer)      │
+│  Frontend  — Next.js 14 App Router (TypeScript, React, Framer)   │
 ├──────────────────────────────────────────────────────────────────┤
-│  API Layer — FastAPI async routers  (JWT auth, SSE, DI)          │
-│              /feed · /study · /rag · /genie · /generate          │
+│  API Layer — FastAPI async routers (JWT auth, SSE, DI)           │
+│   /auth · /feed · /papers · /study · /search · /bookmarks        │
+│   /chat · /graph · /genie · /settings · /generate                │
+│   /assistant (sessions/messages/steps/SSE/HITL/attachments)      │
+│   /admin (panel + global settings) · /dev (gated)                │
 ├──────────────────────────────────────────────────────────────────┤
-│  Workflows — LangGraph StateGraph (6) + async generators         │
-│    Ingestion · Study · RAG · Podcast · Slides                    │
-│    FolderConsolidation (coherence + cross-paper synthesis)       │
-│    Genie · Deep Dive (custom async streaming generators)         │
+│  Workflows — 6 LangGraph StateGraphs + async generators          │
+│   Ingestion · Study · RAG · Podcast · Slides                     │
+│   FolderConsolidation                                            │
+│   Genie · Genie-Combine · Deep Dive (async streaming generators) │
 ├──────────────────────────────────────────────────────────────────┤
-│  Services / Adapters — Scoring · GraphService                    │
-│    LLM (OpenAI/Anthropic/Google)                                 │
-│    Embedding (Gemini/OpenAI) · TTS (OpenAI)                      │
-│    PDF (Docling/Marker/Gemini Vision) · Slides (Marp)            │
-│    Blob · Cache · Email                                          │
-│    Sources (arXiv RSS / MCP)                                     │
+│  Research Assistant — Persistent agentic workspace               │
+│   LLMPlanner (+ HeuristicPlanner fallback)                       │
+│   Orchestrator (parallel waves · 12-step / 180 s / 3-empty caps) │
+│   ReAct loop (8 iters / 90 s / 9-middleware chain)               │
+│   41-tool registry · namespace packs                             │
+│   Synthesizer + claim ledger + provenance + repair-drift         │
+│   Recovery · Step cache · SSE bus · HITL inbox                   │
 ├──────────────────────────────────────────────────────────────────┤
-│  Repositories — Paper · Vector · Search · Graph · Workflow       │
-│                 Artifact  (only layer that issues SQL)            │
+│  Services / Adapters                                             │
+│   LLM (OpenAI/Anthropic/Google + tracking decorator)             │
+│   Embedding (OpenAI text-embedding-3-large / Gemini)             │
+│   TTS (OpenAI) · Slides (Marp) · Image (gpt-image-2)             │
+│   PDF (Marker/Docling/Gemini Vision — fallback chain)            │
+│   Web search (Exa/Tavily/DuckDuckGo, auto-best)                  │
+│   Cache (local file / Redis) · Blob (local / Azure)              │
+│   Email (Resend) · Sources (arXiv RSS / MCP)                     │
 ├──────────────────────────────────────────────────────────────────┤
-│  Database — PostgreSQL + pgvector  +  generated_artifacts table  │
+│  Repositories — Paper · Vector · Search · Graph · User           │
+│                 Workflow · Artifact · Assistant                  │
+│                 (only layer that issues SQL)                      │
+├──────────────────────────────────────────────────────────────────┤
+│  Database — PostgreSQL 16 + pgvector (HNSW idx) + pg_trgm        │
+│             tables: papers, paper_chunks, summaries, …           │
+│             assistant_*, idea_capsules, generated_artifacts,     │
+│             langgraph_checkpoints (3 tables for resume), …       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -363,7 +380,7 @@ Wait for all three services to become healthy (watch `docker compose ps`), then 
 |---|---|
 | `Dockerfile.backend` | Multi-stage Python 3.11 production image — installs all deps, copies source, runs uvicorn with 2 workers |
 | `Dockerfile.frontend` | Multi-stage Next.js 20 production image — builds with `npm run build`, runs with `next start` (node_modules kept in image) |
-| `docker-compose.yml` | Orchestrates PostgreSQL + pgvector, Redis, backend, and frontend with healthchecks and named volumes |
+| `docker-compose.yml` | Orchestrates **PostgreSQL + pgvector**, **Redis**, an **arxiv-mcp sidecar** (`mcp/arxiv-mcp-server:latest`, kept alive for ad-hoc CLI use), **backend**, and **frontend** with healthchecks and named volumes (`pgdata`, `redisdata`, `blobcache`, `arxiv_papers`). Backend is built with 2 uvicorn workers; frontend uses `next start` against the prebuilt bundle. |
 | `.env.example` | Template for all environment variables — copy to `.env` and fill in |
 
 ### Seeding the database
@@ -405,6 +422,8 @@ This is baked into the frontend bundle at build time (used for SSE streaming con
 
 ## Test User Credentials
 
+Created by `backend/scripts/seed_db.py` (also invoked by `./setup.sh`):
+
 | Field | Value |
 |---|---|
 | **Email** | `test@researchflow.ai` |
@@ -413,7 +432,9 @@ This is baked into the frontend bundle at build time (used for SSE streaming con
 | **Orientation** | Both |
 | **Subscribed namespaces** | `cs.AI`, `cs.ML`, `cs.NLP` |
 
-To reset: `docker compose down -v && docker compose up db -d && python scripts/seed_db.py`
+The FastAPI lifespan ALSO runs an idempotent self-healing seed pass on every boot (`_ensure_seed_user()` in `backend/main.py`) — but only for slots whose `SEED_*_EMAIL` *and* `SEED_*_PASSWORD` env vars are set. With the defaults shipped in `.env.example` (blank passwords), the lifespan pass is a no-op — so on a fresh checkout the test account comes from the `seed_db.py` script.
+
+To reset: `docker compose down -v && docker compose up db -d && cd backend && python scripts/seed_db.py`
 
 ---
 
@@ -612,12 +633,14 @@ Pipeline: arXiv RSS fetch → enrichment → embeddings → graph update → sco
 
 | Job | Default schedule | What it does |
 |---|---|---|
-| Ingestion | `0 5 * * 2-5` — 05:00 UTC, Tue–Fri | Fetches new papers, enriches, embeds, updates graph, scores PoTD. Runs on the four days with fresh arXiv content (Mon–Thu announcements arrive by 01:00 UTC). |
+| Ingestion | `0 5 * * 2-5` — 05:00 UTC, Tue–Fri | Fetches new papers, enriches, embeds, updates graph, scores PoTD. Runs on the four days with fresh arXiv content (Mon–Thu announcements arrive by 01:00 UTC). Gated on the `arxiv_ingest_enabled` global feature flag (admin-toggleable). |
 | Clustering | `0 5 * * 0` — Sun 05:00 UTC | Subtopic discovery — job scaffold registered; full HDBSCAN implementation is post-MVP |
 | Cross-namespace links | `30 5 * * 0` — Sun 05:30 UTC | Cross-namespace concept bridge edges — job scaffold registered; cosine-similarity pass is post-MVP |
 | Bookmark index rebuild | Sun 03:00 UTC (fixed) | Re-embeds any bookmarked papers that are missing an abstract chunk |
+| Memory consolidation | Sun 04:30 UTC (fixed) | Clusters + LLM-merges related session-memory entries across every user's chat / tree / namespace tiers so the store grows by *summary*, not by raw event accumulation. |
+| Checkpoint cleanup | 04:00 UTC, day 1 of each month (fixed) | Deletes `langgraph_checkpoints` threads older than 30 days to prevent unbounded growth of the LangGraph checkpoint tables. |
 
-Schedules are configurable via `INGESTION_CRON`, `CLUSTERING_CRON`, `CROSS_NAMESPACE_CRON`.
+The first three are configurable via `INGESTION_CRON`, `CLUSTERING_CRON`, `CROSS_NAMESPACE_CRON`. The last three have fixed schedules in `app/scheduler/jobs.py`.
 
 To trigger ingestion manually from Python:
 ```python
@@ -650,8 +673,9 @@ asyncio.run(run_ingestion("cs.AI"))
 | `MARKER_API_KEY` | — | ✗ | Marker cloud API key (local `marker-pdf` package works without it) |
 | `RESEND_API_KEY` | — | ✗ | Email sending (emails disabled if blank) |
 | `LANGSMITH_API_KEY` | — | ✗ | LangSmith observability |
-| `WEB_SEARCH_PROVIDER` | `duckduckgo` | ✗ | Web search backend for LLM tool: `duckduckgo` (free) or `tavily` |
-| `TAVILY_API_KEY` | — | ✗ | Required when `WEB_SEARCH_PROVIDER=tavily` |
+| `WEB_SEARCH_PROVIDER` | `auto` | ✗ | Web search backend for the LLM `web_search` tool. `auto` picks the best-available provider whose key is present (preference order: **exa > tavily > duckduckgo**). Explicit values `exa`, `tavily`, `duckduckgo` force a specific backend; DuckDuckGo is the no-key free fallback. |
+| `TAVILY_API_KEY` | — | ✗ | Tavily key — used when present or when `WEB_SEARCH_PROVIDER=tavily`. |
+| `EXA_API_KEY` | — | ✗ | Exa key — used when present or when `WEB_SEARCH_PROVIDER=exa`. Highest-quality LLM-optimised search; preferred when available. |
 | `BREAKTHROUGH_THRESHOLD` | `0.88` | ✗ | Novelty score cutoff for breakthrough classification |
 | `ENVIRONMENT` | `local` | ✗ | `local` \| `azure` |
 | `AZURE_STORAGE_CONNECTION_STRING` | — | ✗* | *Required when `BLOB_BACKEND=azure` |
@@ -669,6 +693,25 @@ asyncio.run(run_ingestion("cs.AI"))
 | `ADS_API_TOKEN` | — | ✗ | NASA ADS astronomy search token (astro-ph namespace tools) |
 | `NVD_API_KEY` | — | ✗ | NVD CVE database key (cs namespace) — free without key; key raises rate limits |
 | `GITHUB_TOKEN` | — | ✗ | GitHub PAT for `github_search` tool — raises rate limit from 10 to 30 req/min |
+| `REDIS_URL` | `redis://localhost:6379/0` | ✗ | Redis URL — required when `CACHE_BACKEND=redis`; otherwise ignored. |
+| `CACHE_DIR` | `~/.cache/researchflow` | ✗ | Filesystem directory used by the local cache backend (`CACHE_BACKEND=local`). |
+| `BLOB_LOCAL_DIR` | `~/.cache/researchflow/blobs` | ✗ | Filesystem directory used by the local blob backend (`BLOB_BACKEND=local`). |
+| `IMAGE_GEN_PROVIDER` | `openai` | ✗ | Image generation provider for Study Mode diagrams (only `openai` currently wired). |
+| `DEFAULT_EMBEDDING_MODEL` | `text-embedding-3-large` | ✗ | Specific embedding model — override per provider (e.g. `gemini-embedding-2-preview` when `DEFAULT_EMBEDDING_PROVIDER=gemini`). |
+| `JWT_ALGORITHM` | `HS256` | ✗ | JWT signing algorithm. |
+| `JWT_EXPIRE_MINUTES` | `10080` | ✗ | JWT expiry window (default 7 days). |
+| `ENABLE_DEV_RESET` | `false` | ✗ | When `true`, enables `POST /api/v1/dev/reset` (wipes all content, keeps user accounts). Off in production. |
+| `EMAIL_FROM` | `noreply@researchflow.ai` | ✗ | "From" address for transactional emails (PoTD, digest, breakthrough). |
+| `EMAIL_FROM_NAME` | `ResearchFlow` | ✗ | "From" display name. |
+| `LANGSMITH_PROJECT` | `researchflow` | ✗ | LangSmith project name when tracing is enabled. |
+| `LANGCHAIN_TRACING_V2` | `false` | ✗ | When `true`, LangChain + LangGraph runs trace to LangSmith. |
+| `ARXIV_MCP_TRANSPORT` | `stdio` | ✗ | Transport for the official arXiv MCP server: `stdio` (default — backend spawns the subprocess) or `sse`. |
+| `ARXIV_MCP_COMMAND` | `python -m arxiv_mcp_server --storage-path /data/papers` | ✗ | Subprocess invocation used when `ARXIV_MCP_TRANSPORT=stdio`. |
+| `ARXIV_MCP_URL` | `http://localhost:8765/sse` | ✗ | Endpoint used when `ARXIV_MCP_TRANSPORT=sse`. |
+| `SEED_GUEST_EMAIL` / `SEED_GUEST_PASSWORD` | `test@researchflow.ai` / blank | ✗ | Optional seeded guest account. **Blank password = skip.** Lifespan `_ensure_seed_user()` materialises this on every boot when set. Production deploys typically blank all seed passwords. |
+| `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | `admin@researchflow.ai` / blank | ✗ | Optional seeded admin account. Canonical admin used by the lifespan's "admin invariant" pass (demotes non-canonical admins). |
+| `SEED_USER_EMAIL` / `SEED_USER_PASSWORD` | `user@researchflow.ai` / blank | ✗ | Optional seeded normal user. |
+| `ASSISTANT_AUTO_RESUME` | `1` | ✗ | When `0` (or `DISABLE_AUTO_RECOVERY=1`), startup recovery fails every orphaned RA task instead of resuming. Useful for incident response. |
 
 ---
 
@@ -769,12 +812,13 @@ Set `NEXT_PUBLIC_API_URL=/_/backend` (no trailing slash) in the Vercel project's
 ```
 research_flow/
 ├── backend/
-│   ├── main.py                  # FastAPI app, lifespan, CORS, startup recovery
+│   ├── main.py                  # FastAPI app, lifespan (idempotent schema migrations, seed users, recovery, scheduler), CORS
 │   ├── requirements.txt
-│   ├── Dockerfile
-│   ├── alembic/                 # DB migrations
+│   ├── Dockerfile               # Local-development image (used by root docker-compose.yml; hot-reload)
+│   ├── alembic/                 # DB migrations scaffold (lifespan runs additive ALTER COLUMN IF NOT EXISTS guards instead)
 │   ├── scripts/
-│   │   └── seed_db.py           # Creates test user + SourceMappings
+│   │   ├── seed_db.py           # Standalone seed: creates test user + SourceMappings (called by setup.sh)
+│   │   └── reset_db.py          # Wipes content but keeps user accounts
 │   └── app/
 │       ├── core/
 │       │   ├── config.py        # Pydantic settings (all env vars)
@@ -786,12 +830,15 @@ research_flow/
 │       │   ├── session.py       # Async engine + session factory
 │       │   └── checkpointer.py  # AsyncPostgresCheckpointer — LangGraph crash-resume for media gen
 │       ├── models/              # SQLAlchemy ORM models
-│       │   ├── user.py          # User, UserProviderSettings, Annotation
-│       │   ├── paper.py         # Paper, PaperChunk, Summary, Bookmark, PoTD, QueryLog, FeedFeedback
+│       │   ├── user.py          # User (with is_admin, role, tier_slug, feature_overrides), UserProviderSettings, UserInterestProfile, Annotation
+│       │   ├── paper.py         # Paper, PaperChunk, Summary, Bookmark, BookmarkFolder, PoTD, QueryLog, FeedFeedback, PaperNamespaceHide
 │       │   ├── graph.py         # KnowledgeNode, KnowledgeEdge, NamespaceSubscription, SourceMapping
 │       │   ├── workflow.py      # WorkflowRun, TokenUsage
-│       │   ├── genie.py         # GenieElement, IdeaCapsule, GenieSession
-│       │   └── artifact.py      # GeneratedArtifact (podcast/slides)
+│       │   ├── genie.py         # GenieElement, IdeaCapsule (with originating_session_id), GenieSession
+│       │   ├── assistant.py     # AssistantSession, AssistantMessage, AssistantTask, AssistantStep, AssistantAttachment, AssistantArtifact
+│       │   ├── admin.py         # AppSetting (key-value site config) + audit log rows
+│       │   ├── rbac.py          # Forward-compatible role / tier scaffolding (today every check still reads is_admin)
+│       │   └── artifact.py      # GeneratedArtifact (podcast/slides/etc.)
 │       ├── schemas/             # Pydantic v2 request/response schemas
 │       ├── adapters/
 │       │   ├── llm/             # OpenAI, Anthropic, Google adapters + TrackingLLMAdapter
@@ -832,34 +879,52 @@ research_flow/
 │       │   ├── podcast.py       # 5-node StateGraph + multi-turn segmented script + TTS
 │       │   ├── slides.py        # 4-node StateGraph + multi-turn batched Marp generation
 │       │   └── folder_consolidation.py # 3-node StateGraph: load → coherence → synthesize
-│       ├── assistant/           # Research Assistant — planner, orchestrator, tool registry
+│       ├── assistant/           # Research Assistant — planner, orchestrator, tool registry, ReAct, middlewares
 │       │   ├── orchestrator.py  # Executes plans: step rows, parallel waves, guardrails, recovery
 │       │   ├── planner.py       # HeuristicPlanner (keyword-based fallback)
 │       │   ├── planner_llm.py   # LLMPlanner with structured JSON output + heuristic fallback
-│       │   ├── synthesizer.py   # Composes step results into block-rendered final message
+│       │   ├── synthesizer.py   # Composes step results + claim ledger into block-rendered final message
+│       │   ├── reflection.py    # LLM critique + red-team review (4 extra dimensions: evidence/inference, novelty-delta, falsifiability, ranked-explanations)
+│       │   ├── claim_ledger.py  # Strong-claim detector + ledger (SOURCE_CHUNK vs SOURCE_ABSTRACT/SNIPPET)
+│       │   ├── hitl_inbox.py    # Process-local async inbox for the HITL gate (genie_synthesize approval)
+│       │   ├── contradiction.py # Lexical + numeric + LLM-semantic contradiction detection
+│       │   ├── scratchpad.py    # THINK trail rendered under each assistant message
+│       │   ├── retrieval_observability.py # Per-retrieval coverage, dispersion, rerank disagreement
+│       │   ├── intent.py · clarify.py · persona.py · prompt_safety.py · query_strategy.py
+│       │   ├── research_brief.py · branch_context.py · state_lock.py · telemetry.py · tuning.py
+│       │   ├── auto_memory.py · semantic_memory.py · memory_consolidation.py · session_metadata.py
+│       │   ├── interest_updater.py # Updates UserInterestProfile from turn results
+│       │   ├── repair_drift.py · provenance_evidence.py · provenance_verification.py
 │       │   ├── events.py        # In-process SSE event bus (AssistantEvent)
 │       │   ├── scheduler.py     # submit(job_id) / cancel(job_id) — in-process task runner
 │       │   ├── recovery.py      # Startup reconciliation of orphaned running/pending tasks
 │       │   ├── step_cache.py    # Per-tool result cache (TTL-keyed, Redis or local)
-│       │   ├── session_metadata.py # Fire-and-forget session title + summary refresh
-│       │   ├── interest_updater.py # Updates UserInterestProfile from turn results
-│       │   └── tools/           # 30+ registered AssistantTool implementations
+│       │   ├── react_loop.py    # ReAct mid-turn THINK/ACT/OBSERVE loop (max 8 iters, 90 s deadline)
+│       │   ├── react/           # ReAct data model: state, middleware, investigation plan, subagents
+│       │   │   └── middlewares/ # 9 middlewares: param_preflight, tool_ban, hitl_gate, diminishing_returns,
+│       │   │                    #   paper_ledger, observability_mw, critic_gate, contradiction_mw, full_paper_gate
+│       │   └── tools/           # 41 registered AssistantTool implementations
 │       │       ├── registry.py  # register_tool / get_tool / describe_for_planner
 │       │       ├── base.py      # AssistantTool protocol, ToolContext, ToolResult
-│       │       └── *.py         # deep_search, arxiv_import, arxiv_search, frontier_scan,
+│       │       ├── namespace_packs.py # Domain-specific tool overlays per namespace
+│       │       └── *.py         # deep_search, arxiv_import, arxiv_search, paper_import, frontier_scan,
 │       │                        # concept_explain, compare_papers, genie_synthesize, genie_deep_dive,
-│       │                        # paper_qa, bookmarks_query, graph_build, graph_query, web_search,
+│       │                        # genie_read, genie_combine, paper_qa, study_paper, bookmarks_query,
+│       │                        # graph_build (planner-forbidden), graph_query, web_search,
 │       │                        # pubmed, inspire_hep, nasa_ads, fred, nvd_cve, clinicaltrials,
 │       │                        # github_search, huggingface_search, wolfram_alpha, wikipedia,
-│       │                        # semantic_scholar, crossref, unpaywall, papers_with_code, oeis,
-│       │                        # latex_parse, draft_section, research_trends, memory, media_generate
+│       │                        # crossref, unpaywall, papers_with_code, oeis,
+│       │                        # latex_parse, draft_section, research_trends, literature_survey,
+│       │                        # citation_finder, parse_context, memory, media_generate
 │       ├── api/v1/              # FastAPI routers
 │       │   ├── auth.py · feed.py · papers.py · study.py · search.py
 │       │   ├── chat.py · bookmarks.py · graph.py · genie.py · settings.py
-│       │   ├── assistant.py     # /assistant — sessions, messages, steps, artifacts, attachments, SSE
+│       │   ├── assistant.py     # /assistant — sessions, messages, steps, artifacts, attachments, SSE, HITL ACK
+│       │   ├── admin.py         # /admin — admin panel routes + /settings sub-router (global feature flags)
+│       │   ├── dev.py           # /dev — reset endpoint (gated by ENABLE_DEV_RESET)
 │       │   └── generate.py      # POST/GET /generate — media generation control plane
 │       └── scheduler/
-│           └── jobs.py          # APScheduler: nightly + weekly jobs
+│           └── jobs.py          # APScheduler: ingestion, clustering, cross-ns, bookmark rebuild, memory consolidation, checkpoint cleanup
 │
 ├── frontend/
 │   ├── app/
@@ -939,20 +1004,22 @@ pytest
 
 Tests run without a real database — all DB calls are mocked with `AsyncMock`.
 
-| Module | What's tested |
+| Test group | Coverage |
 |---|---|
-| `test_security.py` | Password hashing, JWT creation/decode, expiry |
-| `test_scoring.py` | Score formula, orientation weights, clamping, why-tags |
-| `test_arxiv_rss.py` | arXiv ID extraction, date parsing, HTTP mock fetch |
-| `test_paper_repository.py` | Upsert, bookmark, feedback with mocked DB |
-| `test_search_repository.py` | RRF fusion math, keyword/semantic mocks, hybrid calls |
-| `test_api_auth.py` | Register, login, /me via TestClient with dependency overrides |
-| `test_api_feed.py` | Feed, feedback, refresh, health endpoints |
+| `test_security.py` · `test_api_auth.py` | Password hashing, JWT creation/decode/expiry, register/login/`/me` via TestClient |
+| `test_scoring.py` · `test_arxiv_rss.py` · `test_paper_repository.py` · `test_search_repository.py` · `test_api_feed.py` | Feed scoring formula + orientation weights, arXiv RSS parsing, paper repo upserts, RRF fusion math, feed/refresh endpoints |
+| `test_artifact_repository.py` · `test_content_loader.py` · `test_generation_workflows.py` · `test_job_store.py` | Media-generation artifact storage, content loader (deep PDF grounding), podcast/slides LangGraph workflows, in-memory + Redis JobStore semantics |
+| `test_hardening.py` · `test_hardening_audit2.py` · `test_hardening_audit3.py` · `test_hardening_active_user.py` · `test_hardening_depth_tier.py` · `test_hardening_memory.py` · `test_hardening_react_session.py` · `test_hardening_reset.py` | Production-hardening regression suite covering DB lifecycle, SSE bus races, replay/cancel races, pgvector truthiness, retrieval rank-distance alignment, memory tier semantics |
+| `test_react_loop.py` · `test_react_middleware_chain.py` · `test_react_middleware_units.py` · `test_react_audit_fixes.py` · `test_react_fanout.py` · `test_react_gaps.py` · `test_react_residual_gaps.py` · `test_react_param_hardening.py` · `test_react_subagents.py` · `test_investigation_plan.py` | The ReAct loop, every middleware in isolation, the composed chain, fanout / subagent / investigation-plan paths, and param-hardening edge cases |
+| `test_claim_ledger.py` · `test_full_paper_gate.py` · `test_hitl_inbox.py` · `test_abstention_gate.py` | Strong-claim detector + ledger semantics, full-paper verification gate, HITL inbox roundtrip + ownership, abstention behaviour |
+| `test_contradiction_detection.py` · `test_retrieval_observability.py` · `test_provenance_evidence.py` · `test_provenance_verification.py` · `test_query_strategy.py` · `test_memory_consolidation.py` · `test_memory_freshness.py` · `test_repair_drift.py` · `test_prompt_safety.py` · `test_web_search_routing.py` | Reflection / contradiction / observability / provenance / query-strategy / memory consolidation paths, plus prompt-safety wrappers and web-search provider auto-selection |
+| `eval/` | Manual end-to-end evaluation harnesses (not part of the unit-test run). |
 
 ```bash
 pytest -v            # verbose
-pytest -k security   # run specific module
+pytest -k security   # run specific group
 pytest --tb=short    # compact tracebacks
+pytest tests/test_react_loop.py  # narrow to one file
 ```
 
 ---

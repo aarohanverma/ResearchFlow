@@ -328,6 +328,18 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
                 CREATE INDEX IF NOT EXISTS idx_idea_capsules_namespace
                 ON idea_capsules (user_id, namespace_key)
             """))
+            # RA-originated capsules: backlink to the AssistantSession so the
+            # Genie page can render a "From Assistant" section grouped by
+            # conversation. Idempotent; safe to re-run on every boot.
+            await conn.execute(_text("""
+                ALTER TABLE idea_capsules
+                ADD COLUMN IF NOT EXISTS originating_session_id UUID
+            """))
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_idea_capsules_originating_session
+                ON idea_capsules (user_id, originating_session_id)
+                WHERE originating_session_id IS NOT NULL
+            """))
             # One-shot backfill for rows created before the namespace_key
             # column shipped. Resolves the dominant namespace via two
             # parallel paths and writes back to the row so future list

@@ -308,6 +308,7 @@ details[open] summary::before{transform:rotate(90deg)}
     <a class="nav-link" href="#ra-tools">Tool Registry</a>
     <a class="nav-link" href="#ra-orchestrator">Orchestrator</a>
     <a class="nav-link" href="#ra-planner">Planner</a>
+    <a class="nav-link" href="#ra-react">ReAct &amp; Middleware</a>
     <a class="nav-link" href="#ra-streaming">SSE Streaming</a>
     <a class="nav-link" href="#ra-recovery">Recovery</a>
     <a class="nav-link" href="#ra-api">API Surface</a>
@@ -351,7 +352,7 @@ details[open] summary::before{transform:rotate(90deg)}
     <tr><td><strong>RAG Chat</strong></td><td>Query rewrite → intent classify → 3-tier scoped retrieval → graph augment → LLM rerank → Self-RAG check → cited synthesis</td><td><code>workflows/rag.py</code></td></tr>
     <tr><td><strong>Genie</strong></td><td>Seed elements → bridge discovery → hypothesis generation → LLM critique → elaboration → diagrams → PoC code → saved IdeaCapsule</td><td><code>workflows/genie.py</code></td></tr>
     <tr><td><strong>Deep Dive</strong></td><td>Single-pass: reasoning model writes a complete 11-section synthesis article grounded in the source paper text, streams tokens to the frontend, persists result to <code>idea_capsules.deep_dive_content</code></td><td><code>workflows/genie.py:run_deep_dive</code></td></tr>
-    <tr><td><strong>Research Assistant</strong></td><td>Persistent workspace per session. LLM planner selects from 30+ tools per turn; orchestrator executes steps in parallel waves, writes per-step checkpoint rows, synthesizes a block-rendered answer. Crashed workers resume from last completed step. Sessions branch up to 3 levels deep. File uploads (PDF, image, text, DOCX) parsed and attached as session context.</td><td><code>assistant/orchestrator.py</code> · <code>assistant/tools/</code></td></tr>
+    <tr><td><strong>Research Assistant</strong></td><td>Persistent workspace per session. LLM planner selects from 41 tools per turn; orchestrator executes steps in parallel waves (12-step / 180 s / 3-empty caps), writes per-step checkpoint rows, runs a bounded ReAct loop on deep-tier turns (8 iters, 90 s, 9-middleware chain including HITL gate + full-paper claim verification), and synthesizes a block-rendered answer with evidence/inference labelling. Crashed workers resume from last completed step (tasks &lt; 2 h). Sessions branch up to 3 levels deep. File uploads (PDF, image, text, DOCX; 25 MB cap) parsed and attached as session context.</td><td><code>assistant/orchestrator.py</code> · <code>assistant/react_loop.py</code> · <code>assistant/tools/</code></td></tr>
   </table>
 
   <div class="callout callout-anchor">
@@ -5009,7 +5010,7 @@ sequenceDiagram
   <p>
     Unlike a chatbot, the RA's intelligence is its <strong>planner</strong> and its power is its
     <strong>tool surface</strong>. An LLM planner (with a heuristic fallback that never fails)
-    selects from 30+ registered tools per turn, groups them into parallel execution waves, and
+    selects from 41 registered tools per turn, groups them into parallel execution waves, and
     then a synthesizer composes the step results into a block-rendered final message with inline citations.
   </p>
 
@@ -5045,7 +5046,7 @@ flowchart LR
     SCHED["Scheduler<br/>(asyncio tasks)"]
     ORCH["Orchestrator<br/>run_turn()"]
     PLAN["LLMPlanner<br/>(+ HeuristicPlanner fallback)"]
-    REG[("Tool Registry<br/>30+ tools")]
+    REG[("Tool Registry<br/>41 tools")]
     CACHE[("StepCache<br/>per-tool TTL")]
     SYN["Synthesizer<br/>(stream + blocks)"]
     BUS{{"AssistantEvent bus<br/>(in-process pub/sub)"}}
@@ -5257,13 +5258,23 @@ erDiagram
 
 <div class="section" id="ra-tools">
   <div class="section-tag">Research Assistant</div>
-  <h2>Tool Registry — 30+ Registered Tools</h2>
+  <h2>Tool Registry — 41 Registered Tools</h2>
   <p>
     Every RA capability is an <code>AssistantTool</code> with a stable name, a Pydantic input/output schema,
     a cost class (<code>cheap</code> / <code>moderate</code> / <code>heavy</code>), and flags for
     <code>side_effects</code>, <code>cancellable</code>, and <code>streamable</code>.
     The planner sees only <code>describe_for_planner()</code> output — names, summaries, and JSON schemas.
     New tools are added by registering; no planner or orchestrator code changes.
+  </p>
+  <p>
+    Two academically-obvious tools are intentionally <em>not</em> registered:
+    <code>semantic_scholar</code> (rate-limited and unreliable; OpenAlex via
+    <code>research_trends</code> covers the same ground) and <code>author_network</code>
+    (OpenAlex <code>/authors?search=</code> returns 400 on compound research-topic
+    queries, which is the only kind of query the planner ever produced for it).
+    <code>graph_build</code> is registered for operator visibility but the planner
+    is forbidden from picking it — it has its own UI trigger because deep graph
+    builds run for minutes and exhaust the LLM rate limit.
   </p>
   <p>
     The registry is namespace-aware: <code>describe_for_planner(namespace_key)</code> returns
@@ -5296,7 +5307,6 @@ erDiagram
     <tr><td><code>huggingface_search</code></td><td>moderate</td><td>no</td><td>Hugging Face model/dataset/space search — preferred for ML namespaces.</td></tr>
     <tr><td><code>wolfram_alpha</code></td><td>moderate</td><td>no</td><td>Wolfram Alpha computation. Disabled when neither <code>WOLFRAM_ALPHA_APP_ID</code> nor <code>WOLFRAM_MCP_COMMAND</code> is set.</td></tr>
     <tr><td><code>wikipedia</code></td><td>cheap</td><td>no</td><td>Wikipedia article retrieval for background context.</td></tr>
-    <tr><td><code>semantic_scholar</code></td><td>moderate</td><td>no</td><td>Semantic Scholar citation and related-paper search.</td></tr>
     <tr><td><code>crossref</code></td><td>cheap</td><td>no</td><td>CrossRef DOI resolution and citation metadata.</td></tr>
     <tr><td><code>unpaywall</code></td><td>cheap</td><td>no</td><td>Open-access PDF discovery via Unpaywall.</td></tr>
     <tr><td><code>papers_with_code</code></td><td>moderate</td><td>no</td><td>Papers with Code search — surfaces benchmark results and reference implementations.</td></tr>
@@ -5307,8 +5317,12 @@ erDiagram
     <tr><td><code>literature_survey</code></td><td>heavy</td><td>no</td><td>Generates a structured mini literature-survey from a set of papers.</td></tr>
     <tr><td><code>memory</code></td><td>cheap</td><td>yes (writes session state)</td><td>Reads/writes session-scoped key-value memory for persistent user facts.</td></tr>
     <tr><td><code>media_generate</code></td><td>heavy</td><td>yes (creates artifact)</td><td>Triggers podcast or slide-deck generation for a paper or idea capsule.</td></tr>
-    <tr><td><code>citation_finder</code></td><td>moderate</td><td>no</td><td>Finds papers that cite a given arXiv paper via Semantic Scholar.</td></tr>
-    <tr><td><code>author_network</code></td><td>moderate</td><td>no</td><td>Maps co-authorship and collaboration networks around a researcher.</td></tr>
+    <tr><td><code>citation_finder</code></td><td>moderate</td><td>no</td><td>Finds papers that cite a given arXiv paper via OpenAlex.</td></tr>
+    <tr><td><code>genie_read</code></td><td>cheap</td><td>no</td><td>Reads an existing Idea Capsule (title, hypothesis, scores, source papers) for follow-up questions.</td></tr>
+    <tr><td><code>genie_combine</code></td><td>heavy</td><td>yes (creates capsule)</td><td>Combines two existing Idea Capsules into a third synthesised capsule.</td></tr>
+    <tr><td><code>study_paper</code></td><td>moderate</td><td>no</td><td>Returns a Study-Mode-style structured handle for a paper. (The full streamed Study walkthrough is page-only.)</td></tr>
+    <tr><td><code>parse_context</code></td><td>cheap</td><td>no</td><td>Lazily parses pending attachments (PDF, image, DOCX) when the planner needs their text.</td></tr>
+    <tr><td><code>memory_write</code> / <code>memory_recall</code> / <code>memory_delete</code></td><td>cheap</td><td>yes (writes session state)</td><td>Three operations over session-scoped key-value memory for persistent user facts.</td></tr>
   </table>
 
   <h3>Namespace packs</h3>
@@ -5323,9 +5337,9 @@ erDiagram
     <div class="diagram-title">Global tools ∪ namespace pack overlays — what the planner sees</div>
     <div class="mermaid">
 flowchart LR
-    GLOBAL["GLOBAL_TOOLS<br/>(33 tools)<br/>deep_search · arxiv_import · paper_import<br/>arxiv_search · frontier_scan · literature_survey<br/>paper_qa · compare_papers · concept_explain<br/>draft_section · citation_finder · latex_parse<br/>web_search · wikipedia · crossref · pubmed<br/>unpaywall · research_trends · author_network<br/>genie_read · genie_synthesize · genie_deep_dive<br/>graph_query · graph_build · bookmarks_query<br/>memory_* · parse_context · media_generate · wolfram_alpha"]
+    GLOBAL["GLOBAL_TOOLS<br/>(~34 names visible to planner)<br/>deep_search · arxiv_import · arxiv_search<br/>paper_import · frontier_scan · literature_survey<br/>paper_qa · study_paper · compare_papers · concept_explain<br/>draft_section · citation_finder · latex_parse<br/>web_search · wikipedia · crossref · pubmed<br/>unpaywall · research_trends<br/>genie_read · genie_synthesize · genie_deep_dive · genie_combine<br/>graph_query · graph_build (planner-forbidden) · bookmarks_query<br/>memory_* · parse_context · media_generate · wolfram_alpha"]
 
-    CSPACK["cs.*<br/>github_search<br/>huggingface_search<br/>papers_with_code<br/>nvd_cve (cs.CR)"]
+    CSPACK["cs.*<br/>github_search<br/>huggingface_search<br/>papers_with_code<br/>nvd_cve"]
     EESS["eess.*<br/>github_search<br/>huggingface_search<br/>papers_with_code"]
     QBIO["q-bio.*<br/>pubmed (boosted)<br/>clinicaltrials"]
     ECON["econ.* / q-fin.*<br/>fred"]
@@ -5477,6 +5491,134 @@ flowchart TD
   </div>
 </div>
 
+<div class="section" id="ra-react">
+  <div class="section-tag">Research Assistant</div>
+  <h2>ReAct Mid-Turn Loop &amp; Middleware Chain</h2>
+  <p>
+    On deep-tier turns, the orchestrator runs the initial plan, then hands control
+    to <code>run_react_loop()</code> in <code>backend/app/assistant/react_loop.py</code>.
+    The loop lets the model THINK (free-form scratchpad), ACT (pick another tool or
+    a pseudo-action: <code>finalize</code>, <code>critique</code>, <code>fanout</code>,
+    <code>subagent</code>, <code>write_todos</code>), and OBSERVE the result — looping
+    until the model finalises, the iteration cap fires, or the wall-clock deadline
+    expires. Every exit path is bounded.
+  </p>
+
+  <table>
+    <tr><th>Knob (<code>ReactConfig</code>)</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>max_iterations</code></td><td>8</td><td>Hard cap on THINK / ACT / OBSERVE cycles</td></tr>
+    <tr><td><code>deadline_seconds</code></td><td>90.0</td><td>Wall-clock budget</td></tr>
+    <tr><td><code>_MIN_ITERS_BEFORE_FREE_FINALIZE</code></td><td>3</td><td>No free finalize before iter 3 — the loop forces a critique first</td></tr>
+    <tr><td><code>_MAX_FANOUT_BRANCHES</code></td><td>4</td><td>Hard cap on parallel branches per fanout action</td></tr>
+  </table>
+
+  <p>
+    <code>memory_write</code> and <code>memory_delete</code> are disallowed as ACT
+    targets inside the loop — durable memory writes happen post-turn, not mid-turn,
+    to avoid premature commits.
+  </p>
+
+  <h3>Middleware chain — 9 cross-cutting concerns</h3>
+  <p>
+    Every iteration is wrapped in a chain composed by
+    <code>default_chain_factory()</code> in
+    <code>backend/app/assistant/react/middlewares/__init__.py</code>. Order is
+    load-bearing — earlier middlewares get the first say on
+    <code>before_tool</code>; the chain's <code>gate_finalize</code> walks the
+    same order so a sufficient-evidence turn isn't kept open by a soft signal.
+  </p>
+
+  <table>
+    <tr><th>#</th><th>Middleware</th><th>What it does</th></tr>
+    <tr><td>1</td><td><code>ParamPreflight</code></td><td>Strips placeholder values (<code>__to_fill__</code>, <code>&lt;TODO&gt;</code>, empty strings); auto-fills missing required fields from the user query / paper ledger.</td></tr>
+    <tr><td>2</td><td><code>ToolBan</code></td><td>Blocks tools the loop has banned (repeated failures, broken adapters); may redirect to a substitute.</td></tr>
+    <tr><td>3</td><td><code>HitlGate</code></td><td>Pauses for user approval before <code>genie_synthesize</code> dispatches. Emits <code>react_hitl_pending</code>, awaits an ACK future with a <strong>10 s</strong> timeout (<code>_ACK_WINDOW_SEC</code>), then continues with a scratchpad note on timeout.</td></tr>
+    <tr><td>4</td><td><code>DiminishingReturns</code></td><td>Skips identical-param redos; signals "no new evidence" when retrieval stops returning new IDs.</td></tr>
+    <tr><td>5</td><td><code>PaperLedger</code></td><td>Accumulates paper IDs from every tool result for downstream auto-fill + ledger-aware prompts.</td></tr>
+    <tr><td>6</td><td><code>RetrievalObservability</code></td><td>Records per-call coverage, dispersion, and rerank disagreement so the synth can downgrade confidence on thin retrievals.</td></tr>
+    <tr><td>7</td><td><code>CriticGate</code></td><td>Forces one critique step before a too-early finalize.</td></tr>
+    <tr><td>8</td><td><code>ContradictionDetector</code></td><td>Lexical + numeric + LLM-semantic; can force at most one counter-search on a high-confidence open signal.</td></tr>
+    <tr><td>9</td><td><code>FullPaperVerification</code></td><td>At finalize, inspects every strong claim in the claim ledger and forces up to <strong>2</strong> <code>paper_qa</code> rounds (<code>_MAX_FORCED_PAPER_QA_PER_TURN</code>) on those whose source was only the abstract / snippet. Remaining strong claims without chunk-level evidence are tagged <code>unverifiable</code>.</td></tr>
+  </table>
+
+  <h3>Strong-claim ledger</h3>
+  <p>
+    <code>backend/app/assistant/claim_ledger.py</code> defines
+    <code>detect_strong_spans()</code>, which matches numeric, SOTA, causal, and
+    comparative regexes. Each detected span becomes a <code>StrongClaim</code>
+    carrying its source provenance:
+  </p>
+  <ul>
+    <li><code>SOURCE_CHUNK</code> — comes from <code>paper_qa</code>; <strong>verified</strong>.</li>
+    <li><code>SOURCE_ABSTRACT</code> / <code>SOURCE_SNIPPET</code> — comes from retrieval / arXiv-search; <strong>provisional</strong> until the full-paper gate runs.</li>
+  </ul>
+  <p>
+    The synthesiser reads the ledger and renders provisional / unverifiable claims
+    with explicit <code>(abstract-only)</code> / <code>(unverifiable)</code> labels.
+    The contradiction detector also writes into the ledger so already-disputed
+    claims get a <code>contradicted</code> tag.
+  </p>
+
+  <h3>Human-in-the-loop inbox</h3>
+  <p>
+    <code>backend/app/assistant/hitl_inbox.py</code> is a process-local async inbox.
+    The HitlGate middleware calls <code>register_pending(request_id, session_id, user_id)</code>,
+    awaits the returned future, and the API endpoint
+    <code>POST /api/v1/assistant/sessions/{session_id}/hitl/{request_id}</code>
+    resolves it via <code>resolve(request_id, …, decision)</code>. Decision values:
+    <code>approve</code> (continue), <code>skip</code> (abort the dispatch),
+    <code>modify</code> (override params then continue).
+  </p>
+  <div class="callout callout-warning">
+    <div class="callout-title">⚠ Multi-worker limitation</div>
+    <p>
+      The inbox is in-process. The SSE listener (which surfaces the
+      <code>react_hitl_pending</code> event) and the inbox writer must run in the
+      same process, so HITL only works correctly with a single backend replica
+      or with sticky sessions. A Redis-backed swap is a one-file change when
+      multi-worker deployments need it.
+    </p>
+  </div>
+
+  <h3>Synthesiser prompt blocks (added by the loop's outputs)</h3>
+  <p>
+    The synthesiser receives the ReAct loop's <code>claim_ledger</code>,
+    <code>contradictions</code>, <code>retrieval_metrics</code>, and
+    <code>investigation_plan</code> when present, and adds four discipline
+    blocks to its prompt:
+  </p>
+  <ul>
+    <li><strong>EVIDENCE vs INFERENCE LABELLING</strong> — forces explicit
+      <em>Directly shown by [N]:</em>, <em>Reasonable inference from [N], [M]:</em>,
+      <em>RA hypothesis (no direct citation):</em>, <em>Uncertain:</em> labels.</li>
+    <li><strong>PROVISIONAL CLAIMS</strong> — reads the STRONG-CLAIM LEDGER; labels
+      provisional / unverifiable claims as <em>(abstract-only)</em>; refuses to
+      repeat contradicted claims without a flag.</li>
+    <li><strong>COMPETING EXPLANATIONS</strong> — ranks by evidence strength,
+      plausibility, impact, generality, testability, production relevance —
+      <em>not</em> by paper count.</li>
+    <li><strong>PRODUCTION-AWARENESS (gated)</strong> — only emitted for
+      applied / deployed-AI questions; pure-research questions get no
+      production checklist.</li>
+  </ul>
+
+  <h3>Subagents</h3>
+  <p>
+    The <code>subagent</code> ACT delegates a focused sub-task to a
+    context-quarantined inner loop. Recursion depth is gated at <strong>1</strong>:
+    a subagent can only run from the top-level loop, so subagents cannot spawn
+    subagents. The decision prompt also hides the subagent catalogue at
+    <code>subagent_depth &gt; 0</code> so the temptation is removed entirely.
+  </p>
+
+  <h3>What ends up on the assistant message</h3>
+  <ul>
+    <li><code>payload.scratchpad</code> — the THINK trail rendered under the message in the reasoning-tree view.</li>
+    <li><code>payload.workflow.actions</code> — new ReAct tool calls are appended with a <code>ReAct:</code> prefix so the action chip row distinguishes them from the initial plan.</li>
+    <li><code>react_iterations</code> / <code>react_completed_normally</code> / <code>react_tool_failures</code> / <code>react_successful_retrievals</code> / <code>react_paper_ledger_size</code> / <code>react_claim_ledger</code> — surfaced in the reasoning-tree footer for ops visibility.</li>
+  </ul>
+</div>
+
 <div class="section" id="ra-streaming">
   <div class="section-tag">Research Assistant</div>
   <h2>SSE Streaming — Typed AssistantEvent Objects</h2>
@@ -5495,6 +5637,12 @@ flowchart TD
     <tr><td><code>step_progress</code></td><td>Mid-tool progress updates</td><td><code>step_id</code>, <code>percent</code>, <code>summary</code></td></tr>
     <tr><td><code>step_completed</code></td><td>After each tool finishes</td><td><code>step_id</code>, <code>tool</code>, <code>summary</code>, <code>cache_hit</code></td></tr>
     <tr><td><code>step_failed</code></td><td>After a tool errors</td><td><code>step_id</code>, <code>error</code>, <code>retryable</code></td></tr>
+    <tr><td><code>react_thought</code></td><td>Each ReAct THINK</td><td><code>iteration</code>, <code>text</code></td></tr>
+    <tr><td><code>react_dispatch</code></td><td>Before a ReAct ACT</td><td><code>iteration</code>, <code>tool</code>, <code>params</code></td></tr>
+    <tr><td><code>react_done</code></td><td>ReAct loop exits</td><td><code>iterations</code>, <code>finalized</code>, <code>new_tools</code></td></tr>
+    <tr><td><code>react_hitl_pending</code></td><td>HITL gate fires (pre-<code>genie_synthesize</code>)</td><td><code>request_id</code>, <code>tool</code>, <code>params</code>, <code>ack_window_sec</code></td></tr>
+    <tr><td><code>react_hitl_resolved</code></td><td>User responded to HITL</td><td><code>request_id</code>, <code>decision</code></td></tr>
+    <tr><td><code>react_hitl_timeout</code></td><td>HITL ACK window expired</td><td><code>request_id</code></td></tr>
     <tr><td><code>message_delta</code></td><td>Each synthesizer token</td><td><code>message_id</code>, <code>delta</code></td></tr>
     <tr><td><code>message_completed</code></td><td>After synthesis writes to DB</td><td><code>message_id</code>, <code>citation_count</code>, <code>blocks[]</code></td></tr>
     <tr><td><code>task_completed</code></td><td>Turn fully done</td><td><code>summary</code></td></tr>
@@ -5615,6 +5763,10 @@ flowchart LR
 <span class="dec">GET</span>    /assistant/sessions/{id}/steps            → all steps in session (reasoning tree)
 <span class="dec">GET</span>    /assistant/messages/{msg_id}/steps        → steps that produced a single message
 
+# HITL (human-in-the-loop ACK for the genie_synthesize gate)
+<span class="dec">POST</span>   /assistant/sessions/{session_id}/hitl/{request_id}
+                                                {status: approve|skip|modify, params?, note?}
+
 # Artifacts
 <span class="dec">GET</span>    /assistant/sessions/{id}/artifacts        → generated outputs (study/idea/podcast/slides/etc.)
 
@@ -5654,7 +5806,7 @@ flowchart LR
     You now have the full picture: six layers, eight workflow modules (six LangGraph
     StateGraphs — Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation — plus the
     Genie synthesis and Deep Dive async generators), a persistent Research Assistant
-    layer with 30+ tools, an LLM planner with heuristic fallback, six new
+    layer with 41 tools, an LLM planner with heuristic fallback, six new
     <code>assistant_*</code> tables (sessions, messages, tasks, steps, attachments, artifacts),
     typed SSE event streaming, per-step checkpointed resume, ten adapter families, seven
     repositories, one PostgreSQL 16 database with pgvector HNSW index, a knowledge graph,

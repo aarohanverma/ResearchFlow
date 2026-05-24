@@ -152,6 +152,7 @@ async def get_provider_settings(user_id: CurrentUserID, db: DBSession):
     """Return the effective LLM and embedding provider configuration.
 
     Always returns what the backend is actually running with:
+
     - User's saved DB row when present.
     - System defaults from config / .env.local otherwise.
     - Embedding provider reflects the runtime fallback (e.g. if Gemini is

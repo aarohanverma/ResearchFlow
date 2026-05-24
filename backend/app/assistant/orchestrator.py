@@ -729,6 +729,7 @@ class Orchestrator:
         task._react_retrieval_metrics = outcome.retrieval_metrics  # type: ignore[attr-defined]
         task._react_contradictions = outcome.contradiction_signals  # type: ignore[attr-defined]
         task._react_investigation_plan = outcome.investigation_plan  # type: ignore[attr-defined]
+        task._react_claim_ledger = outcome.claim_ledger  # type: ignore[attr-defined]
 
         try:
             self._publish(job_id, "react_done", {
@@ -1649,6 +1650,7 @@ class Orchestrator:
             retrieval_metrics=getattr(task, "_react_retrieval_metrics", None) or {},
             contradictions=getattr(task, "_react_contradictions", None) or [],
             investigation_plan=getattr(task, "_react_investigation_plan", None),
+            claim_ledger=getattr(task, "_react_claim_ledger", None),
         )
 
         # Side-channel output dict the synthesizer fills with
@@ -2645,6 +2647,7 @@ def _distill_agent_notes(
     retrieval_metrics: dict | None = None,
     contradictions: list[dict] | None = None,
     investigation_plan: dict | None = None,
+    claim_ledger: dict | None = None,
 ) -> dict | None:
     """Distill a ReAct scratchpad into a compact dict for the synthesizer.
 
@@ -2689,6 +2692,12 @@ def _distill_agent_notes(
         # work shows up as an honest caveat in the answer.
         if int(investigation_plan.get("total") or 0) > 0:
             notes["investigation_plan"] = investigation_plan
+    # Full-paper verification: surface the claim ledger so the
+    # synthesizer can label verified vs provisional spans correctly.
+    # Skipped on turns where no strong claims were detected.
+    if claim_ledger and isinstance(claim_ledger, dict):
+        if int(claim_ledger.get("total") or 0) > 0:
+            notes["claim_ledger"] = claim_ledger
 
     # Latest critique, if any.
     if scratchpad is not None:

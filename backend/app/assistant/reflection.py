@@ -100,6 +100,26 @@ _CRITIQUE_SCHEMA = {
         "completeness":  {"type": "number", "minimum": 0, "maximum": 1},
         "memory_faithfulness": {"type": "number", "minimum": 0, "maximum": 1},
         "clarity":       {"type": "number", "minimum": 0, "maximum": 1},
+        # Additional rigor dimensions surfaced by the deeper-research
+        # overhaul. Scoring optional — when the cheap judge omits them
+        # the synthesizer treats the dimension as "untested" rather
+        # than failing repair.
+        "evidence_inference_separation": {
+            "type": "number", "minimum": 0, "maximum": 1,
+            "description": "Does the answer clearly distinguish what sources directly show from RA's inferences/hypotheses?",
+        },
+        "novelty_delta_clarity": {
+            "type": "number", "minimum": 0, "maximum": 1,
+            "description": "When proposing a new direction, does it explicitly name the closest prior work and articulate the delta?",
+        },
+        "falsifiability_present": {
+            "type": "number", "minimum": 0, "maximum": 1,
+            "description": "Does the proposal include a clear disproof criterion / negative control / failure mode?",
+        },
+        "ranked_explanations_quality": {
+            "type": "number", "minimum": 0, "maximum": 1,
+            "description": "When multiple competing explanations were retrieved, are they ranked by explicit criteria (evidence strength, plausibility, generality, testability, practical impact) rather than popularity?",
+        },
         "issues": {
             "type": "array",
             "items": {"type": "string", "maxLength": 240},
@@ -128,7 +148,7 @@ async def llm_critique(
 
         system = (
             "You are auditing a research-assistant answer for quality.\n\n"
-            "Score four dimensions on [0, 1]:\n"
+            "Score the core dimensions on [0, 1]:\n"
             "  groundedness        — every factual claim is supported by the "
             "                        provided evidence block.\n"
             "  completeness        — the answer fully addresses the user's "
@@ -140,11 +160,47 @@ async def llm_critique(
             "                        the answer respects it sensibly.\n"
             "  clarity             — well-structured, no truncation, no "
             "                        jargon left unexplained.\n\n"
+            "Also score these RIGOR dimensions whenever the answer involves "
+            "synthesis, hypothesis, recommendation, or comparison of "
+            "approaches (skip / score 1.0 for trivial lookups):\n"
+            "  evidence_inference_separation — Does the answer make it clear "
+            "                        which statements are directly supported "
+            "                        by sources vs. RA's own inference vs. "
+            "                        speculation? An answer that mixes "
+            "                        sourced facts and inferred opinions "
+            "                        without labelling scores low.\n"
+            "  novelty_delta_clarity — When a NEW direction is proposed, "
+            "                        does the answer (a) name the closest "
+            "                        prior method, (b) say what's reused vs. "
+            "                        what's new, (c) explain why the "
+            "                        combination matters, and (d) name the "
+            "                        hardest baseline to beat? Score 1.0 if "
+            "                        no new direction was proposed.\n"
+            "  falsifiability_present — Does any proposed direction / "
+            "                        hypothesis include a clear DISPROOF "
+            "                        criterion (negative control, ablation, "
+            "                        metric value that would invalidate)? "
+            "                        Score 1.0 if no direction was proposed.\n"
+            "  ranked_explanations_quality — When competing explanations / "
+            "                        bottlenecks appear, are they ranked by "
+            "                        explicit criteria (evidence, "
+            "                        plausibility, generality, testability, "
+            "                        impact) rather than by how often "
+            "                        papers mention them? Score 1.0 if no "
+            "                        competing explanations were on the "
+            "                        table.\n\n"
             "List concrete issues in ``issues`` (max 5). Set ``should_repair`` "
-            "to true ONLY when groundedness < 0.6 OR there's a critical "
-            "issue (fabricated citation, mid-sentence truncation, claim "
-            "directly contradicted by evidence). Be conservative — frequent "
-            "false-positive repairs hurt latency."
+            "to true when ANY of:\n"
+            "  • groundedness < 0.6, OR\n"
+            "  • critical issue (fabricated citation, mid-sentence "
+            "    truncation, claim directly contradicted by evidence), OR\n"
+            "  • evidence_inference_separation < 0.5 AND the answer makes "
+            "    strong claims (the reader can't tell what was proven), OR\n"
+            "  • novelty_delta_clarity < 0.5 AND the answer proposes a new "
+            "    direction without naming a comparator, OR\n"
+            "  • falsifiability_present < 0.5 AND the answer proposes a "
+            "    direction without saying how to disprove it.\n"
+            "Be conservative — frequent false-positive repairs hurt latency."
         )
 
         # Caps generous enough to avoid mid-claim truncation while still
@@ -188,12 +244,32 @@ _REDTEAM_SCHEMA = {
         "weak_evidence": {
             "type": "array",
             "items": {"type": "string", "maxLength": 240},
-            "description": "Claims whose support in the evidence is thin or absent.",
+            "description": "Claims whose support is thin (narrow benchmark, missing ablation, small-scale experiment, unclear baseline, only-qualitative argument, abstract-only evidence on a strong claim).",
         },
         "overclaims": {
             "type": "array",
             "items": {"type": "string", "maxLength": 240},
             "description": "Statements that go beyond what the evidence actually shows.",
+        },
+        "missing_novelty_delta": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 240},
+            "description": "Proposed directions without an explicit comparison to the closest prior work (no named comparator, no description of what is reused vs new, no hardest-baseline-to-beat).",
+        },
+        "missing_falsifiability": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 240},
+            "description": "Proposed directions without a disproof criterion / negative control / failure mode.",
+        },
+        "popularity_anchored_ranking": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 240},
+            "description": "Cases where the draft ranks competing explanations by how often papers mention them instead of by explicit criteria.",
+        },
+        "production_concerns_ignored": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 240},
+            "description": "Only fill when the answer is about an applied / deployed AI system: deployment constraints (latency, compute, data cost, safety, monitoring, human override, failure recovery, eval drift) that are MATERIAL to the recommendation but unaddressed. Leave empty for pure research / theory questions — do NOT manufacture generic production checklists.",
         },
         "severity": {
             "type": "string",
@@ -224,17 +300,42 @@ async def red_team_review(
         llm = get_llm_adapter()
         system = (
             "You are a skeptical peer reviewer auditing a research-assistant "
-            "draft for bias, missing perspectives, weak evidence, and "
-            "overclaiming. Be terse and specific. List flaws as short "
-            "phrases; do NOT rewrite the answer. If the draft is clean, "
-            "return empty arrays and severity='none'.\n\n"
+            "draft. Audit for:\n"
+            "  • Bias, missing perspectives, weak evidence, overclaims.\n"
+            "  • Novelty delta — when a NEW direction is proposed, is the "
+            "    closest prior work named, is the delta (reused vs new) "
+            "    spelled out, is the hardest baseline named? Missing → flag "
+            "    under ``missing_novelty_delta``.\n"
+            "  • Falsifiability — when a direction is proposed, is there a "
+            "    disproof criterion / negative control / ablation that "
+            "    would invalidate? Missing → flag under "
+            "    ``missing_falsifiability``.\n"
+            "  • Popularity-anchored ranking — when competing explanations "
+            "    are compared, are they ranked by explicit criteria "
+            "    (evidence, plausibility, generality, testability, impact) "
+            "    or just by 'most papers say X'? Popularity-anchored → "
+            "    flag under ``popularity_anchored_ranking``.\n"
+            "  • Production concerns — ONLY for applied / deployed AI "
+            "    questions, flag material deployment constraints (latency, "
+            "    compute, data cost, safety, monitoring, override, "
+            "    failure recovery, eval drift) that go unaddressed. For "
+            "    pure research / theory / explanatory answers, leave this "
+            "    EMPTY — do not invent generic production checklists; that "
+            "    is the worse failure mode of this audit.\n\n"
+            "Be terse and specific. List flaws as short phrases; do NOT "
+            "rewrite the answer. If the draft is clean, return empty "
+            "arrays and severity='none'.\n\n"
             "Severity rubric:\n"
             "  none   — no material issues\n"
             "  low    — minor phrasing problems, nothing factual\n"
-            "  medium — a missing perspective or thin evidence on at least "
-            "           one claim\n"
-            "  high   — overclaim, bias, or hallucinated citation that "
-            "           would mislead a reader"
+            "  medium — a missing perspective, thin evidence on at least "
+            "           one claim, missing novelty delta when a new "
+            "           direction was proposed, or popularity-anchored "
+            "           ranking\n"
+            "  high   — overclaim, bias, hallucinated citation, missing "
+            "           falsifiability on a proposed direction, or a "
+            "           critical production gap on a deployment question "
+            "           that would mislead a reader"
         )
         user = (
             f"USER QUERY:\n{query[:4000]}\n\n"
@@ -267,12 +368,16 @@ def redteam_to_issue_list(redteam: dict[str, Any]) -> list[str]:
         ("missing perspective", "missing_perspectives"),
         ("weak evidence", "weak_evidence"),
         ("overclaim", "overclaims"),
+        ("missing novelty delta", "missing_novelty_delta"),
+        ("missing falsifiability", "missing_falsifiability"),
+        ("popularity-anchored ranking", "popularity_anchored_ranking"),
+        ("production gap", "production_concerns_ignored"),
     ):
         for item in (redteam.get(key) or [])[:3]:
             s = str(item).strip()
             if s:
                 out.append(f"{label}: {s}")
-    return out[:8]
+    return out[:12]
 
 
 # ─── Convergence check ──────────────────────────────────────────────────────
@@ -576,7 +681,35 @@ def critique_to_issue_list(critique: dict[str, Any]) -> list[str]:
         issues.append(
             f"memory faithfulness slipped ({mf:.2f}) — re-check user preferences before responding"
         )
-    return issues[:6]
+    # Rigor dimensions: only surface when they failed AND the dimension
+    # is actually relevant (the scorer returns 1.0 to declare "N/A" for
+    # this answer type, so a 1.0 means we don't synthesize a complaint).
+    eis = float(critique.get("evidence_inference_separation") or 1.0)
+    if eis < 0.5:
+        issues.append(
+            f"evidence vs inference is not clearly separated ({eis:.2f}) — "
+            "label what is directly shown by sources vs what is RA inference / hypothesis"
+        )
+    ndc = float(critique.get("novelty_delta_clarity") or 1.0)
+    if ndc < 0.5:
+        issues.append(
+            f"novelty delta is unclear ({ndc:.2f}) — name the closest prior method, "
+            "what is reused vs what is genuinely new, and the hardest baseline to beat"
+        )
+    fp = float(critique.get("falsifiability_present") or 1.0)
+    if fp < 0.5:
+        issues.append(
+            f"falsifiability missing ({fp:.2f}) — state a disproof criterion / negative "
+            "control / ablation that would invalidate the proposed direction"
+        )
+    req = float(critique.get("ranked_explanations_quality") or 1.0)
+    if req < 0.5:
+        issues.append(
+            f"competing explanations not ranked by explicit criteria ({req:.2f}) — "
+            "rank by evidence strength, plausibility, generality, testability, impact "
+            "rather than how many papers mention each"
+        )
+    return issues[:10]
 
 
 # ─── Improvisation ───────────────────────────────────────────────────────────
