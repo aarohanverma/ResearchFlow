@@ -37,14 +37,26 @@ def test_strip_drops_out_of_range_marker():
 
 
 def test_strip_keeps_resolvable_subset_of_compound_marker():
+    """Compound and range markers must expand into individual
+    space-separated brackets — the frontend's marker regex only
+    matches single-number brackets, so the legacy comma-joined
+    ``[1,2]`` form rendered as plain text. Out-of-range indices
+    (here: 5, with only 2 papers) are dropped during expansion."""
     from app.assistant.synthesizer import _strip_unresolvable_citations
 
     papers = [{"paper_id": "p1"}, {"paper_id": "p2"}]
     answer = "Compound [1,2,5,3]. Range [1-4]."
     cleaned = _strip_unresolvable_citations(answer, papers, [])
-    assert "[1,2]" in cleaned, f"compound filter wrong, got {cleaned!r}"
-    assert "[1,2]" in cleaned  # range 1-4 clamped to 1-2
-    assert "5" not in cleaned.split("[", 1)[1] if "[" in cleaned else True
+    # Compound [1,2,5,3] → keeps 1 and 2 (3 and 5 exceed the ceiling).
+    # Range [1-4] → expands to [1] [2] (clamped at the ceiling).
+    assert "Compound [1] [2]" in cleaned
+    assert "Range [1] [2]" in cleaned
+    # The old comma-joined form must NOT appear — the frontend
+    # couldn't render it as clickable chips.
+    assert "[1,2]" not in cleaned
+    # And out-of-range indices are gone.
+    assert "[5]" not in cleaned
+    assert "[3]" not in cleaned
 
 
 def test_strip_handles_empty_answer_and_empty_papers():

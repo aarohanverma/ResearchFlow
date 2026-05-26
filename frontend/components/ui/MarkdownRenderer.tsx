@@ -636,12 +636,30 @@ export function InlineText({
           return <strong key={i} className="font-semibold text-white">{dec(part.slice(2, -2), `b${i}`)}</strong>;
         if (/^\*[^*\n]+\*$/.test(part) && !part.startsWith("**"))
           return <em key={i} className="italic text-gray-300">{dec(part.slice(1, -1), `i${i}`)}</em>;
-        if (/^`[^`]+`$/.test(part))
+        if (/^`[^`]+`$/.test(part)) {
+          // Auto-promote backtick content that's CLEARLY LaTeX/math
+          // to inline math. The model occasionally wraps math in
+          // backticks (`r_t < \tau`, `\pi_\theta(a \mid s)`) which
+          // renders as flat code instead of typeset math. Heuristic:
+          // contains a LaTeX command (``\\word``) OR a math-y
+          // character cluster (Greek letters, ≥, ≤, ∑, ∏, ∞, ∂,
+          // etc.) AND no obvious code tells (no triple-paren
+          // ``()``, no ``=>``, no semicolons, no quoted strings).
+          // Conservative — false positives just render slightly
+          // differently; the user's spec is "fully render formulas".
+          const inner = part.slice(1, -1);
+          const looksLatex = /\\[a-zA-Z]+/.test(inner);
+          const hasMathChars = /[≥≤≠≈∑∏∞∂∇∫πθλμσφψωαβγδεζηικξρτυχ]/.test(inner);
+          const hasCodeTells = /[;{}]|=>|"[^"]*"|'[^']*'/.test(inner);
+          if (!hasCodeTells && (looksLatex || hasMathChars)) {
+            return <InlineMath key={i} expr={inner} />;
+          }
           return (
             <code key={i} className="px-1.5 py-0.5 rounded-md bg-gray-800 border border-gray-700/60 text-[12px] font-mono text-indigo-300 mx-0.5">
-              {dec(part.slice(1, -1), `c${i}`)}
+              {dec(inner, `c${i}`)}
             </code>
           );
+        }
         if (/^\$[^$]+\$$/.test(part)) {
           return <InlineMath key={i} expr={part.slice(1, -1)} />;
         }

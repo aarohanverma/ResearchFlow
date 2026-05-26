@@ -369,7 +369,20 @@ async def deep_search_background(
         )
     )
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def _on_search_done(t: asyncio.Task, _jid: str = job_id) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            # Background failures otherwise surface only as asyncio
+            # "exception was never retrieved" debug-level warnings; lift
+            # them to WARNING so they show up in production logs and the
+            # job row's failed status has a paired trace for diagnosis.
+            log.warning("deep_search background job %s failed: %s", _jid, exc)
+
+    task.add_done_callback(_on_search_done)
 
     return DeepSearchJobResponse(
         job_id=job_id,

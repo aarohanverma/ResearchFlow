@@ -129,7 +129,19 @@ async def import_arxiv_paper(
             name=f"import-arxiv:{canonical_id}:{ns_key}",
         )
         _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+
+        def _on_import_done(t: asyncio.Task, _jid: str = job_id) -> None:
+            _background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                # Surface failures explicitly. ``_import_arxiv_background``
+                # owns its own job_store status writes; anything that
+                # escapes its scope is a programmer error we want to see.
+                log.warning("arxiv import job %s failed: %s", _jid, exc)
+
+        task.add_done_callback(_on_import_done)
         spawned.append({"job_id": job_id, "namespace_key": ns_key})
 
     ns_label = namespace_keys[0] if len(namespace_keys) == 1 else f"{len(namespace_keys)} namespaces"

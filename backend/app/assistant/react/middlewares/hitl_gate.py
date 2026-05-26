@@ -133,69 +133,96 @@ class HitlGateMiddleware(BaseMiddleware):
         # Wait — but never longer than the ack window. asyncio.wait_for
         # propagates CancelledError so the loop's cancel path still
         # works while we're paused at the gate.
+        #
+        # The outer try/finally guarantees ``inbox_discard`` runs on
+        # ANY exit path other than a successful ``resolve()`` (which
+        # pops the slot itself). Without this guard a propagating
+        # exception between the await and the return — e.g. a
+        # ``publish_event`` raise that slipped past the safe wrapper,
+        # or a future-set_result corruption — would leave the slot
+        # lingering in the inbox until the hard cap evicted it. The
+        # ``_discarded`` flag stops us from double-discarding on the
+        # already-handled timeout / cancel branches.
+        decision: HitlDecision | None = None
+        _discarded = False
         try:
-            decision: HitlDecision = await asyncio.wait_for(
-                record.future, timeout=_ACK_WINDOW_SEC,
-            )
-        except asyncio.TimeoutError:
-            inbox_discard(record.request_id)
+            try:
+                decision = await asyncio.wait_for(
+                    record.future, timeout=_ACK_WINDOW_SEC,
+                )
+            except asyncio.TimeoutError:
+                inbox_discard(record.request_id)
+                _discarded = True
+                state.publish_event(
+                    "react_hitl_timeout",
+                    {"request_id": record.request_id, "tool": action},
+                )
+                state.pad.think(
+                    "HITL gate: user did not respond within the ack window — "
+                    "proceeding with the originally-emitted params. The "
+                    "synthesized idea will still surface on the Genie page; "
+                    "the user can dismiss it there if it was unintended."
+                )
+                return CONTINUE
+            except asyncio.CancelledError:
+                inbox_discard(record.request_id)
+                _discarded = True
+                raise
+
+            # Resolved by the user — fan out to the three concrete branches.
             state.publish_event(
-                "react_hitl_timeout",
-                {"request_id": record.request_id, "tool": action},
-            )
-            state.pad.think(
-                "HITL gate: user did not respond within the ack window — "
-                "proceeding with the originally-emitted params. The "
-                "synthesized idea will still surface on the Genie page; "
-                "the user can dismiss it there if it was unintended."
-            )
-            return CONTINUE
-        except asyncio.CancelledError:
-            inbox_discard(record.request_id)
-            raise
-
-        # Resolved by the user — fan out to the three concrete branches.
-        state.publish_event(
-            "react_hitl_resolved",
-            {
-                "request_id": record.request_id,
-                "tool": action,
-                "status": decision.status,
-            },
-        )
-
-        if decision.status == "skip":
-            state.pad.think(
-                "HITL gate: user vetoed the Genie synthesis call. "
-                "Dropping the dispatch and continuing the loop."
-            )
-            return AbortDispatch(
-                reason="hitl_user_skip",
-                observation_summary=(
-                    "User skipped the Genie synthesis at the approval gate. "
-                    "No capsule was created. Consider whether a different "
-                    "tool would address the user's question, or finalize "
-                    "with the evidence already gathered."
-                ),
-                error="hitl_skip",
+                "react_hitl_resolved",
+                {
+                    "request_id": record.request_id,
+                    "tool": action,
+                    "status": decision.status,
+                },
             )
 
-        # approve / modify: use the user's params when supplied, else
-        # fall back to the originally-emitted dict. ``modify`` is the
-        # interesting branch — the user can adjust seed paper ids /
-        # intent before we kick off the heavy workflow.
-        new_params = dict(params)
-        if decision.params:
-            new_params.update(decision.params)
-            state.pad.think(
-                "HITL gate: user approved with edits — using the modified "
-                f"params for {action}."
-            )
-        else:
-            state.pad.think(
-                f"HITL gate: user approved {action} — proceeding."
-            )
-        return DispatchOverride(params=new_params)
+            if decision.status == "skip":
+                state.pad.think(
+                    "HITL gate: user vetoed the Genie synthesis call. "
+                    "Dropping the dispatch and continuing the loop."
+                )
+                return AbortDispatch(
+                    reason="hitl_user_skip",
+                    observation_summary=(
+                        "User skipped the Genie synthesis at the approval gate. "
+                        "No capsule was created. Consider whether a different "
+                        "tool would address the user's question, or finalize "
+                        "with the evidence already gathered."
+                    ),
+                    error="hitl_skip",
+                )
+
+            # approve / modify: use the user's params when supplied, else
+            # fall back to the originally-emitted dict. ``modify`` is the
+            # interesting branch — the user can adjust seed paper ids /
+            # intent before we kick off the heavy workflow.
+            new_params = dict(params)
+            if decision.params:
+                new_params.update(decision.params)
+                state.pad.think(
+                    "HITL gate: user approved with edits — using the modified "
+                    f"params for {action}."
+                )
+            else:
+                state.pad.think(
+                    f"HITL gate: user approved {action} — proceeding."
+                )
+            return DispatchOverride(params=new_params)
+        finally:
+            # Catch-all: if we left the gate without going through one
+            # of the discard-handled branches above (unexpected raise
+            # mid-resolve-handling), make sure the slot doesn't linger.
+            # ``inbox_discard`` is idempotent so the double-call on
+            # the timeout/cancel paths is safe to skip via the flag.
+            if not _discarded:
+                # When a decision arrived, ``resolve()`` already
+                # popped the slot — discard is a no-op. When the
+                # success path raised after the await, this is the
+                # only place we clean up.
+                inbox_discard(record.request_id)
 
     # ── Preview builders ────────────────────────────────────────────
 

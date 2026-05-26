@@ -1653,7 +1653,21 @@ def queue_study(paper_id: UUID, expertise_level: str, user_id: UUID, paper_title
         name=f"study:{job_id}",
     )
     _study_background_tasks.add(task)
-    task.add_done_callback(_study_background_tasks.discard)
+
+    def _on_study_done(t: asyncio.Task, _jid: str = job_id) -> None:
+        _study_background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            # ``_run_job`` writes the job_store / DB status on its own
+            # failure paths, but if it raises BEFORE its own try/except
+            # opens (e.g. import error, OOM) the failure used to vanish
+            # into "task exception was never retrieved." Log so operators
+            # at least see the trace.
+            log.warning("study background job %s failed: %s", _jid, exc)
+
+    task.add_done_callback(_on_study_done)
     return job_id
 
 

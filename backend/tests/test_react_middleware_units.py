@@ -105,6 +105,54 @@ async def test_tool_ban_promotes_to_banned_set_after_cap():
     assert "deep_search" in state.banned_tools
 
 
+@pytest.mark.asyncio
+async def test_tool_ban_counts_successful_invocations():
+    """The per-tool TOTAL invocation counter must increment on every
+    ``before_tool`` pass-through, not just on failures. Without this
+    the new per-turn invocation cap could be silently bypassed by
+    successful tool calls."""
+    state = _make_state()
+    mw = ToolBanMiddleware()
+    await mw.before_tool(state, "deep_search", {"query": "x"})
+    await mw.before_tool(state, "deep_search", {"query": "y"})
+    assert state.tool_invocation_counts.get("deep_search") == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_ban_aborts_after_per_turn_invocation_cap():
+    """The per-tool invocation cap is the LangChain ToolCallLimit
+    ``run_limit`` equivalent — once a tool has been called N times in
+    one turn, further dispatches in the same turn are short-circuited
+    with ``error="tool_cap_exceeded"``. Prevents a planner stuck in a
+    successful-but-redundant loop from chewing the iteration budget."""
+    from app.assistant.tuning import REACT_PER_TOOL_INVOCATION_CAP
+
+    state = _make_state()
+    mw = ToolBanMiddleware()
+    # Pre-load the counter to the cap so the next call should abort.
+    state.tool_invocation_counts["deep_search"] = REACT_PER_TOOL_INVOCATION_CAP
+
+    result = await mw.before_tool(state, "deep_search", {"query": "again"})
+    assert isinstance(result, AbortDispatch)
+    assert result.error == "tool_cap_exceeded"
+    # Counter must NOT increment further on the aborted dispatch — the
+    # call never happened, so the bookkeeping must reflect that.
+    assert state.tool_invocation_counts["deep_search"] == REACT_PER_TOOL_INVOCATION_CAP
+
+
+@pytest.mark.asyncio
+async def test_tool_ban_counter_is_per_tool():
+    """The cap is scoped per-tool, not per-turn-global. Calls to
+    different tools must NOT contaminate each other's counters."""
+    state = _make_state()
+    mw = ToolBanMiddleware()
+    await mw.before_tool(state, "deep_search", {"query": "x"})
+    await mw.before_tool(state, "arxiv_search", {"query": "y"})
+    await mw.before_tool(state, "deep_search", {"query": "z"})
+    assert state.tool_invocation_counts["deep_search"] == 2
+    assert state.tool_invocation_counts["arxiv_search"] == 1
+
+
 # ── PaperLedger ─────────────────────────────────────────────────────────────
 
 
@@ -244,11 +292,20 @@ async def test_contradiction_detects_lexical_marker_on_result():
 
 @pytest.mark.asyncio
 async def test_contradiction_gate_forces_counter_search_on_open_signal():
-    state = _make_state(max_iterations=5)
+    """When a high-confidence contradiction's span shares meaningful
+    vocabulary with the user's query, the gate forces a counter-search.
+    The main-topic guard (added 2026-05) requires that overlap so
+    side-branch contradictions don't pull retrieval off-topic."""
+    state = _make_state(
+        query="transformer attention mechanism multi-head",
+        max_iterations=5,
+    )
     state.iteration_count = 1
     state.contradictions.add(ContradictionSignal(
         kind="lexical",
-        span="strong refutation here",
+        # Span includes vocabulary that overlaps the query so the
+        # main-topic guard lets it through.
+        span="The transformer attention claim is refuted by a stronger ablation",
         sources=["deep_search"],
         confidence=0.9,
     ))
@@ -256,6 +313,56 @@ async def test_contradiction_gate_forces_counter_search_on_open_signal():
     gate = await mw.gate_finalize(state)
     assert isinstance(gate, FinalizeForceAction)
     assert "claim" in gate.params or "query" in gate.params
+
+
+@pytest.mark.asyncio
+async def test_contradiction_gate_skips_offtopic_signal():
+    """A contradiction whose span shares ZERO meaningful vocabulary
+    with the user's query is treated as a side-branch and finalize is
+    allowed. Regression guard for the main-topic prioritisation rule
+    the user explicitly asked for."""
+    state = _make_state(
+        query="transformer attention mechanism multi-head",
+        max_iterations=5,
+    )
+    state.iteration_count = 1
+    state.contradictions.add(ContradictionSignal(
+        kind="lexical",
+        # Off-topic — no overlap with the transformer query.
+        span="The climate model precipitation reanalysis was refuted by satellite data",
+        sources=["deep_search"],
+        confidence=0.9,
+    ))
+    mw = ContradictionMiddleware(enable_semantic_llm=False)
+    gate = await mw.gate_finalize(state)
+    # Off-topic contradiction → no forced counter-search.
+    assert isinstance(gate, FinalizeAllow)
+
+
+@pytest.mark.asyncio
+async def test_contradiction_gate_skips_marginal_one_token_overlap():
+    """A single shared token between query and span is no longer
+    enough to force a counter-search. The 2026-05 tightening requires
+    ≥2 shared tokens AND ≥20% overlap with the query so a span that
+    happens to share one common research term (e.g. "retrieval") with
+    a long multi-topic query doesn't drag retrieval off-topic."""
+    state = _make_state(
+        query="mechanistic interpretability of transformer attention circuits",
+        max_iterations=5,
+    )
+    state.iteration_count = 1
+    state.contradictions.add(ContradictionSignal(
+        kind="lexical",
+        # Shares only "interpretability" with the query — the rest is
+        # about an unrelated symbolic-AI subfield.
+        span="The symbolic rule extraction interpretability claim was refuted",
+        sources=["deep_search"],
+        confidence=0.9,
+    ))
+    mw = ContradictionMiddleware(enable_semantic_llm=False)
+    gate = await mw.gate_finalize(state)
+    # Only one token overlaps — gate must allow finalize.
+    assert isinstance(gate, FinalizeAllow)
 
 
 @pytest.mark.asyncio
@@ -324,6 +431,80 @@ async def test_critic_gate_allows_on_last_iteration():
     state = _make_state(max_iterations=3)
     state.iteration_count = 3
     state.is_last_iteration = True
+    mw = CriticGateMiddleware()
+    gate = await mw.gate_finalize(state)
+    assert isinstance(gate, FinalizeAllow)
+
+
+@pytest.mark.asyncio
+async def test_critic_gate_blocks_free_finalize_when_no_loop_retrievals():
+    """A loop that hits the min-iteration threshold but has done no
+    retrievals of its own AND had only a thin initial plan must NOT
+    free-finalize — it should still be forced through a critique.
+    This is the "shallow turn" carve-out: avoid the
+    plan-already-executed-→-finalize trace."""
+    state = _make_state(max_iterations=5)
+    # Past the iteration threshold (default 3) but no real evidence.
+    state.iteration_count = 4
+    state.successful_retrievals = 0
+    state.new_results = {}
+    state.prior_results = {}  # initial plan also empty
+    mw = CriticGateMiddleware()
+    gate = await mw.gate_finalize(state)
+    assert isinstance(gate, FinalizeForceCritique)
+
+
+@pytest.mark.asyncio
+async def test_critic_gate_reforces_critique_on_weak_scores_with_no_retrievals():
+    """When the first critique returned weak scores AND the loop has
+    no retrievals of its own AND there's critique budget left, the
+    gate must force a SECOND critique to pressure the model to gather
+    evidence before finalizing."""
+    state = _make_state(max_iterations=5)
+    state.iteration_count = 1
+    state.successful_retrievals = 0
+    state.new_results = {}
+    state.prior_results = {}
+    # Simulate that one critique already ran and recorded weak scores.
+    state.forced_critiques = 1
+    state.pad.critique(
+        groundedness=0.3, completeness=0.3, memory_faithfulness=1.0,
+        issues=["too thin"], verdict="revise",
+    )
+    mw = CriticGateMiddleware()
+    gate = await mw.gate_finalize(state)
+    assert isinstance(gate, FinalizeForceCritique)
+    assert state.forced_critiques == 2
+
+
+@pytest.mark.asyncio
+async def test_critic_gate_does_not_reforce_when_scores_pass():
+    """When the recorded critique already scored above the threshold,
+    the gate must allow finalize — the model judged the answer ready
+    and we have no reason to second-guess it."""
+    state = _make_state(max_iterations=5)
+    state.iteration_count = 1
+    state.successful_retrievals = 0
+    state.new_results = {}
+    state.forced_critiques = 1
+    state.pad.critique(
+        groundedness=0.8, completeness=0.8, memory_faithfulness=1.0,
+        issues=[], verdict="ship",
+    )
+    mw = CriticGateMiddleware()
+    gate = await mw.gate_finalize(state)
+    assert isinstance(gate, FinalizeAllow)
+
+
+@pytest.mark.asyncio
+async def test_critic_gate_allows_when_evidence_is_substantive():
+    """A loop that's past the min-iteration threshold AND has done
+    real retrievals of its own must free-finalize — the substantive-
+    evidence carve-out keeps deep-research turns from being pinned
+    at the gate after they've actually worked."""
+    state = _make_state(max_iterations=5)
+    state.iteration_count = 4
+    state.successful_retrievals = 2
     mw = CriticGateMiddleware()
     gate = await mw.gate_finalize(state)
     assert isinstance(gate, FinalizeAllow)

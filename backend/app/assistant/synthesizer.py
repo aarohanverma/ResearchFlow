@@ -100,8 +100,17 @@ _FORMAT_GUIDANCE = (
     "• Mermaid diagrams — when a concept benefits from a flow / state diagram, emit "
     "a ` ```mermaid ` fenced block. Keep node labels short. Validate the syntax in "
     "your head before emitting (no trailing semicolons, no smart quotes in labels).\n"
+    "• Math expressions — wrap inline math in `$...$` (e.g. `$r_t < \\tau$`, "
+    "`$\\pi_\\theta(a \\mid s)$`) so the frontend renders it via KaTeX. NEVER wrap "
+    "math in backticks (`` ` ``) — that's code formatting and the math will render "
+    "as a flat literal string instead of typeset math. Use display math `$$...$$` "
+    "on its own line for important formulas.\n"
     "• Citations — every factual sentence must carry at least one citation in the "
-    "form `[1]`, `[2]`, or `[A1]` for arXiv candidates.\n"
+    "form `[1]`, `[2]`, or `[A1]` for arXiv candidates. NEVER compress citation "
+    "ranges. Write `[2] [3] [4] [5] [6]` (each marker individually) — NOT "
+    "`[2]-[6]`, NOT `[2]_[6]`, NOT `[2]–[6]`. Each marker must be its own "
+    "bracketed token so the frontend can render every citation as its own "
+    "clickable chip.\n"
     "\n"
     "STRUCTURE — ALWAYS:\n"
     "1. Open with a 1–3 sentence answer-first TL;DR (no heading).\n"
@@ -160,6 +169,44 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
     evidence_expansion_failed = (
         tool_failures >= 2 and successful_retrievals == 0 and iters > 0
     )
+
+    # Genie status — surfaces the actual tool outcome so the answer
+    # narrates honestly. Without this directive the synthesizer would
+    # describe a still-running synthesis as if it had completed,
+    # because the only signal it sees is "genie_session_id exists".
+    genie_status = (agent_notes or {}).get("genie_status") or {}
+    if isinstance(genie_status, dict) and genie_status.get("status"):
+        st = str(genie_status.get("status") or "").lower()
+        title = (genie_status.get("capsule_title") or "").strip()
+        if st in {"done"}:
+            if title:
+                parts.append(
+                    f"- GENIE STATUS: done — capsule '{title}' is ready. The user "
+                    "can open it from the Genie tab; you may reference its "
+                    "hypothesis in the answer."
+                )
+            else:
+                parts.append(
+                    "- GENIE STATUS: done — capsule is ready on the Genie tab."
+                )
+        elif st in {"queued", "running", "timeout"}:
+            parts.append(
+                f"- GENIE STATUS: {st} — the idea is STILL being synthesized in "
+                "the background. DO NOT describe it as completed. Tell the "
+                "user it's in progress and will appear on the Genie tab when "
+                "ready; link there rather than narrating a finished hypothesis."
+            )
+        elif st in {"failed", "done_empty"}:
+            parts.append(
+                f"- GENIE STATUS: {st} — the synthesis did NOT produce a "
+                "publishable hypothesis. Acknowledge this honestly in the "
+                "answer; do not pretend a capsule was created."
+            )
+        elif st == "cancelled":
+            parts.append(
+                "- GENIE STATUS: cancelled — the user (or the orchestrator) "
+                "stopped the synthesis. Do not narrate a result."
+            )
 
     if iters > 0:
         parts.append(f"- The agent ran {iters} adaptive iteration(s) after the initial plan.")
@@ -244,20 +291,33 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
         c = int(claims.get("contradicted_count") or 0)
         u = int(claims.get("unverifiable_count") or 0)
         p = int(claims.get("provisional_count") or 0)
+        tiers = claims.get("by_evidence_tier") or {}
+        exp = int(tiers.get("experiment-verified") or 0)
+        meth = int(tiers.get("method-verified") or 0)
+        abs_only = int(tiers.get("abstract-only") or 0)
+        unver = int(tiers.get("unverified") or 0)
         parts.append(
             f"- STRONG-CLAIM LEDGER: {claims['total']} strong claim(s) tracked — "
             f"{v} verified against the paper body, {c} contradicted, "
-            f"{u} unverifiable (full-paper check unavailable), {p} still provisional. "
-            "When an answer uses a verified claim it may be stated firmly. "
-            "When an answer uses a provisional / unverifiable claim, you MUST "
-            "explicitly label it as ABSTRACT-ONLY or PROVISIONAL — do not "
-            "present it as if the full paper confirmed it."
+            f"{u} unverifiable (full-paper check unavailable), {p} still provisional.\n"
+            f"    Evidence tiers: experiment-verified={exp}, method-verified={meth}, "
+            f"abstract-only={abs_only}, unverified={unver}.\n"
+            "    EVIDENCE-QUALITY LABELLING RULES (load-bearing — the user explicitly asks for this):\n"
+            "    • An ``experiment-verified`` claim may be stated firmly. "
+            "Optionally label it inline as \"(experiment-verified)\" when the precision matters.\n"
+            "    • A ``method-verified`` claim should be quoted with a light hedge — "
+            "say \"according to the paper's method section\" or label it \"(method-verified)\".\n"
+            "    • An ``abstract-only`` claim MUST be explicitly labelled \"(abstract-only)\" — "
+            "do not present it as if the full paper confirmed it.\n"
+            "    • An ``unverified`` claim MUST be labelled \"(unverified)\" or \"(provisional)\" — "
+            "the answer's tone around it should be tentative, not declarative."
         )
         if claims.get("contradicted"):
             parts.append("    Contradicted strong claims (DO NOT repeat without flagging):")
             for item in claims["contradicted"][:4]:
                 parts.append(
                     f"      • paper={str(item.get('paper_id',''))[:12]} "
+                    f"tier={item.get('evidence_tier','abstract-only')} "
                     f"claim={str(item.get('span',''))[:200]!r}"
                 )
         if claims.get("provisional"):
@@ -266,6 +326,7 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
                 parts.append(
                     f"      • paper={str(item.get('paper_id',''))[:12]} "
                     f"src={item.get('source','?')} "
+                    f"tier={item.get('evidence_tier','abstract-only')} "
                     f"claim={str(item.get('span',''))[:200]!r}"
                 )
         if claims.get("verified"):
@@ -273,6 +334,7 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
             for item in claims["verified"][:4]:
                 parts.append(
                     f"      • paper={str(item.get('paper_id',''))[:12]} "
+                    f"tier={item.get('evidence_tier','abstract-only')} "
                     f"claim={str(item.get('span',''))[:200]!r}"
                 )
 
@@ -300,6 +362,104 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
     if not parts:
         return ""
     return "<agent_notes>\n" + "\n".join(parts) + "\n</agent_notes>"
+
+
+def _detect_output_quality_issue(answer: str) -> str | None:
+    """Return a short reason string when ``answer`` looks broken,
+    else ``None`` when the answer is fit to ship.
+
+    The user's spec is explicit: "RA must never output empty or
+    corrupted content." We check for the failure modes we've actually
+    seen in the wild:
+
+    * Empty / whitespace-only output.
+    * Suspiciously short output relative to a research turn (under
+      ~80 chars including markdown formatting is almost always a
+      truncated generation, not a real answer).
+    * Truncated mid-token: ends with an unmatched code-fence,
+      unbalanced parenthesis run, a dangling ``[`` citation marker,
+      or an unmatched ``$`` LaTeX block.
+    * Template-placeholder leakage: ``{{var}}`` / ``${var}`` /
+      ``<TODO>`` markers that escaped the strip pass.
+    * Provider error markers the adapter occasionally bubbles up
+      (``[ERROR]``, ``[BLOCKED]``, ``RATE_LIMIT``).
+
+    Returns the reason on failure so the caller can log it; returns
+    ``None`` on the happy path so the safeguard is a cheap no-op for
+    well-formed answers.
+    """
+    if not isinstance(answer, str):
+        return "answer is not a string"
+    stripped = answer.strip()
+    if not stripped:
+        return "empty answer"
+    # Length floor with a "sentence-completed" carve-out. The
+    # original 80-char floor false-positived on legitimate short
+    # replies — a complete one-sentence answer like
+    # ``"Yes. The transformer paper introduced multi-head attention,
+    #    not the original attention mechanism."`` is fine but would
+    # have tripped the 80-char check. The refined rule:
+    #
+    #   * Under 24 chars → almost certainly truncated.
+    #   * 24..80 chars AND ends without sentence-ending punctuation
+    #     → likely truncated mid-sentence. We let the trailing-
+    #     connective check downstream catch the rest of these,
+    #     but here we cover the case where the model emits a
+    #     fragment with no terminator at all.
+    #   * 24..80 chars ending with ``.!?`` (or close-quote/paren
+    #     variants) is treated as a legitimate short reply.
+    SENT_END = ".!?\"')]`"
+    if len(stripped) < 24:
+        return f"answer too short ({len(stripped)} chars) — likely truncated"
+    if len(stripped) < 80 and stripped[-1] not in SENT_END:
+        return (
+            f"answer short ({len(stripped)} chars) and lacks sentence-ending "
+            "punctuation — likely truncated"
+        )
+    # Template-placeholder leak.
+    import re as _re_q
+    if _re_q.search(r"\{\{\s*[A-Za-z_][\w.\-]*\s*\}\}|\$\{\s*[A-Za-z_][\w.\-]*\s*\}", stripped):
+        return "answer contains unresolved template placeholder"
+    if _re_q.search(r"<\s*(?:TODO|FIXME|PLACEHOLDER|TBD)\b", stripped, _re_q.IGNORECASE):
+        return "answer contains TODO/FIXME placeholder marker"
+    # Provider error markers — the adapter normally raises, but some
+    # paths surface a string instead. Catch the obvious cases.
+    low = stripped.lower()
+    if low.startswith(("[error]", "[blocked]", "[rate_limit]", "error:", "blocked:")):
+        return "answer starts with a provider error marker"
+    # Unbalanced code fence — ``len(matches) % 2 != 0`` means the
+    # final block was opened but never closed.
+    if stripped.count("```") % 2 != 0:
+        return "answer ends mid code-block (unbalanced ```)"
+    # Unmatched single-line LaTeX — ``$...$`` count must be even.
+    # We deliberately don't check ``$$...$$`` because that's an
+    # acceptable display-math block and balanced rendering is
+    # frontend-tolerant.
+    if stripped.count("$") % 2 != 0 and "$$" not in stripped:
+        return "answer ends mid LaTeX expression (unmatched $)"
+    # Dangling citation marker — ``[`` at end without closing ``]``.
+    # We only check the LAST 80 chars so a long answer with an
+    # internal ``[`` in code (e.g. Python list literal) doesn't
+    # false-positive.
+    tail = stripped[-80:]
+    open_brackets = tail.count("[")
+    close_brackets = tail.count("]")
+    if open_brackets > close_brackets and stripped.endswith(("[", "[A", "[A1")):
+        return "answer ends mid citation marker"
+    # Ends with a hanging conjunction / preposition / comma — a
+    # strong truncation tell. We require the LAST WORD to be one of
+    # these AND the answer not end with a period/question/exclamation,
+    # so a sentence that closes correctly even with a trailing
+    # connective doesn't trip the check.
+    last_char = stripped[-1]
+    if last_char not in ".!?\"')]`":
+        last_word = stripped.rsplit(None, 1)[-1].lower() if stripped.split() else ""
+        if last_word in {
+            "and", "but", "or", "the", "a", "an", "of", "to", "in", "on", "for",
+            "with", "as", "by", "from", "that", "which", "while", "where", "because",
+        }:
+            return f"answer ends mid-sentence (trailing connective {last_word!r})"
+    return None
 
 
 def _has_low_grounding_signal(
@@ -441,7 +601,26 @@ def _strip_unresolvable_citations(
     n_papers = len(papers or [])
     n_arxiv = len(arxiv_results or [])
 
-    def _filter_indices(raw: str, ceiling: int) -> list[int]:
+    # ``[A*]`` markers must point at an arxiv_results entry that the
+    # frontend can actually open — either ``external_id`` (arXiv abs
+    # URL) or ``source_url`` (DOI / publisher / Semantic Scholar
+    # fallback). An entry with neither is functionally inert in the
+    # UI (chip styled as a link but click does nothing), so we treat
+    # those indices as unresolvable and strip the marker. This makes
+    # the on-screen state honest: a citation chip survives only when
+    # clicking it will navigate.
+    resolvable_arxiv: set[int] = set()
+    for idx, item in enumerate(arxiv_results or []):
+        if not isinstance(item, dict):
+            continue
+        has_dest = bool(
+            (item.get("external_id") or "").strip()
+            or (item.get("source_url") or item.get("url") or "").strip()
+        )
+        if has_dest:
+            resolvable_arxiv.add(idx + 1)  # 1-based marker index
+
+    def _filter_indices(raw: str, ceiling: int, *, allowed: set[int] | None = None) -> list[int]:
         out: list[int] = []
         for part in raw.split(","):
             part = part.strip()
@@ -461,6 +640,8 @@ def _strip_unresolvable_citations(
                     continue
                 if 1 <= n <= ceiling:
                     out.append(n)
+        if allowed is not None:
+            out = [i for i in out if i in allowed]
         # Preserve order, drop dups
         seen: set[int] = set()
         ordered: list[int] = []
@@ -474,23 +655,135 @@ def _strip_unresolvable_citations(
         idxs = _filter_indices(m.group(1), n_papers)
         if not idxs:
             return ""  # drop the whole marker
-        return "[" + ",".join(str(i) for i in idxs) + "]"
+        # Emit one bracketed marker per index, space-separated, so the
+        # frontend's single-number marker regex (``[A?\d+]``) renders
+        # each citation as its own clickable chip. The earlier
+        # comma-joined ``[1,2,3]`` form rendered as plain text in the
+        # UI — broken citations the user couldn't click. Expanding to
+        # ``[1] [2] [3]`` also matches the user's explicit spec
+        # ("never collapse to a range").
+        return " ".join(f"[{i}]" for i in idxs)
 
     def _replace_arxiv(m: re.Match) -> str:
-        idxs = _filter_indices(m.group(1), n_arxiv)
+        idxs = _filter_indices(m.group(1), n_arxiv, allowed=resolvable_arxiv)
         if not idxs:
             return ""
-        return "[A" + ",".join(str(i) for i in idxs) + "]"
+        return " ".join(f"[A{i}]" for i in idxs)
 
-    # Paper markers first — ``[A N]`` is more specific so we run it before
+    # Expand adjacency ranges FIRST — the LLM emits ``[1] - [7]``
+    # (two separate markers joined by a dash) more often than the
+    # internal-range form ``[1-7]``. Running expansion before the
+    # per-marker filter means each expanded index is then validated
+    # by the same pipeline as any other inline marker — out-of-range
+    # indices get clamped here, then re-validated below. The user's
+    # spec is explicit: never collapse a contiguous citation range;
+    # render every marker individually so each chip is clickable and
+    # auditable in the citation table.
+    cleaned = _expand_adjacent_marker_ranges(answer, n_papers, n_arxiv, resolvable_arxiv)
+    # Paper markers — ``[A N]`` is more specific so we run it before
     # the broad ``[N]`` pattern.
-    cleaned = re.sub(r"\[A\s*(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_arxiv, answer)
+    cleaned = re.sub(r"\[A\s*(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_arxiv, cleaned)
     cleaned = re.sub(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_paper, cleaned)
     # Tidy: orphan punctuation left behind when we dropped a marker
     # (``"...baseline ." → "...baseline."``, ``"...sentence  ;" → "...sentence;"``).
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned
+
+
+# Separators the LLM uses to "compress" a citation range across two
+# adjacent markers. Matches a literal hyphen, en-dash, em-dash, minus
+# sign, or underscore — optionally surrounded by whitespace. Does NOT
+# match a comma (that's a list, not a range) or "to" (too ambiguous in
+# prose).
+_RANGE_SEP = r"\s*[-‐‑‒–—−_]\s*"
+_CORPUS_RANGE_PATTERN = re.compile(rf"\[(\d+)\]{_RANGE_SEP}\[(\d+)\]")
+_ARXIV_RANGE_PATTERN = re.compile(rf"\[A(\d+)\]{_RANGE_SEP}\[A(\d+)\]")
+# A safety cap so a degenerate ``[1]-[10000]`` doesn't expand into a
+# 10k-marker wall; 50 mirrors the per-marker range cap inside
+# ``_filter_indices``.
+_MAX_RANGE_EXPANSION = 50
+
+
+def _expand_adjacent_marker_ranges(
+    text: str,
+    n_papers: int,
+    n_arxiv: int,
+    resolvable_arxiv: set[int],
+) -> str:
+    """Expand adjacent-marker range syntax into individual markers.
+
+    Turns ``"[2]-[6]"`` and ``"[2] _ [6]"`` and ``"[2]–[6]"`` into
+    ``"[2] [3] [4] [5] [6]"`` (corpus) and ``"[A2]-[A6]"`` into
+    ``"[A2] [A3] [A4] [A5] [A6]"`` (arXiv). Reversed ranges (``[6]-[2]``)
+    or excessive spans (``[1]-[10000]``) collapse safely back to the
+    original text — the goal is precision, not aggressive rewrites.
+
+    The expansion runs iteratively so chains like ``[1]-[3]-[5]`` resolve
+    in two passes (``[1]-[3]`` first, then the result merges with
+    ``-[5]``). Hard-capped at three passes so a pathological input can
+    never blow the synthesizer.
+    """
+    if not text:
+        return text
+
+    def _expand_corpus(match: re.Match) -> str:
+        a = int(match.group(1))
+        b = int(match.group(2))
+        expanded = _expand_range(a, b, n_papers, prefix="")
+        # Invalid range (reversed, oversized, both below 1) → keep
+        # the original text intact rather than silently deleting it.
+        # The user can re-read and decide; we never want this helper
+        # to make the answer worse.
+        return expanded or match.group(0)
+
+    def _expand_arxiv(match: re.Match) -> str:
+        a = int(match.group(1))
+        b = int(match.group(2))
+        expanded = _expand_range(a, b, n_arxiv, prefix="A")
+        if not expanded:
+            return match.group(0)
+        # Drop indices the frontend can't actually link — same gate the
+        # per-marker filter uses for arXiv rows.
+        if resolvable_arxiv:
+            kept = [
+                tok for tok in expanded.split(" ")
+                if int(tok[2:-1]) in resolvable_arxiv  # ``[A12]`` → 12
+            ]
+            if not kept:
+                # Nothing in the range is resolvable — leave the
+                # original text so the strip pass below can decide
+                # whether to drop or keep it.
+                return match.group(0)
+            return " ".join(kept)
+        return expanded
+
+    out = text
+    for _ in range(3):
+        prev = out
+        out = _ARXIV_RANGE_PATTERN.sub(_expand_arxiv, out)
+        out = _CORPUS_RANGE_PATTERN.sub(_expand_corpus, out)
+        if out == prev:
+            break
+    return out
+
+
+def _expand_range(a: int, b: int, ceiling: int, *, prefix: str) -> str:
+    """Return the space-joined marker sequence for [a..b], or the
+    empty string when the range is invalid. The caller decides whether
+    to substitute or leave the original text intact.
+    """
+    if a < 1 or b < 1:
+        return ""
+    if a > b:
+        return ""
+    if b - a + 1 > _MAX_RANGE_EXPANSION:
+        return ""
+    if ceiling > 0:
+        b = min(b, ceiling)
+        if a > b:
+            return ""
+    return " ".join(f"[{prefix}{i}]" for i in range(a, b + 1))
 
 
 async def synthesize_answer(
@@ -923,6 +1216,149 @@ async def synthesize_answer(
         except Exception as exc:  # noqa: BLE001
             log.debug("low-grounding notice skipped: %s", exc)
 
+        # ── Semantic-adequacy evaluator ─────────────────────────────
+        # Strong-model audit of the answer for relevance,
+        # groundedness, completeness, and drift. Distinct from the
+        # mechanical-corruption check below — this catches answers
+        # that are well-formed but don't actually address what the
+        # user asked. When the evaluator flags revisable issues,
+        # we run ONE re-synth pass with the evaluator's notes
+        # spliced in. Bounded (one revision max) so we never loop.
+        # Best-effort: a failure here ships the original answer.
+        try:
+            from app.assistant.final_evaluator import (
+                evaluate_final_answer,
+                revision_notes,
+                should_revise,
+            )
+            eval_report = await evaluate_final_answer(
+                query=query,
+                answer=answer,
+                papers=papers,
+                arxiv_results=arxiv_results,
+            )
+            if eval_report and isinstance(output, dict):
+                output["final_evaluation"] = eval_report
+            if eval_report and should_revise(eval_report):
+                notes = revision_notes(eval_report)
+                log.info(
+                    "final_evaluator: verdict=%s — running one revision pass",
+                    eval_report.get("verdict"),
+                )
+                try:
+                    from app.adapters.llm import get_llm_adapter
+                    _llm = get_llm_adapter()
+                    revise_prompt = (
+                        f"Below is your DRAFT answer to the user. A reviewer flagged "
+                        f"the following issues:\n\n{notes}\n\n"
+                        f"ORIGINAL QUERY:\n{query}\n\n"
+                        f"DRAFT ANSWER:\n{answer}\n\n"
+                        "Produce a REVISED answer that addresses every flagged "
+                        "issue while preserving everything the draft got right. "
+                        "Keep the same citation style and the same evidence-tier "
+                        "labelling. Do NOT introduce claims you can't cite. If a "
+                        "flagged improvement asks for content you don't have "
+                        "evidence for, acknowledge the gap explicitly rather than "
+                        "fabricating."
+                    )
+                    revised = await _llm.complete(
+                        [{"role": "user", "content": revise_prompt}],
+                        _llm.reasoning_model,
+                        max_tokens=None,
+                        temperature=0.1,
+                    )
+                    revised_text = (revised.text or "").strip()
+                    # Apply the same citation strip the original got
+                    # so the revision's markers stay valid.
+                    if revised_text:
+                        try:
+                            revised_text = _strip_unresolvable_citations(
+                                revised_text, papers, arxiv_results,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Only adopt the revision when it didn't
+                        # introduce a quality issue of its own.
+                        rev_issue = _detect_output_quality_issue(revised_text)
+                        if rev_issue is None:
+                            answer = revised_text
+                            if isinstance(output, dict):
+                                output["revised_after_evaluation"] = True
+                                # Stale provenance verdicts were keyed
+                                # against the ORIGINAL answer's claim
+                                # positions. Re-run the deterministic
+                                # verifier on the revised text so the
+                                # frontend renders correct per-marker
+                                # verdicts. We skip the LLM-escalation
+                                # step here to keep latency bounded —
+                                # any unverified claims remain flagged
+                                # exactly as the cheap path scored
+                                # them. ``chunk_evidence`` is also
+                                # cleared because its claim-position
+                                # links no longer apply.
+                                try:
+                                    from app.assistant.provenance_verification import (
+                                        verify_claims as _verify_claims,
+                                    )
+                                    rev_report = _verify_claims(
+                                        answer=answer,
+                                        papers=papers,
+                                        arxiv_results=arxiv_results,
+                                    )
+                                    if rev_report.total:
+                                        output["provenance"] = {
+                                            "total": rev_report.total,
+                                            "supported": rev_report.supported,
+                                            "unverified": rev_report.unverified,
+                                            "unsupported": rev_report.unsupported,
+                                            "verified_ratio": rev_report.verified_ratio,
+                                            "flagged": [
+                                                {
+                                                    "marker": c.marker, "verdict": c.verdict,
+                                                    "paper_title": c.paper_title[:120],
+                                                    "claim": c.claim[:240],
+                                                    "missing_salient": c.missing_salient[:4],
+                                                    "overlap_score": c.overlap_score,
+                                                }
+                                                for c in rev_report.claims
+                                                if c.verdict in ("unsupported", "unverified")
+                                            ][:10],
+                                        }
+                                    else:
+                                        # No citations to verify —
+                                        # clear any stale provenance.
+                                        output.pop("provenance", None)
+                                except Exception as _exc:  # noqa: BLE001
+                                    # If re-verification fails, scrub
+                                    # the stale provenance so the
+                                    # frontend doesn't show wrong
+                                    # verdicts.
+                                    output.pop("provenance", None)
+                                    log.debug(
+                                        "post-revision provenance re-verify failed: %s",
+                                        _exc,
+                                    )
+                except Exception as exc:  # noqa: BLE001 — revision is best-effort
+                    log.debug("final_evaluator revision skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — evaluator must never crash the turn
+            log.debug("final_evaluator skipped: %s", exc)
+
+        # ── Output-quality safeguard ─────────────────────────────────
+        # Catch empty / truncated / corrupted answers BEFORE returning.
+        # The user's spec is unambiguous: "RA must never output empty
+        # or corrupted content." When the quality check trips, raise
+        # so the existing fallback retry path runs — one retry with
+        # the quality model. If that still produces garbage we
+        # surface ``fallback`` rather than show the user a broken
+        # answer.
+        quality_issue = _detect_output_quality_issue(answer)
+        if quality_issue is not None:
+            log.warning(
+                "assistant synthesis quality safeguard tripped: %s — retrying",
+                quality_issue,
+            )
+            raise RuntimeError(f"synthesis quality safeguard: {quality_issue}")
+
         return answer
     except Exception as exc:
         log.warning("assistant synthesis fallback (reasoning model): %s — retrying with quality model", exc)
@@ -942,9 +1378,23 @@ async def synthesize_answer(
                 async for chunk in llm2.stream(msgs2, llm2.quality_model):
                     chunks2.append(chunk)
                     await on_delta(chunk)
-                return "".join(chunks2).strip() or fallback
-            res2 = await llm2.complete(msgs2, llm2.quality_model, max_tokens=None, temperature=0.2)
-            return res2.text.strip() or fallback
+                retry_answer = "".join(chunks2).strip() or fallback
+            else:
+                res2 = await llm2.complete(msgs2, llm2.quality_model, max_tokens=None, temperature=0.2)
+                retry_answer = res2.text.strip() or fallback
+            # Apply the same quality safeguard to the retry — a broken
+            # retry must NEVER reach the user. If the retry is also
+            # corrupt, fall back to the canned ``fallback`` message
+            # which is at least intelligible.
+            retry_issue = _detect_output_quality_issue(retry_answer)
+            if retry_issue is not None:
+                log.warning(
+                    "assistant synthesis retry also failed quality check: %s — "
+                    "returning fallback",
+                    retry_issue,
+                )
+                return fallback
+            return retry_answer
         except Exception as exc2:
             log.warning("assistant synthesis fallback: %s", exc2)
             return fallback
@@ -1600,14 +2050,26 @@ def build_message_blocks(
     fred_series: list[dict] | None = None,
     trials_results: list[dict] | None = None,
     code_results: list[dict] | None = None,
+    agent_notes: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Assemble the structured ``payload.blocks`` list rendered by the UI.
 
     Block kinds: ``text``, ``paper_grid``, ``arxiv_grid``, ``source_papers``,
     ``graph_summary``, ``web_results``, ``comparison_table``, ``bookmarks_answer``,
     ``artifact_link``, ``suggestion_chips``, ``actions_taken``,
-    ``nvd_results``, ``fred_data``, ``trials_results``, ``code_results``.
+    ``nvd_results``, ``fred_data``, ``trials_results``, ``code_results``,
+    ``citation_table``.
     Frontend dispatches per-block so the assistant message is never a wall of markdown.
+
+    ``agent_notes`` carries the ReAct loop's claim ledger and the
+    provenance verifier's per-citation report when available. The
+    ``citation_table`` block — emitted at the END of the message — joins
+    those reports against the actual ``papers`` + ``arxiv_results`` lists
+    to give the user one consolidated, auditable view of every cited
+    source: marker, title, evidence tier, verification verdict, and
+    clickable URL. The user asked for this so they can verify every
+    citation at a glance instead of having to cross-reference inline
+    markers with separate grids.
     """
     blocks: list[dict[str, Any]] = []
     if answer:
@@ -1730,7 +2192,216 @@ def build_message_blocks(
             "kind": "actions_taken",
             "actions": actions,
         })
-    return blocks
+    # Consolidated citation table — emitted at the END so it reads
+    # like a References section. Joins the paper / arxiv lists against
+    # the claim ledger + provenance verifier so each row shows the
+    # marker the answer used, the title, the evidence tier, the
+    # verification verdict, and the clickable URL. Skipped on turns
+    # with no citations at all (free-reasoning answers).
+    citation_rows = _build_citation_rows(
+        papers=papers,
+        arxiv_results=arxiv_results,
+        agent_notes=agent_notes,
+    )
+    if citation_rows:
+        blocks.append({
+            "kind": "citation_table",
+            "title": "Citations",
+            "rows": citation_rows,
+        })
+    # Defensive guard — keep the citation table pinned to the END of
+    # the block list regardless of which paths above appended what.
+    # The user's spec is unambiguous ("Citation table should be shown
+    # at the end of the output"); a future contributor adding a new
+    # block kind after this point would otherwise silently displace
+    # the table. Centralising the invariant here means any future
+    # blocks land in their natural position and the table still ships
+    # last.
+    return _pin_citation_table_last(blocks)
+
+
+def _pin_citation_table_last(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move every ``citation_table`` block to the tail of the list.
+
+    Idempotent: calling on a list where the table is already last is a
+    no-op. Multiple tables collapse to a single trailing run (the
+    synthesizer only ever emits one, but the helper handles arbitrary
+    counts so downstream merges stay safe).
+    """
+    if not blocks:
+        return blocks
+    head: list[dict[str, Any]] = []
+    tail: list[dict[str, Any]] = []
+    for b in blocks:
+        if isinstance(b, dict) and b.get("kind") == "citation_table":
+            tail.append(b)
+        else:
+            head.append(b)
+    return head + tail
+
+
+def _build_citation_rows(
+    *,
+    papers: list[dict],
+    arxiv_results: list[dict],
+    agent_notes: dict | None,
+) -> list[dict]:
+    """Compose the consolidated citation table the UI renders at the
+    bottom of every grounded message.
+
+    Each row carries:
+
+    * ``marker``         — the inline marker the answer uses (``1`` for
+                           corpus, ``A1`` for external).
+    * ``title``          — the paper title.
+    * ``authors``        — first three authors, comma-separated.
+    * ``namespace_key``  — corpus only; empty for external rows.
+    * ``paper_id``       — corpus UUID, used by the frontend to open
+                           the Paper Panel.
+    * ``url``            — external URL when available (DOI / arXiv /
+                           publisher / Semantic Scholar). Empty when
+                           the row is corpus-only — those open through
+                           ``paper_id`` instead.
+    * ``evidence_tier``  — ``experiment-verified`` / ``method-verified``
+                           / ``abstract-only`` / ``unverified``, sourced
+                           from the strong-claim ledger when the paper
+                           was the subject of a forced verification
+                           round; otherwise defaults to the row's
+                           inherent tier (corpus rows: abstract-only;
+                           arXiv rows: unverified until inspected).
+    * ``verdict``        — ``verified`` / ``contradicted`` / ``provisional``
+                           / ``unverified`` / ``unresolved``. ``unresolved``
+                           specifically marks rows the answer cited but
+                           where the URL / paper_id couldn't be resolved
+                           — the user explicitly asked us to surface
+                           these rather than silently treat them as
+                           grounded.
+
+    Empty list when no papers or external candidates were surfaced this
+    turn — the citation table block is then suppressed entirely.
+    """
+    rows: list[dict] = []
+
+    # Build a paper_id → verdict / tier map from the claim ledger so
+    # rows can carry per-paper verification state. Defensive against
+    # malformed agent_notes — a non-dict ``claim_ledger`` (some future
+    # serialisation path that lands a list here) silently collapses to
+    # empty maps rather than crashing the table builder.
+    raw_ledger = (agent_notes or {}).get("claim_ledger")
+    ledger: dict = raw_ledger if isinstance(raw_ledger, dict) else {}
+    by_paper_tier: dict[str, str] = {}
+    by_paper_verdict: dict[str, str] = {}
+    for bucket_name, default_verdict in (
+        ("verified", "verified"),
+        ("contradicted", "contradicted"),
+        ("provisional", "provisional"),
+    ):
+        bucket = ledger.get(bucket_name)
+        if not isinstance(bucket, list):
+            continue
+        for item in bucket:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("paper_id") or "")
+            if not pid:
+                continue
+            # Strongest tier wins; the same paper may carry multiple
+            # claims at different tiers.
+            tier = str(item.get("evidence_tier") or "abstract-only")
+            current = by_paper_tier.get(pid)
+            if _tier_rank(tier) > _tier_rank(current or "abstract-only"):
+                by_paper_tier[pid] = tier
+            elif current is None:
+                by_paper_tier[pid] = tier
+            # First-write wins for verdict (the ledger orders strongest
+            # bucket first).
+            by_paper_verdict.setdefault(pid, default_verdict)
+
+    # Provenance verifier per-marker verdicts, when available. Same
+    # defensive shape guard: a non-dict provenance silently collapses
+    # to an empty flagged set rather than crashing the builder.
+    raw_prov = (agent_notes or {}).get("provenance")
+    prov: dict = raw_prov if isinstance(raw_prov, dict) else {}
+    flagged_raw = prov.get("flagged")
+    flagged_iter = flagged_raw if isinstance(flagged_raw, list) else []
+    flagged_markers: set[str] = {
+        str(f.get("marker") or "")
+        for f in flagged_iter
+        if isinstance(f, dict) and f.get("verdict") in {"unverified", "unsupported"}
+    }
+
+    # Corpus papers — markers [1]..[N].
+    for idx, p in enumerate(papers or [], start=1):
+        pid = str(p.get("paper_id") or "")
+        marker = str(idx)
+        tier = by_paper_tier.get(pid, "abstract-only")
+        verdict = by_paper_verdict.get(pid, "provisional")
+        # A corpus row whose marker the provenance verifier flagged
+        # gets a softer "unverified" verdict so the UI can highlight
+        # the misalignment rather than imply the citation is grounded.
+        if marker in flagged_markers and verdict == "provisional":
+            verdict = "unverified"
+        rows.append({
+            "marker": marker,
+            "is_external": False,
+            "title": (p.get("title") or "")[:280],
+            "authors": [(a or "") for a in (p.get("authors") or [])[:3]],
+            "namespace_key": p.get("namespace_key") or "",
+            "paper_id": pid,
+            "url": p.get("source_url") or "",
+            "evidence_tier": tier,
+            "verdict": verdict,
+        })
+
+    # External candidates — markers [A1]..[A20].
+    for idx, p in enumerate(arxiv_results or [], start=1):
+        marker = f"A{idx}"
+        ext_id = str(p.get("external_id") or "").strip()
+        src_url = str(p.get("source_url") or p.get("url") or "").strip()
+        url = ""
+        if ext_id and not ext_id.lower().startswith(("http://", "https://")):
+            url = (
+                f"https://doi.org/{ext_id}"
+                if "/" in ext_id and not ext_id.lower().startswith("arxiv:")
+                else f"https://arxiv.org/abs/{ext_id}"
+            )
+        elif src_url:
+            url = src_url
+        verdict = "unverified"
+        if not url:
+            # Unresolved — the answer cited a candidate we cannot link
+            # back to a real source. Surface explicitly per user spec.
+            verdict = "unresolved"
+        if marker in flagged_markers and verdict != "unresolved":
+            verdict = "unverified"
+        rows.append({
+            "marker": marker,
+            "is_external": True,
+            "title": (p.get("title") or "")[:280],
+            "authors": [(a or "") for a in (p.get("authors") or [])[:3]],
+            "namespace_key": "",
+            "paper_id": "",
+            "url": url,
+            "evidence_tier": "abstract-only" if url else "unverified",
+            "verdict": verdict,
+        })
+
+    return rows
+
+
+_TIER_ORDER = {
+    "unverified": 0,
+    "abstract-only": 1,
+    "method-verified": 2,
+    "experiment-verified": 3,
+}
+
+
+def _tier_rank(tier: str) -> int:
+    """Return a sortable rank for an evidence tier; unknown tiers
+    sort below ``unverified`` so the strongest tier always wins the
+    "strongest tier wins" merge."""
+    return _TIER_ORDER.get(tier or "", -1)
 
 
 def _graph_has_content(graph_result: dict) -> bool:

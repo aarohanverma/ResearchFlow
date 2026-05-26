@@ -28,6 +28,7 @@ WRITE new facts or DELETE stale ones; recall is implicit.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -266,6 +267,119 @@ async def _resolve_root_session(db, session_id):
     return await db.get(AssistantSession, rid)
 
 
+# Module-level strong-reference set for fire-and-forget background
+# tasks spawned by ``memory_recall``. Without this, Python 3.12+ GCs
+# unrooted asyncio tasks at any await point — the recall response
+# could return, the task could be collected mid-write, and
+# ``last_recalled_ts`` would silently never land in storage. Tasks
+# remove themselves on completion via a done-callback so the set
+# doesn't grow unboundedly.
+_RECALL_BG_TASKS: "set[asyncio.Task]" = set()
+
+
+async def _bump_last_recalled_ts(
+    *,
+    session_id,
+    persistent_keys: dict[str, set[str]],
+    ns_namespace: str,
+    recalled_ts: str,
+) -> None:
+    """Update ``last_recalled_ts`` on memory entries that were just
+    surfaced by ``memory_recall``.
+
+    Why fire-and-forget: we want the "last used" field on the
+    Settings → Memory UI to be real, but the recall response must
+    stay fast. So we schedule the bump as a detached asyncio task
+    after the tool returns. Failure is logged but never bubbles up.
+
+    Why bounded keys: only the entries actually returned to the
+    planner get bumped — not the whole bucket. Otherwise the field
+    would say "everything was recalled at the same instant", which
+    isn't useful.
+
+    Why a separate DB session: ``ctx.db`` is owned by the calling
+    turn's transaction; we don't want to interleave a stray write
+    into it. ``async_session_factory()`` gives us a clean one that
+    commits its own changes.
+
+    Args:
+        session_id: Originating session — used to walk to the root
+            session that holds the memory buckets.
+        persistent_keys: ``{"tree_memory": {keys...}, "ns_memory": {keys...}}``.
+            Short-tier (``chat_memory``) is intentionally excluded —
+            it lives on the per-chat session and auto-prunes, so the
+            extra write would be churn.
+        ns_namespace: Namespace key for the ``ns_memory`` bucket.
+            ``ns_memory`` is keyed by namespace at the top level
+            (``ns_memory[namespace_key][key]``); without it we can't
+            target the right inner bucket.
+        recalled_ts: ISO timestamp to write into each entry.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.assistant.state_lock import session_state_lock
+    # ``async_session_factory`` isn't imported at module scope (this
+    # helper is the only consumer in this file), so we resolve it
+    # here. Previously a bare reference NameError'd inside the
+    # try/except below and the bump silently never landed — the
+    # ``last_recalled_ts`` UI field was effectively dead on arrival.
+    from app.db.session import async_session_factory
+
+    if not any(persistent_keys.values()):
+        return
+    try:
+        async with async_session_factory() as db:
+            current = await db.get(AssistantSession, session_id)
+            if current is None:
+                return
+            root = await _resolve_root_session(db, session_id) or current
+            async with session_state_lock(root.id):
+                # Re-fetch the root inside the lock so concurrent
+                # writes (auto_memory consolidation) don't get
+                # clobbered by our background update.
+                root = await db.get(AssistantSession, root.id)
+                if root is None:
+                    return
+                state = dict(root.state or {})
+                mutated = False
+                # Tree memory.
+                tree_keys = persistent_keys.get("tree_memory") or set()
+                if tree_keys:
+                    tree = dict(state.get("tree_memory") or {})
+                    for k in tree_keys:
+                        entry = tree.get(k)
+                        if isinstance(entry, dict):
+                            entry["last_recalled_ts"] = recalled_ts
+                            tree[k] = entry
+                            mutated = True
+                    if mutated:
+                        state["tree_memory"] = tree
+                # Namespace memory.
+                ns_keys = persistent_keys.get("ns_memory") or set()
+                if ns_keys and ns_namespace:
+                    ns_mem = dict(state.get("ns_memory") or {})
+                    bucket = dict(ns_mem.get(ns_namespace) or {})
+                    bucket_mutated = False
+                    for k in ns_keys:
+                        entry = bucket.get(k)
+                        if isinstance(entry, dict):
+                            entry["last_recalled_ts"] = recalled_ts
+                            bucket[k] = entry
+                            bucket_mutated = True
+                    if bucket_mutated:
+                        ns_mem[ns_namespace] = bucket
+                        state["ns_memory"] = ns_mem
+                        mutated = True
+                if mutated:
+                    root.state = state
+                    flag_modified(root, "state")
+                    await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "last_recalled_ts bump failed (session=%s): %s",
+            session_id, exc,
+        )
+
+
 def _evict_to_cap(mem: dict, cap: int) -> dict:
     """Drop oldest non-preference entries until ``len(mem) <= cap``.
 
@@ -400,11 +514,28 @@ class MemoryWriteTool:
 
     async def run(self, ctx: ToolContext, params: MemoryWriteInput) -> ToolResult:
         from app.assistant.state_lock import session_state_lock
+        from app.assistant.pii_redactor import redact_pii
 
         mem_type = params.memory_type if params.memory_type in _VALID_TYPES else "context"
         norm_key = _normalize_key(params.key)
         tier = _SCOPE_ALIASES.get(params.scope, "medium")
         bucket = _SCOPE_TO_BUCKET[tier]
+        # PII redaction at the memory boundary. The LLM occasionally
+        # decides to "remember the user's email / API key / phone"
+        # from the conversation; without this, that PII persists in
+        # ``session.state`` for the lifetime of the session, ends up
+        # in the embedding cache, and can leak back into future
+        # planner prompts. The redactor is conservative (Luhn-
+        # validated cards; specific API-key prefixes only) and never
+        # raises — on any failure the original text is kept so a
+        # regex misfire can't silently break memory writes.
+        _pii = redact_pii(params.value)
+        if _pii.found:
+            params = params.model_copy(update={"value": _pii.text})
+            log.info(
+                "memory_write: redacted %s from %s-tier write key=%r",
+                ",".join(sorted(_pii.found)), tier, norm_key,
+            )
         await ctx.emit_progress(30, f"Storing {tier}-tier [{mem_type}] memory: {norm_key!r}")
         try:
             # ``short`` and ``long`` write to the current session. ``medium``
@@ -563,6 +694,38 @@ class MemoryWriteTool:
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(target, "state")
                 await ctx.db.flush()
+
+                # ── Audit trail ──────────────────────────────────────────
+                # Records every manual memory_write so the user can see
+                # the full history in Settings → Memory and restore an
+                # earlier version. Best-effort: a failure here is
+                # logged but never aborts the live write, which is
+                # already committed by the surrounding nested
+                # transaction.
+                if tier in ("medium", "long"):
+                    try:
+                        from app.assistant.memory_revisions import record_revision
+                        ns_for_row = (
+                            params.namespace_key
+                            if (tier == "long" and getattr(params, "namespace_key", ""))
+                            else (ctx.namespace_key if tier == "long" else "")
+                        )
+                        await record_revision(
+                            ctx.db,
+                            user_id=ctx.user_id,
+                            session_id=ctx.session_id,
+                            tier=tier,
+                            key=norm_key,
+                            value=params.value,
+                            action=("update" if existing is not None else "create"),
+                            namespace_key=ns_for_row or "",
+                            entry_type=mem_type,
+                            source="manual",
+                            previous_value=(existing_value or None),
+                            ttl_days=int(params.ttl_days) if params.ttl_days else None,
+                        )
+                    except Exception as _rev_exc:
+                        log.debug("memory_write audit log skipped: %s", _rev_exc)
         except Exception as exc:
             log.warning("memory_write failed: %s", exc)
             return ToolResult(
@@ -703,6 +866,15 @@ class MemoryRecallTool:
                 # them as independent facts).
                 if isinstance(entry, dict) and entry.get("consolidated_into"):
                     return False
+                # Same logic for entries the supersession detector has
+                # marked: the NEWER entry is authoritative; the older
+                # one stays in storage for the audit trail and the
+                # Settings → Memory restore button, but the planner
+                # must not see both. Filtering here is the cheapest
+                # place to gate it — the entry stays in the bucket so
+                # restore still works.
+                if isinstance(entry, dict) and entry.get("superseded_by_key"):
+                    return False
                 if t and _entry_type(entry) != t:
                     return False
                 if q:
@@ -807,6 +979,55 @@ class MemoryRecallTool:
             short_out = {}
             medium_out, long_out = {}, {}
 
+        # ── Fire-and-forget: bump ``last_recalled_ts`` on persistent
+        # entries that were actually surfaced. Bounded to the keys we
+        # returned (not the full memory bucket) so the write stays
+        # cheap. Detached as a background task so recall latency
+        # stays unchanged; failure is logged but never blocks the
+        # tool's return.
+        try:
+            recalled_now = _now_iso()
+            persistent_keys = {
+                "tree_memory": set(medium_out.keys()),
+                "ns_memory":   set(long_out.keys()),
+            }
+            # Only schedule the update if SOMETHING persistent was
+            # surfaced — the common no-result case stays free.
+            if any(persistent_keys.values()):
+                # Root the task in a module-level strong-reference set
+                # so Python 3.12+ doesn't GC it before completion.
+                # ``add_done_callback`` removes the task from the set
+                # once it finishes (success or failure), so the set
+                # stays bounded by the number of in-flight bumps.
+                bg_task = asyncio.create_task(
+                    _bump_last_recalled_ts(
+                        session_id=ctx.session_id,
+                        persistent_keys=persistent_keys,
+                        ns_namespace=ctx.namespace_key,
+                        recalled_ts=recalled_now,
+                    ),
+                    name="memory_recall:last_recalled_ts",
+                )
+                _RECALL_BG_TASKS.add(bg_task)
+
+                def _on_recall_done(t: asyncio.Task) -> None:
+                    _RECALL_BG_TASKS.discard(t)
+                    if t.cancelled():
+                        return
+                    exc = t.exception()
+                    if exc is not None:
+                        # last_recalled_ts is pure telemetry — failure is
+                        # never user-visible, but we still want it in the
+                        # logs to spot DB-write regressions instead of
+                        # letting them silently accumulate.
+                        log.debug(
+                            "last_recalled_ts bump failed: %s", exc,
+                        )
+
+                bg_task.add_done_callback(_on_recall_done)
+        except Exception as _exc:  # noqa: BLE001 — telemetry must never block recall
+            log.debug("last_recalled_ts schedule skipped: %s", _exc)
+
         await ctx.emit_progress(
             100,
             f"Recalled {len(short_out)} chat + {len(medium_out)} tree + "
@@ -881,6 +1102,14 @@ class MemoryDeleteTool:
                 state = dict(target.state or {})
                 mem = dict(state.get(bucket) or {})
                 if norm_key in mem:
+                    removed_entry = mem[norm_key]
+                    prior_value = ""
+                    prior_type = "context"
+                    if isinstance(removed_entry, dict):
+                        prior_value = str(removed_entry.get("value") or "")
+                        prior_type = str(removed_entry.get("type") or "context")
+                    elif removed_entry is not None:
+                        prior_value = str(removed_entry)
                     del mem[norm_key]
                     state[bucket] = mem
                     target.state = state
@@ -888,6 +1117,30 @@ class MemoryDeleteTool:
                     flag_modified(target, "state")
                     await ctx.db.flush()
                     deleted = True
+
+                    # Audit trail — only the persistent tiers (medium /
+                    # long). Short-tier entries auto-prune; recording
+                    # would bloat the log without surfacing actionable
+                    # history.
+                    if tier in ("medium", "long"):
+                        try:
+                            from app.assistant.memory_revisions import record_revision
+                            await record_revision(
+                                ctx.db,
+                                user_id=ctx.user_id,
+                                session_id=ctx.session_id,
+                                tier=tier,
+                                key=norm_key,
+                                value="",
+                                action="delete",
+                                namespace_key=(ctx.namespace_key if tier == "long" else ""),
+                                entry_type=prior_type,
+                                source="manual",
+                                previous_value=prior_value,
+                                status="deleted",
+                            )
+                        except Exception as _rev_exc:
+                            log.debug("memory_delete audit log skipped: %s", _rev_exc)
         except Exception as exc:
             log.warning("memory_delete failed: %s", exc)
 

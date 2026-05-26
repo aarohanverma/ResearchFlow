@@ -64,7 +64,17 @@ log = logging.getLogger(__name__)
 # Conservative defaults. The orchestrator can override per call when it
 # already knows the depth tier (e.g. push max_iterations down for "single").
 _DEFAULT_MAX_ITERATIONS = 8
-_DEFAULT_DEADLINE_SECONDS = 90.0
+# Wall-clock ceiling for the full ReAct loop. 30 minutes is generous
+# enough for a deep-research turn with multiple full-paper
+# verification rounds, while still bounding a genuinely stuck loop
+# so a worker can't be held forever. Per-tool timeouts derive from
+# this via ``state.time_remaining()``, so a single hanging tool
+# will trip well within the ceiling.
+#
+# Infrastructure safety nets (DB pool timeout, lock acquisition
+# timeout, per-provider HTTP timeouts) are KEPT — those are
+# correctness guards, not latency budgets.
+_DEFAULT_DEADLINE_SECONDS = 1_800.0   # 30 minutes
 _FORCE_FINAL_THRESHOLD = 1   # last iteration auto-finalizes if model doesn't
 # Minimum reasoning depth before the model is allowed to finalize without
 # at least one self-critique. A turn that finalized on iteration 1-2 with
@@ -88,6 +98,15 @@ _DISALLOWED_FROM_LOOP: frozenset[str] = frozenset({
 # so far and records the score on the scratchpad — giving the model a way to
 # self-judge mid-flight rather than waiting for the post-synth critique pass.
 _PSEUDO_ACTIONS: frozenset[str] = frozenset({"critique"})
+
+# Maximum number of subagents the loop will dispatch in parallel via
+# ``subagent_parallel``. The LangChain multi-agent docs flag
+# Subagents+parallelism as the most token-efficient pattern for
+# multi-domain queries (5 calls / ~9K tokens for a 3-domain example
+# vs Handoffs at 7+ calls / 14K+ tokens). We bound this so a
+# hallucinated fan-out can't blow the iteration budget; 3 covers the
+# common multi-domain compare case (e.g. "compare A vs B vs C").
+_MAX_PARALLEL_SUBAGENTS = 3
 
 
 # ── Decision schema ──────────────────────────────────────────────────────────
@@ -118,6 +137,27 @@ _DECISION_SCHEMA = {
                     "rationale": {"type": "string", "maxLength": 400},
                 },
                 "required": ["tool"],
+            },
+        },
+        # When ``action == "subagent_parallel"``, the model emits a
+        # ``dispatches`` array of {subagent_name, task} pairs. The loop
+        # spawns all subagents concurrently (preserving context
+        # quarantine per subagent), waits via ``asyncio.gather``, and
+        # records each subagent's distilled summary as a separate
+        # result. This is the LangChain multi-agent docs'
+        # "Subagents + parallel execution" pattern — most efficient
+        # for multi-domain queries.
+        "dispatches": {
+            "type": "array",
+            "maxItems": _MAX_PARALLEL_SUBAGENTS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "subagent_name": {"type": "string", "maxLength": 60},
+                    "task": {"type": "string", "maxLength": 600},
+                    "rationale": {"type": "string", "maxLength": 400},
+                },
+                "required": ["subagent_name", "task"],
             },
         },
         # When ``action == "write_todos"``, ``todos`` is a list of
@@ -175,6 +215,36 @@ _PLACEHOLDER_PATTERNS = re.compile(
         <{1,2}\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^>]*>{1,2}? |
         \{\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^}]*\}    |
         \[\s*(?:todo|fill|placeholder|tbd|fixme|xxx)[^\]]*\]  |
+        # Mustache / Jinja / Handlebars / Liquid-style template
+        # variables. The planner LLM regularly emits these for
+        # cross-step references like ``{{best_supporting_paper_id}}``
+        # expecting some later substitution layer to fill them in —
+        # but there is no such layer, so without this guard the
+        # placeholder reaches the tool and fails with "Paper not
+        # found: {{best_supporting_paper_id}}". Double braces are
+        # unambiguously template syntax; single braces would risk
+        # false positives on legitimate strings.
+        \{\{\s*[A-Za-z_][\w.\-]*\s*\}\}    |
+        # JS-style template literal: ${var_name}
+        \$\{\s*[A-Za-z_][\w.\-]*\s*\}      |
+        # ERB / EJS style: <%= var %> or <% var %>
+        <%=?\s*[A-Za-z_][\w.\-]*\s*%>      |
+        # Cross-step reference templates the planner LLM hallucinates
+        # from LangChain / agent-framework training data — there is no
+        # such substitution layer in this orchestrator, so without this
+        # guard the literal string ``$STEP2.paper_ids[0]`` reaches
+        # paper_qa / compare_papers and trips the tool's own validation
+        # only after a failed DB lookup. Matched forms:
+        #   $STEP2.paper_ids[0]   ${STEP_2.paper_ids}
+        #   STEP1.paper_id        step3.results[2]
+        #   <<step_2.output>>     [step1.id]
+        \$?\{?\s*step[_\s]?\d+\s*[.\[][\w.\[\]\-]*\}?  |
+        <<\s*step[_\s]?\d+[^>]*>>          |
+        \[\s*step[_\s]?\d+[.\[][^\]]*\]    |
+        # Generic "output of step N" / "from step N" prose that
+        # sometimes lands in id fields when the LLM narrates instead
+        # of substituting.
+        (?:output|result|id|ids)\s+(?:of|from)\s+step[_\s]?\d+ |
         (?:n/?a|tbd|todo|fixme|null|none|undefined|fill_me|fill_in|\?{2,})\s*$
     )
     """,
@@ -187,6 +257,12 @@ def _looks_like_placeholder(value: Any) -> bool:
     Caught:
       - ``"__to_fill_from_retrieval__"`` and ``__like_this__``
       - ``"<TODO>"`` / ``<<fill>>`` / ``{placeholder}`` / ``[tbd]``
+      - Mustache / Jinja / Handlebars / Liquid templates like
+        ``"{{best_supporting_paper_id}}"`` — the planner LLM regularly
+        emits these for cross-step references, but there is no
+        substitution layer downstream, so an unstripped template
+        variable lands in the tool unchanged.
+      - JS template literals ``${var}`` and ERB ``<%= var %>``.
       - Bare ``"null"`` / ``"None"`` / ``"undefined"`` strings
       - Empty / whitespace-only strings
       - Lists where every element is itself a placeholder
@@ -216,6 +292,20 @@ _QUERY_LIKE_FIELDS: frozenset[str] = frozenset({
 })
 _PAPER_ID_LIST_FIELDS: frozenset[str] = frozenset({"paper_ids", "ids"})
 _PAPER_ID_SINGLE_FIELDS: frozenset[str] = frozenset({"paper_id", "id"})
+
+# Tools that NEED at least one paper reference to be useful, even
+# though their pydantic schemas declare ``paper_id`` and
+# ``paper_title`` as optional (because either alternative satisfies
+# the contract). When the preflight sees one of these tools called
+# with BOTH paper_id and paper_title empty AND the ledger has
+# papers, it auto-fills paper_id from the ledger so the call lands
+# instead of being rejected by the tool's own placeholder guard. The
+# user explicitly flagged this as a bug: retrieval populated the
+# ledger but the model called paper_qa with empty identifiers, and
+# the preflight had no signal to fill them.
+_REQUIRES_PAPER_REF: frozenset[str] = frozenset({
+    "paper_qa", "deep_paper_analysis", "study_paper",
+})
 
 
 @dataclass
@@ -418,6 +508,33 @@ def _preflight_and_repair_params(
             if ids:
                 repaired[k] = ids[0]
                 notes.append(f"auto-filled '{k}' from ledger: {ids[0]}")
+
+    # 3. Tool-specific OPTIONAL-field ledger fill. paper_qa /
+    # deep_paper_analysis / study_paper need at least one paper
+    # reference to do useful work, but their schemas mark both
+    # ``paper_id`` and ``paper_title`` as optional (because either
+    # satisfies the contract). The required-field loop above skips
+    # them, so without this pass the call lands at the tool with
+    # both empty and gets rejected. Auto-filling paper_id from the
+    # ledger here closes the gap.
+    if action in _REQUIRES_PAPER_REF:
+        has_id = (
+            "paper_id" in repaired
+            and isinstance(repaired["paper_id"], str)
+            and repaired["paper_id"].strip()
+        )
+        has_title = (
+            "paper_title" in repaired
+            and isinstance(repaired["paper_title"], str)
+            and repaired["paper_title"].strip()
+        )
+        if not has_id and not has_title:
+            ids = ledger.ids(limit=1)
+            if ids:
+                repaired["paper_id"] = ids[0]
+                notes.append(
+                    f"auto-filled 'paper_id' from ledger for {action}: {ids[0]}"
+                )
 
     return repaired, notes
 
@@ -830,6 +947,144 @@ async def run_react_loop(
             )
             continue
 
+        # ── Pseudo-action: subagent_parallel (multi-domain fan-out) ──
+        # Mirrors ``subagent`` but takes a ``dispatches`` array and
+        # runs the named subagents concurrently. The LangChain
+        # multi-agent docs flag this as the most token-efficient
+        # pattern for multi-domain queries (e.g. compare three
+        # technologies, gather independent evidence on N facets).
+        # Each subagent gets full context quarantine — the parent
+        # only sees N distilled summaries, never the intermediate
+        # observations. Bounded by ``_MAX_PARALLEL_SUBAGENTS`` so a
+        # hallucinated fan-out can't blow the iteration budget.
+        if action.lower() == "subagent_parallel" and state.subagent_depth > 0:
+            state.pad.observe(
+                tool="subagent_parallel",
+                summary=(
+                    "Nested parallel subagent dispatch refused — a subagent "
+                    "cannot itself delegate. Focus on the assigned task."
+                ),
+                output_ref="",
+                error="subagent_recursion_blocked",
+            )
+            continue
+
+        if action.lower() == "subagent_parallel":
+            raw_dispatches = decision.get("dispatches") or params.get("dispatches") or []
+            if not isinstance(raw_dispatches, list) or not raw_dispatches:
+                state.pad.observe(
+                    tool="subagent_parallel",
+                    summary=(
+                        "subagent_parallel emitted with no 'dispatches' array — "
+                        "expected list of {subagent_name, task} pairs."
+                    ),
+                    output_ref="",
+                    error="missing_dispatches",
+                )
+                continue
+            # Filter to valid dispatch shapes + cap at the hard limit.
+            valid: list[tuple[str, str, str]] = []
+            for d in raw_dispatches[:_MAX_PARALLEL_SUBAGENTS]:
+                if not isinstance(d, dict):
+                    continue
+                sname = str(d.get("subagent_name") or "").strip()
+                stask = str(d.get("task") or "").strip()
+                srat = str(d.get("rationale") or "")[:400]
+                if not sname or sname not in SUBAGENT_REGISTRY:
+                    state.pad.observe(
+                        tool="subagent_parallel",
+                        summary=(
+                            f"Unknown subagent '{sname}' in dispatches — skipped. "
+                            "Available: " + ", ".join(sorted(SUBAGENT_REGISTRY.keys()))
+                        ),
+                        output_ref="",
+                        error="unknown_subagent",
+                    )
+                    continue
+                if not stask:
+                    state.pad.observe(
+                        tool="subagent_parallel",
+                        summary=f"Empty task for subagent '{sname}' — skipped.",
+                        output_ref="",
+                        error="empty_task",
+                    )
+                    continue
+                valid.append((sname, stask, srat))
+            if not valid:
+                state.pad.observe(
+                    tool="subagent_parallel",
+                    summary="No valid subagent dispatches survived filtering.",
+                    output_ref="",
+                    error="no_valid_dispatches",
+                )
+                continue
+
+            state.pad.act(
+                tool="subagent_parallel",
+                params={
+                    "dispatch_count": len(valid),
+                    "subagents": [n for n, _, _ in valid],
+                },
+                rationale=rationale or "parallel multi-domain delegation",
+            )
+            state.publish_event("react_subagent_parallel_start", {
+                "iteration": state.pad.iteration,
+                "subagents": [n for n, _, _ in valid],
+            })
+
+            # Concurrent dispatch — each subagent runs in its own
+            # nested ReAct loop with its own scratchpad + tool catalog.
+            # ``return_exceptions=True`` so one failing subagent never
+            # cancels its siblings; failures are recorded and the
+            # parent moves on. Cancellation propagates through
+            # ``should_cancel`` on each nested loop.
+            async def _run_one(name: str, task_text: str) -> Any:
+                return await run_subagent(
+                    parent_state=state,
+                    subagent_name=name,
+                    task=task_text,
+                )
+            sub_outputs = await asyncio.gather(
+                *(_run_one(n, t) for n, t, _ in valid),
+                return_exceptions=True,
+            )
+            for (sname, _stask, _srat), outcome in zip(valid, sub_outputs):
+                if isinstance(outcome, asyncio.CancelledError):
+                    raise outcome
+                if isinstance(outcome, BaseException):
+                    log.warning(
+                        "parallel subagent '%s' raised: %s", sname, outcome,
+                    )
+                    state.pad.observe(
+                        tool=f"subagent:{sname}",
+                        summary=f"Subagent error: {outcome}",
+                        output_ref="",
+                        error=str(outcome)[:300],
+                    )
+                    continue
+                sub_tool_result = outcome.to_tool_result()
+                slot_key = f"subagent:{sname}"
+                # Disambiguate when the same subagent is dispatched
+                # multiple times in one fan-out (e.g. researcher on
+                # three sub-questions): suffix with an index.
+                idx = 1
+                while slot_key in state.new_results:
+                    idx += 1
+                    slot_key = f"subagent:{sname}#{idx}"
+                state.new_results[slot_key] = sub_tool_result
+                await chain.after_tool(state, slot_key, params, sub_tool_result)
+                state.pad.observe(
+                    tool=slot_key,
+                    summary=outcome.summary,
+                    output_ref=slot_key,
+                    error=None,
+                )
+            state.publish_event("react_subagent_parallel_done", {
+                "iteration": state.pad.iteration,
+                "dispatched": len(valid),
+            })
+            continue
+
         if action.lower() == "subagent":
             subagent_name = str(
                 params.get("subagent_name")
@@ -981,13 +1236,74 @@ async def run_react_loop(
                     )
                     continue
 
-            if state.ctx_factory is not None:
-                async with state.ctx_factory() as _action_ctx:
-                    result: ToolResult = await tool.run(_action_ctx, validated)
-            elif state.ctx is not None:
-                result = await tool.run(state.ctx, validated)
-            else:
-                raise RuntimeError("react_loop: neither ctx nor ctx_factory provided")
+            # Per-tool wall-clock guardrail. Now derived from the
+            # loop's remaining time + a small grace window, which is
+            # effectively 24h thanks to the relaxed default deadline.
+            # The user spec explicitly says "avoid deadlines/budgets
+            # — user can wait for quality outputs," so this no longer
+            # acts as a latency budget; it only catches the
+            # pathological case of a tool that wedges forever (network
+            # socket lost, provider returns no response) where the
+            # provider's own HTTP timeout has somehow failed to fire.
+            # The user's Stop button still works because
+            # ``should_cancel`` is polled between iterations and the
+            # async cancellation propagates into the in-flight tool.
+            tool_timeout = max(5.0, state.time_remaining() + 2.0)
+
+            async def _dispatch_with_ctx() -> ToolResult:
+                if state.ctx_factory is not None:
+                    async with state.ctx_factory() as _action_ctx:
+                        return await tool.run(_action_ctx, validated)
+                elif state.ctx is not None:
+                    return await tool.run(state.ctx, validated)
+                else:
+                    raise RuntimeError("react_loop: neither ctx nor ctx_factory provided")
+
+            try:
+                result: ToolResult = await asyncio.wait_for(
+                    _dispatch_with_ctx(),
+                    timeout=tool_timeout,
+                )
+            except asyncio.TimeoutError as _to_exc:
+                # Route the timeout through the SAME error path the
+                # regular-exception branch uses below, so the per-tool
+                # ban counter, retrieval observability, and
+                # contradiction signals all see a consistent record of
+                # the failure. Previously the timeout path called
+                # ``record_tool_failure`` directly and skipped
+                # ``chain.on_tool_error`` — middleware observability
+                # silently missed every tool timeout. Going through
+                # ``on_tool_error`` is the right channel: the
+                # ToolBanMiddleware bumps the counter exactly once,
+                # avoiding the double-increment a direct call would
+                # cause.
+                state.pad.observe(
+                    tool=action,
+                    summary=(
+                        f"Tool '{action}' exceeded the loop's remaining wall-clock "
+                        f"budget ({tool_timeout:.1f}s) — dispatched, timed out, "
+                        "no result. The tool is now considered failed for this "
+                        "turn; the loop continues with whatever evidence is "
+                        "already in scope."
+                    ),
+                    output_ref="",
+                    error="tool_timeout",
+                )
+                try:
+                    await chain.on_tool_error(state, action, params, _to_exc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _mw_exc:  # noqa: BLE001
+                    # Middleware error-hook failure must never abort
+                    # the loop — log and continue. The loop's primary
+                    # contract is "always return a ReactOutcome".
+                    log.warning(
+                        "react_loop: on_tool_error hook failed after timeout "
+                        "for tool '%s': %s", action, _mw_exc,
+                    )
+                # CancelledError propagation is unaffected because
+                # wait_for surfaces it natively.
+                continue
 
             state.new_results[action] = result
             state.pad.observe(
@@ -1127,13 +1443,26 @@ async def _decide_next_action(
             "      chatter you don't need to read in detail. Available subagents:\n"
             f"{_render_subagent_catalog()}\n"
             "      Format: ``{\"action\":\"subagent\",\"params\":{\"subagent_name\":\"researcher\",\"task\":\"...\"}}``,\n"
+            "  (d2) call action 'subagent_parallel' with a 'dispatches' array of\n"
+            f"       up to {_MAX_PARALLEL_SUBAGENTS} {{subagent_name, task}} pairs to\n"
+            "       fan out independent multi-step investigations CONCURRENTLY. Each\n"
+            "       subagent keeps its own context quarantine; you observe N distilled\n"
+            "       summaries, not N traces. Use when sub-questions are genuinely\n"
+            "       independent (compare three approaches; gather counter-evidence on\n"
+            "       multiple claims at once; research three sub-topics in parallel).\n"
+            "       Saves wall-clock time vs serial subagent dispatches.\n"
+            "       Format: ``{\"action\":\"subagent_parallel\",\"dispatches\":["
+            "{\"subagent_name\":\"researcher\",\"task\":\"...\"},"
+            "{\"subagent_name\":\"contradiction_hunter\",\"task\":\"...\"}]}``,\n"
             "  (e) call action 'finalize' to hand off to synthesis.\n\n"
         )
         delegation_advice = (
-            "Prefer 'fanout' when sub-questions are independent and each is one tool "
-            "call. Prefer 'subagent' when a sub-question is itself a multi-step "
-            "investigation (you want isolation, not just parallelism). Prefer serial "
-            "calls when a later step depends on an earlier step's output.\n\n"
+            "Prefer 'fanout' when sub-questions are independent and each is ONE tool "
+            "call. Prefer 'subagent' when a single sub-question is itself a multi-step "
+            "investigation (you want isolation, not just parallelism). Prefer "
+            "'subagent_parallel' when 2-3 independent sub-questions are each multi-step "
+            "investigations — this saves both context AND wall-clock time. Prefer "
+            "serial calls when a later step depends on an earlier step's output.\n\n"
         )
     else:
         subagent_block = (

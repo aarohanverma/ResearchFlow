@@ -115,11 +115,57 @@ class AssistantRepository:
         return session
 
     async def archive_session(self, user_id: UUID, session_id: UUID) -> bool:
+        """Archive a session and detach its context.
+
+        Beyond flipping the status flag, we ALSO:
+
+        * Strip the session's working memory (chat / tree / ns)
+          so an archived session cannot keep injecting context into
+          future answers via the orchestrator's memory_view. The user
+          spec: "deleting a session should delete its memory".
+        * Remove this session's entry from its parent's
+          ``branch_summaries`` map so the parent no longer surfaces
+          the archived child as an active branch in its own context.
+          This is the "no later parent context should leak" guarantee
+          enforced from the delete direction.
+
+        ``AssistantSession.state`` is the only mutable JSONB column
+        on the row, so we mutate it in-place and call
+        ``flag_modified`` to make the ORM emit the UPDATE.
+        """
+        from sqlalchemy.orm.attributes import flag_modified
+
         session = await self.get_session(user_id, session_id)
         if not session:
             return False
         session.status = AssistantSessionStatus.archived
         session.updated_at = datetime.now(timezone.utc)
+
+        # Wipe operational memory on the archived session itself.
+        # ``state`` may hold rolling history summaries, branch
+        # bookkeeping, and the three memory buckets — clear the
+        # buckets but leave audit-trail fields (history_summary
+        # cache) so the row stays inspectable.
+        state = dict(session.state or {})
+        for bucket in ("chat_memory", "tree_memory", "ns_memory", "branch_summaries"):
+            if bucket in state:
+                state[bucket] = {} if isinstance(state[bucket], dict) else state[bucket]
+        session.state = state
+        flag_modified(session, "state")
+
+        # Detach from parent's branch_summaries so the parent stops
+        # surfacing this child in its context.
+        if session.parent_session_id:
+            parent = await self._db.get(AssistantSession, session.parent_session_id)
+            if parent is not None and parent.user_id == user_id:
+                parent_state = dict(parent.state or {})
+                branches = dict(parent_state.get("branch_summaries") or {})
+                if str(session.id) in branches:
+                    del branches[str(session.id)]
+                    parent_state["branch_summaries"] = branches
+                    parent.state = parent_state
+                    flag_modified(parent, "state")
+
         await self._db.flush()
         return True
 

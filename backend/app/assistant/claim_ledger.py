@@ -180,6 +180,26 @@ class StrongClaim:
     pass — without it the loop would burn the per-turn forced-paper_qa
     budget on the same claim over and over, leaving every other strong
     claim unverified.
+
+    ``evidence_tier`` is the user-facing evidence-quality label the
+    synthesizer renders into the answer. It composes with the verdict:
+
+      * ``abstract-only``      — claim grounded in the abstract / tldr /
+                                 snippet only; no full-paper check ran.
+      * ``method-verified``    — paper_qa hit returned chunks tagged with
+                                 a methodology / approach / architecture
+                                 section, AND the answer supports the
+                                 claim.
+      * ``experiment-verified`` — paper_qa hit returned chunks tagged
+                                 with results / experiments / evaluation
+                                 / ablations, AND the answer supports
+                                 the claim. Strongest tier.
+      * ``unverified``         — paper_qa was attempted but couldn't
+                                 conclude, OR was never attempted because
+                                 the gate exhausted its budget.
+
+    The tier is set automatically by the full_paper_gate via
+    :func:`evidence_tier_from_sections` once paper_qa returns.
     """
 
     span: str
@@ -191,6 +211,11 @@ class StrongClaim:
     verdict: str = "provisional"  # provisional | in_flight | verified | contradicted | unverifiable
     verification_note: str = ""
     verified_at_iteration: int | None = None
+    # Evidence quality label rendered in the synthesizer's agent_notes
+    # block. See class docstring for the four-way taxonomy. Default is
+    # the weakest tier; the middleware upgrades it when paper_qa returns
+    # chunks from method / experiment sections.
+    evidence_tier: str = "abstract-only"
 
     def needs_verification(self) -> bool:
         """True when the claim hasn't been verified and the source
@@ -278,22 +303,49 @@ class ClaimLedger:
             # ctx cancel) and the verdict stays unresolved.
             if c.verdict in ("provisional", "in_flight")
         ]
+        # Evidence-tier counts for the synthesizer. ``experiment-verified``
+        # is the strongest tier; ``abstract-only`` is the weakest. The
+        # synthesizer's agent_notes block surfaces these counts so the
+        # answer can label per-claim evidence quality honestly.
+        by_tier: dict[str, int] = {
+            "experiment-verified": 0,
+            "method-verified": 0,
+            "abstract-only": 0,
+            "unverified": 0,
+        }
+        for c in self.by_key.values():
+            tier = c.evidence_tier or "abstract-only"
+            by_tier[tier] = by_tier.get(tier, 0) + 1
+
         return {
             "total": total,
             "verified_count": len(verified),
             "contradicted_count": len(contradicted),
             "unverifiable_count": len(unverifiable),
             "provisional_count": len(provisional),
+            "by_evidence_tier": by_tier,
             "verified": [
-                {"paper_id": c.paper_id, "span": c.span[:240], "note": c.verification_note[:200]}
+                {
+                    "paper_id": c.paper_id, "span": c.span[:240],
+                    "note": c.verification_note[:200],
+                    "evidence_tier": c.evidence_tier,
+                }
                 for c in verified[:6]
             ],
             "contradicted": [
-                {"paper_id": c.paper_id, "span": c.span[:240], "note": c.verification_note[:200]}
+                {
+                    "paper_id": c.paper_id, "span": c.span[:240],
+                    "note": c.verification_note[:200],
+                    "evidence_tier": c.evidence_tier,
+                }
                 for c in contradicted[:6]
             ],
             "provisional": [
-                {"paper_id": c.paper_id, "span": c.span[:240], "source": c.source_field}
+                {
+                    "paper_id": c.paper_id, "span": c.span[:240],
+                    "source": c.source_field,
+                    "evidence_tier": c.evidence_tier,
+                }
                 for c in (provisional + unverifiable)[:6]
             ],
         }
@@ -314,6 +366,125 @@ class ClaimLedger:
         if len(self.by_key) > limit:
             lines.append(f"  ... and {len(self.by_key) - limit} more")
         return "\n".join(lines)
+
+
+# ── Evidence-tier classifier ────────────────────────────────────────────────
+#
+# The classifier uses the paper's own STRUCTURE — where in the document
+# the answer-grounding chunks lie — rather than hardcoded section-name
+# vocabularies. A long hardcoded cue list only ever covered the venues
+# we happened to think of (CS, ML, parts of biology, parts of physics)
+# and silently misclassified everything else.
+#
+# Conventional paper structure across nearly every academic discipline
+# follows the same ordering: abstract → introduction → method →
+# results → discussion → conclusion. The ordering is canonical enough
+# that the RELATIVE POSITION of a chunk inside the paper is itself a
+# reliable evidence-tier signal:
+#
+#   * Position 0 .. ~20%      : abstract + introduction (weakest tier).
+#   * Position ~20% .. ~55%   : method / setup / approach (mid tier).
+#   * Position ~55% .. 100%   : results / experiments / discussion
+#                               (strongest tier).
+#
+# These bands are heuristic but namespace-agnostic — a math paper's
+# "proof" sits in the same relative position as a biology paper's
+# "results" or a physics paper's "measurements". One small structural
+# rule overrides position: chunks whose ``section_type`` is exactly
+# ``abstract`` (the canonical tag every ingestion path stamps on the
+# abstract row, regardless of namespace) always count as abstract-only
+# regardless of how many chunks the paper has. That single rule keeps
+# papers that only have an abstract indexed (no body chunks) honest.
+
+# Position thresholds. Tuned so a 10-chunk paper's chunk-index 2 is
+# still "method-verified" (boundary at 0.20 = index 2 of 10), and
+# chunk-index 6 is "experiment-verified" (boundary at 0.55 = index
+# 5.5 of 10). The bands give some grace to short / atypical papers
+# (5-8 chunks) while keeping the dominant signal — relative position
+# in the canonical paper structure — intact.
+_EXPERIMENT_POSITION_THRESHOLD = 0.55
+_METHOD_POSITION_THRESHOLD = 0.20
+
+
+def evidence_tier_from_structure(
+    *,
+    chunk_positions: list[float] | None = None,
+    section_types: list[str] | None = None,
+) -> str:
+    """Classify the evidence tier from where the answer-grounding
+    chunks lie in the paper's own structure.
+
+    ``chunk_positions`` carries the relative position of each chunk
+    paper_qa used (chunk_index / total_chunks, in ``[0.0, 1.0]``).
+    ``section_types`` is the parser's section labels for the same
+    chunks; used only to honour the canonical ``abstract`` tag —
+    everything else is namespace-agnostic and decided by position.
+
+    Returns one of:
+
+    * ``experiment-verified`` — at least one grounding chunk sits in
+      the final ~45% of the paper (results / experiments /
+      discussion / conclusion in conventional structure). Strongest
+      tier; the answer can be quoted firmly.
+    * ``method-verified`` — the strongest grounding chunk sits in the
+      middle band (~20% to ~55% — method / setup / approach in
+      conventional structure). Mid tier.
+    * ``abstract-only`` — every grounding chunk sits at the very
+      front of the paper (abstract / introduction), OR the parser
+      explicitly tagged every chunk as ``abstract``, OR the structural
+      signal is missing entirely. Weakest tier.
+
+    Empty / missing structural input defaults to ``abstract-only`` so
+    callers that forgot to thread ``chunk_positions`` don't
+    accidentally claim a stronger tier than they earned.
+    """
+    # Canonical "abstract" demotion. Every ingestion path stamps the
+    # abstract row with ``section_type="abstract"``, regardless of
+    # whether the paper was parsed by Marker / Docling / Gemini Vision
+    # / direct-abstract-only. When every chunk we used carries that
+    # tag, we know the answer came purely from the abstract and the
+    # position signal is moot (often the paper only HAS the abstract).
+    if section_types:
+        normalised = [str(s or "").lower().strip() for s in section_types if s]
+        if normalised and all(s == "abstract" for s in normalised):
+            return "abstract-only"
+
+    if not chunk_positions:
+        return "abstract-only"
+
+    # The strongest-positioned chunk determines the tier: a paper_qa
+    # hit that touched chunk at 0.10 (intro) AND chunk at 0.75
+    # (results) is experiment-verified because the strong claim CAN be
+    # supported by the late section. Using max rather than mean keeps
+    # us from diluting the signal when paper_qa pulled a context chunk
+    # from the front for setup.
+    try:
+        max_pos = max(float(p) for p in chunk_positions)
+    except (TypeError, ValueError):
+        return "abstract-only"
+
+    if max_pos >= _EXPERIMENT_POSITION_THRESHOLD:
+        return "experiment-verified"
+    if max_pos >= _METHOD_POSITION_THRESHOLD:
+        return "method-verified"
+    return "abstract-only"
+
+
+def evidence_tier_from_sections(sections: list[str] | None) -> str:
+    """Backward-compatible shim. Returns ``abstract-only`` when called
+    with only ``section_types`` and no positional structure — the
+    classifier needs the structural position signal to do real work.
+
+    Kept so older callers / tests don't break; new code should use
+    :func:`evidence_tier_from_structure` and supply
+    ``chunk_positions``. The honest default of ``abstract-only`` here
+    is deliberately conservative: without a position signal we'd be
+    guessing, and we'd rather hedge than claim a stronger tier.
+    """
+    return evidence_tier_from_structure(
+        chunk_positions=None,
+        section_types=sections,
+    )
 
 
 # ── Affirmative / refutation cues for paper_qa answers ─────────────────────
@@ -496,6 +667,7 @@ __all__ = [
     "SOURCE_SNIPPET",
     "StrongClaim",
     "detect_strong_spans",
+    "evidence_tier_from_sections",
     "extract_claims_from_result",
     "resolve_paper_qa_verdict",
 ]

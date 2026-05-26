@@ -41,10 +41,29 @@ def _spawn_background(coro, *, name: str | None = None) -> asyncio.Task:
 
     Returns the task so callers can attach additional callbacks if needed.
     The task is removed from the set on completion so the set stays bounded.
+
+    On completion, any uncaught exception is logged at WARNING. Without
+    this, background-task failures became "task exception was never
+    retrieved" debug warnings that don't appear in production logs — so a
+    crashing genie SSE producer would silently disappear with no signal
+    that anything broke.
     """
     task = asyncio.create_task(coro, name=name) if name else asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.warning(
+                "genie background task %s failed: %s",
+                t.get_name() if name is None else name,
+                exc,
+            )
+
+    task.add_done_callback(_on_done)
     return task
 
 

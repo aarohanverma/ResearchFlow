@@ -38,6 +38,28 @@ class PaperQAOutput(BaseModel):
     paper_id: str
     chunks_used: int
     found: bool
+    # Distinct ``section_type`` values for the chunks that backed the
+    # answer (e.g. ["method", "results"]). The full-paper verification
+    # middleware reads this together with ``chunk_positions`` to label
+    # evidence quality honestly. Section names alone are venue-
+    # specific (math papers don't have "method" sections, biology
+    # papers say "materials and methods", etc.) so the structural
+    # signal below carries the load; ``sections_used`` is kept for the
+    # one canonical case the parser stamps consistently: chunks
+    # tagged ``abstract`` always count as abstract-only regardless of
+    # their position.
+    sections_used: list[str] = []
+    # Relative position of each grounding chunk inside the paper
+    # (chunk_index / total_chunks, in ``[0.0, 1.0]``). This is the
+    # primary evidence-tier signal — namespace-agnostic by design,
+    # because the canonical paper structure (abstract → introduction
+    # → method → results → discussion → conclusion) is consistent
+    # across CS, physics, biology, math, economics, and clinical
+    # venues. Empty when the paper has only an abstract row indexed.
+    chunk_positions: list[float] = []
+    # Total chunk count in the paper. Useful telemetry — a paper with
+    # 3 chunks is structurally weaker evidence than one with 60.
+    total_chunks: int = 0
 
 
 class PaperQATool:
@@ -62,6 +84,66 @@ class PaperQATool:
     async def run(self, ctx: ToolContext, params: PaperQAInput) -> ToolResult:
         from app.models.paper import Paper, PaperChunk
         from uuid import UUID
+
+        # Reject empty / placeholder identifiers up front. We also
+        # reject obvious placeholder patterns that survived the LLM
+        # preflight (TBD, PAPER_ID, all-caps stubs, etc.) so the
+        # planner sees a useful diagnostic instead of a "Paper not
+        # found:" trailing-colon trace. The list is conservative —
+        # a UUID-shaped or arXiv-id-shaped input always passes
+        # through to real lookup.
+        id_in = (params.paper_id or "").strip()
+        title_in = (params.paper_title or "").strip()
+
+        def _looks_like_placeholder(v: str) -> bool:
+            if not v:
+                return False
+            low = v.lower()
+            if low in {"tbd", "todo", "placeholder", "paper_id", "id", "n/a", "na",
+                       "none", "null", "undefined", "fill_me", "fill_in", "?", "??"}:
+                return True
+            # Template-variable shapes that survived the preflight repair —
+            # e.g. ``{{best_supporting_paper_id}}`` or ``${paper_id}``.
+            if "{{" in v or "}}" in v or v.startswith("${") and v.endswith("}"):
+                return True
+            # All-uppercase identifier-like stubs (``PAPER_ID``,
+            # ``BEST_PAPER``) are almost always placeholders — real
+            # arXiv ids contain digits + dots and UUIDs contain hex.
+            stripped = v.replace("_", "").replace("-", "")
+            if stripped.isalpha() and stripped.isupper() and len(stripped) <= 24:
+                return True
+            return False
+
+        id_is_placeholder = _looks_like_placeholder(id_in)
+        title_is_placeholder = _looks_like_placeholder(title_in)
+        if (not id_in or id_is_placeholder) and (not title_in or title_is_placeholder):
+            # Surface a structured ``recoverable_hint`` so the loop's
+            # middleware chain can decide to schedule a retrieval
+            # tool before the next paper_qa attempt.
+            reason = (
+                "both paper_id and paper_title are placeholders"
+                if (id_is_placeholder or title_is_placeholder)
+                else "neither paper_id nor paper_title was supplied"
+            )
+            return ToolResult(
+                output={
+                    "answer": "",
+                    "paper_title": "",
+                    "paper_id": "",
+                    "chunks_used": 0,
+                    "found": False,
+                    "sections_used": [],
+                    "chunk_positions": [],
+                    "total_chunks": 0,
+                    "recoverable_hint": "retrieve_then_retry",
+                },
+                summary=(
+                    f"paper_qa skipped — {reason}. Run a retrieval tool "
+                    "(deep_search / arxiv_import / literature_survey) first to "
+                    "populate the paper ledger, then call paper_qa with the "
+                    "concrete paper_id surfaced by retrieval."
+                ),
+            )
 
         await ctx.emit_progress(15, f"Locating paper: {params.paper_title or params.paper_id}")
 
@@ -108,24 +190,42 @@ class PaperQATool:
 
         if paper is None:
             return ToolResult(
-                output={"answer": "", "paper_title": "", "paper_id": "", "chunks_used": 0, "found": False},
+                output={
+                    "answer": "", "paper_title": "", "paper_id": "",
+                    "chunks_used": 0, "found": False, "sections_used": [],
+                    "chunk_positions": [], "total_chunks": 0,
+                },
                 summary=f"Paper not found: {params.paper_title or params.paper_id}",
             )
 
         await ctx.emit_progress(35, f"Retrieved paper: {paper.title}")
 
-        # Step 2: Fetch paper chunks (all, ordered)
+        # Step 2: Fetch paper chunks (all, ordered). We also carry the
+        # per-chunk ``section_type`` (abstract / introduction / method /
+        # results / discussion / …) so the full-paper verification
+        # middleware can later tag the strong claim with the actual
+        # evidence tier the answer drew from. A claim verified against
+        # the methods/experiments section is materially stronger than
+        # one only echoed from the abstract.
         chunks_result = await ctx.db.execute(
-            select(PaperChunk.content, PaperChunk.chunk_index).where(
+            select(PaperChunk.content, PaperChunk.chunk_index, PaperChunk.section_type).where(
                 PaperChunk.paper_id == paper.id,
                 PaperChunk.content.isnot(None),
             ).order_by(PaperChunk.chunk_index)
         )
-        all_chunks = [(row[0] or "") for row in chunks_result.fetchall() if row[0]]
+        all_rows = [
+            (row[0] or "", (row[2] or "abstract"))
+            for row in chunks_result.fetchall()
+            if row[0]
+        ]
+        all_chunks = [r[0] for r in all_rows]
+        chunk_sections = [r[1] for r in all_rows]
 
         if not all_chunks:
-            # Fall back to abstract
+            # Fall back to abstract — single-row case, section_type
+            # collapses to "abstract" by definition.
             all_chunks = [paper.abstract or ""]
+            chunk_sections = ["abstract"]
 
         # Step 3: Score chunks by keyword relevance to the question
         q_words = set(params.question.lower().split())
@@ -134,10 +234,25 @@ class PaperQATool:
             return sum(1 for w in q_words if len(w) > 3 and w in c_lower)
 
         ranked = sorted(enumerate(all_chunks), key=lambda x: _chunk_score(x[1]), reverse=True)
-        top_chunks = [c for _, c in ranked[:_MAX_CHUNKS]]
-        # Re-order by original chunk index for coherence
+        # Re-order by original chunk index for coherence and capture
+        # the section_type set the answer is grounded in.
         selected_indices = {ranked[i][0] for i in range(min(_MAX_CHUNKS, len(ranked)))}
         top_chunks = [all_chunks[i] for i in sorted(selected_indices)]
+        sections_used = sorted({
+            (chunk_sections[i] or "abstract").lower()
+            for i in selected_indices
+        })
+        # Structural position signal. The evidence-tier classifier in
+        # claim_ledger uses these positions — namespace-agnostic, so
+        # math / biology / physics / economics papers all get tier
+        # labels without needing per-discipline section-name
+        # vocabularies. Guard the division: a single-chunk paper
+        # collapses to a single position 0.0 (abstract-only).
+        total = max(len(all_chunks), 1)
+        chunk_positions = sorted({
+            (float(i) / float(total)) if total > 1 else 0.0
+            for i in selected_indices
+        })
 
         await ctx.emit_progress(60, f"Synthesizing answer from {len(top_chunks)} chunk(s)…")
 
@@ -182,6 +297,9 @@ class PaperQATool:
         await ctx.emit_progress(100, f"Paper Q&A complete: {paper.title[:50]}")
         return ToolResult(
             output={
+                "sections_used": sections_used,
+                "chunk_positions": chunk_positions,
+                "total_chunks": total,
                 "answer": answer,
                 "paper_title": paper.title or "",
                 "paper_id": str(paper.id),

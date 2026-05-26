@@ -50,8 +50,16 @@ def _hash_content(value: str) -> str:
     return hashlib.sha1((value or "").encode("utf-8")).hexdigest()[:16]
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    """Plain cosine similarity, safe on empty/mismatched inputs."""
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Plain cosine similarity, safe on empty/mismatched inputs.
+
+    Public helper — exported for callers outside this module (e.g.
+    the memory supersession detector) so they don't have to import
+    a private leading-underscore symbol. The implementation is the
+    naive loop; no numpy dependency, no batching. For tiny vectors
+    (embedding dim is 768 typical) this is well within fast-path
+    Python performance.
+    """
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -64,6 +72,11 @@ def _cosine(a: list[float], b: list[float]) -> float:
     if na <= 0 or nb <= 0:
         return 0.0
     return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+# Backwards-compat alias — older call sites in this module still use
+# the private name. Keep both so the rename stays surgical.
+_cosine = cosine_similarity
 
 
 def _entry_value(entry: object) -> str:

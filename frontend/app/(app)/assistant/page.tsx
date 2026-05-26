@@ -24,6 +24,7 @@ import { api } from "@/lib/api";
 import { useAuthStore } from "@/store/auth";
 import { useNamespaceStore } from "@/store/namespace";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import { AskOnSelectionPopover } from "@/components/ui/AskOnSelectionPopover";
 import { PaperPanel } from "@/components/paper/PaperPanel";
 import type { Paper as FullPaper } from "@/types";
 
@@ -201,7 +202,30 @@ type Block =
   | { kind: "nvd_results"; title?: string; vulnerabilities: NvdVuln[] }
   | { kind: "trials_results"; title?: string; studies: ClinicalStudy[] }
   | { kind: "fred_data"; title?: string; series: FredSeriesItem[] }
-  | { kind: "code_results"; title?: string; items: CodeItem[] };
+  | { kind: "code_results"; title?: string; items: CodeItem[] }
+  | { kind: "citation_table"; title?: string; rows: CitationRow[] };
+
+/**
+ * One row of the consolidated citation table the assistant emits at the
+ * end of every grounded message. Rows mix corpus papers (clickable into
+ * the Paper Panel via ``paper_id``) and external candidates (clickable
+ * to ``url`` — arXiv abs, DOI, publisher, Semantic Scholar). The
+ * ``verdict`` and ``evidence_tier`` come from the strong-claim ledger
+ * and the provenance verifier so the user can audit every citation at
+ * a glance: which were verified against the paper body, which are
+ * abstract-only, and which couldn't be resolved at all.
+ */
+type CitationRow = {
+  marker: string;            // "1", "A1", etc.
+  is_external: boolean;      // true for arXiv / DOI / web candidates
+  title: string;
+  authors: string[];
+  namespace_key?: string;
+  paper_id?: string;
+  url?: string;
+  evidence_tier: "experiment-verified" | "method-verified" | "abstract-only" | "unverified";
+  verdict: "verified" | "contradicted" | "provisional" | "unverified" | "unresolved";
+};
 
 type PaperBlock = {
   paper_id: string;
@@ -221,6 +245,12 @@ type PaperBlock = {
 
 type ArxivCandidate = {
   external_id?: string;
+  // Backend-supplied fallback URL for citation clicks when the
+  // candidate is not a plain arXiv id (DOI hits, citation_finder
+  // results, frontier_scan items whose external_id was empty). The
+  // citation map prefers this URL when present so [A*] chips remain
+  // clickable for non-arXiv external references.
+  source_url?: string;
   title?: string;
   authors?: string[];
   abstract?: string;
@@ -337,6 +367,13 @@ export default function AssistantPage() {
   const [submitting, setSubmitting] = useState(false);
   const sendingRef = useRef(false); // synchronous guard against double-submit races
   const [error, setError] = useState<string | null>(null);
+  // Selection-driven quote attached to the next message. When the
+  // user highlights text inside an assistant reply and clicks the
+  // "Ask RA on this" floating button, the selection lands here. The
+  // Composer renders it as a quote chip the user can dismiss; on
+  // submit it's prepended to the actual message as a markdown
+  // blockquote so the model sees the explicit reference.
+  const [quotedSelection, setQuotedSelection] = useState<string | null>(null);
   // Persisted collapse state for the session rail. Defaults to expanded; we
   // hydrate from localStorage on mount so the user's preference survives
   // page reloads. Stored as a separate effect to avoid SSR hydration mismatch.
@@ -976,8 +1013,20 @@ export default function AssistantPage() {
   }
 
   async function submit(text?: string) {
-    const content = (text ?? input).trim();
+    let content = (text ?? input).trim();
     if (!content || sendingRef.current) return;
+    // Prepend the user's text selection (if any) as a markdown
+    // blockquote so the model sees the explicit reference the user
+    // wanted to ask about. The quote is cleared the moment we
+    // commit to sending — same lifecycle as ``input``.
+    if (quotedSelection && quotedSelection.trim()) {
+      const quote = quotedSelection.trim();
+      const quotedBlock = quote
+        .split("\n")
+        .map(line => `> ${line}`)
+        .join("\n");
+      content = `${quotedBlock}\n\n${content}`;
+    }
     sendingRef.current = true;
     setSubmitting(true);
     setError(null);
@@ -988,6 +1037,7 @@ export default function AssistantPage() {
       if (!sid) return;
       if (!text) {
         setInput("");
+        setQuotedSelection(null);
         // Explicit collapse — the auto-grow effect would do this on
         // its next tick, but clearing the height inline avoids the
         // one-frame "submit while still tall" flicker the user sees
@@ -1044,9 +1094,33 @@ export default function AssistantPage() {
     try {
       await api.delete(`/assistant/sessions/${id}`);
       if (activeId === id) {
+        // Abort any in-flight SSE streams tied to this session
+        // BEFORE we null the session state. Without this, stream
+        // callbacks keep firing against a stale session, occasionally
+        // wedging the composer into a "still submitting" perceived
+        // state — that's the "text input gets blocked after delete"
+        // bug the user reported.
+        for (const [jobId, ctrl] of Object.entries(streamCtrlRef.current)) {
+          try { ctrl.abort(); } catch { /* already aborted */ }
+          delete streamCtrlRef.current[jobId];
+        }
+        // Reset the submit guards so a stuck ``sendingRef`` from a
+        // mid-flight submit on the deleted session can't block the
+        // next message. The textarea has no disabled attribute, but
+        // ``submit()`` short-circuits on a truthy ``sendingRef`` —
+        // hence the explicit reset.
+        sendingRef.current = false;
+        setSubmitting(false);
         setActiveId(null);
         setSession(null);
+        setStreamingContent({});
+        setLiveJobData({});
         router.replace("/assistant");
+        // Re-focus the input on the next tick so the user can start
+        // typing immediately without a manual click. ``setTimeout(0)``
+        // waits for React's next paint so the freshly-mounted textarea
+        // ref is in place.
+        setTimeout(() => inputRef.current?.focus(), 0);
       }
       await loadSessions();
     } catch (e) {
@@ -1513,6 +1587,22 @@ export default function AssistantPage() {
           onAttachNote={attachNote}
           onAttachUrl={attachUrl}
           onAttachFile={attachFile}
+          quotedSelection={quotedSelection}
+          onClearQuotedSelection={() => setQuotedSelection(null)}
+        />
+        {/* Floating "Ask RA on this" button that appears when the user
+            highlights text inside an assistant reply. Listens for
+            selection events globally and renders itself at the cursor;
+            clicking captures the selection into the composer's quoted
+            context. Shared with Study Mode and Genie Idea chats via
+            ``components/ui/AskOnSelectionPopover``. */}
+        <AskOnSelectionPopover
+          label="Ask RA on this"
+          scope="assistant"
+          onAsk={(text) => {
+            setQuotedSelection(text);
+            inputRef.current?.focus();
+          }}
         />
       </section>
 
@@ -2124,6 +2214,43 @@ function ContextRail({
 }) {
   const [contextOpen, setContextOpen] = useState(false);
 
+  // Resizable width — persists across mounts via localStorage. Bounds
+  // keep the rail readable (>=220px so labels don't truncate) without
+  // letting it eat the chat area (<=560px on typical screens).
+  const RAIL_DEFAULT = 280;
+  const [railWidth, setRailWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return RAIL_DEFAULT;
+    try {
+      const saved = parseInt(localStorage.getItem("rf-context-rail-w") || "", 10);
+      if (Number.isFinite(saved) && saved >= 220 && saved <= 560) return saved;
+    } catch {}
+    return RAIL_DEFAULT;
+  });
+  const railWidthRef = useRef<number>(railWidth);
+  useEffect(() => { railWidthRef.current = railWidth; }, [railWidth]);
+  const startRailResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = railWidthRef.current;
+    const onMove = (ev: MouseEvent) => {
+      // Rail is anchored to the right edge → wider = drag left.
+      const dx = startX - ev.clientX;
+      const w = Math.min(560, Math.max(220, startW + dx));
+      setRailWidth(w);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      try { localStorage.setItem("rf-context-rail-w", String(railWidthRef.current)); } catch {}
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
+
   // Collapsed state: render a slim toggle strip only
   if (collapsed) {
     return (
@@ -2161,10 +2288,26 @@ function ContextRail({
 
   return (
     <aside style={{
-      width: 280, flexShrink: 0, borderLeft: "1px solid var(--rf-border)",
+      width: railWidth, flexShrink: 0, borderLeft: "1px solid var(--rf-border)",
       background: "var(--rf-surface1)", overflowY: "auto",
-      padding: "16px 14px",
+      padding: "16px 14px", position: "relative",
     }}>
+      {/* Resize handle pinned to the LEFT edge — drag left to widen.
+          The thin invisible strip widens its hit area without adding
+          visible chrome; on hover the indigo tint surfaces so users
+          can find it. */}
+      <div
+        onMouseDown={startRailResize}
+        title="Drag to resize · double-click to reset"
+        onDoubleClick={() => {
+          setRailWidth(RAIL_DEFAULT);
+          try { localStorage.setItem("rf-context-rail-w", String(RAIL_DEFAULT)); } catch {}
+        }}
+        style={{
+          position: "absolute", left: -3, top: 0, bottom: 0, width: 6,
+          cursor: "ew-resize", zIndex: 20,
+        }}
+      />
       {/* Rail header with collapse toggle */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
         <span style={{ fontSize: "9px", fontWeight: 700, color: "var(--rf-text5)",
@@ -2204,7 +2347,18 @@ function ContextRail({
           <RailRow label="Namespace" value={session.namespace_key} />
           <RailRow label="Topics" value={session.topic_keys.join(", ") || "—"} />
           <RailRow label="Profile" value={`${session.expertise_level} · ${session.orientation}`} />
-          {session.parent_session_id && <RailRow label="Branched from" value="parent session" />}
+          {/* Memory injection state — surfaces the user's pause toggle
+              right where they can see the consequence. The Settings
+              link saves them digging through tabs to flip the switch.
+              Loaded lazily by useMemoryInjectionStatus so the rail
+              doesn't pay the API cost when the section is collapsed. */}
+          <MemoryInjectionRow namespaceKey={session.namespace_key || ""} />
+          {/* Session hierarchy from this session's perspective —
+              ancestors above current, descendants below. Sibling
+              branches of ancestors are intentionally NOT shown:
+              the user explicitly asked that children/branches see
+              their parents but not other sibling branches. */}
+          <SessionHierarchy sessionId={session.id} />
         </div>
       )}
 
@@ -2346,11 +2500,276 @@ function RailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+/**
+ * Session hierarchy view rendered in the Active Context rail.
+ *
+ * Shows the relevant slice ONLY:
+ *   - Ancestors above (root → ... → parent of current)
+ *   - Current session in the middle
+ *   - Descendants below (direct children + their children, etc.)
+ *
+ * Sibling branches of ancestors are intentionally NOT shown — the
+ * user's spec is that a child only sees its own line plus its own
+ * descendants. A parent sees the FULL descendant tree because the
+ * endpoint returns it that way when current_id is the root.
+ *
+ * Fetches lazily via ``/assistant/sessions/{id}/hierarchy`` so we
+ * don't pay the cost when the Active Context section is collapsed.
+ * Re-fetches whenever the current session id changes.
+ */
+type HierarchyNode = {
+  id: string;
+  title: string;
+  namespace_key: string;
+  is_root: boolean;
+  parent_id: string | null;
+  depth: number;
+  branch_from_message_id: string | null;
+  is_current: boolean;
+};
+type HierarchyResponse = {
+  current_id: string;
+  current: HierarchyNode;
+  ancestors: HierarchyNode[];
+  descendants: HierarchyNode[];
+  counts: { ancestors: number; descendants: number };
+};
+
+function SessionHierarchy({ sessionId }: { sessionId: string }) {
+  const [data, setData] = useState<HierarchyResponse | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let cancel = false;
+    setError(false);
+    api.get<HierarchyResponse>(`/assistant/sessions/${sessionId}/hierarchy`)
+      .then(d => { if (!cancel) setData(d); })
+      .catch(() => { if (!cancel) setError(true); });
+    return () => { cancel = true; };
+  }, [sessionId]);
+  if (error) return null;
+  // If there's nothing to show beyond "self", skip the section
+  // entirely — a flat session needs no tree view.
+  if (data && data.ancestors.length === 0 && data.descendants.length === 0) {
+    return null;
+  }
+  return (
+    <div style={{ marginTop: 12 }}>
+      <SectionLabel>Session hierarchy</SectionLabel>
+      {!data && (
+        <p style={{ fontSize: "10.5px", color: "var(--rf-text5)" }}>Loading…</p>
+      )}
+      {data && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {data.ancestors.map(n => (
+            <HierarchyRow key={n.id} node={n} kind="ancestor" />
+          ))}
+          {/* Current — always rendered, even when standalone, so
+              the user sees their position in the tree clearly. */}
+          <HierarchyRow node={data.current} kind="current" />
+          {data.descendants.map(n => (
+            <HierarchyRow key={n.id} node={n} kind="descendant" />
+          ))}
+          {data.counts.descendants > 0 && (
+            <p style={{ fontSize: "9px", color: "var(--rf-text5)", marginTop: 4 }}>
+              {data.counts.ancestors > 0 && `${data.counts.ancestors} ancestor${data.counts.ancestors === 1 ? "" : "s"} · `}
+              {data.counts.descendants} descendant{data.counts.descendants === 1 ? "" : "s"}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HierarchyRow({
+  node, kind,
+}: {
+  node: HierarchyNode;
+  kind: "ancestor" | "current" | "descendant";
+}) {
+  // Visual hierarchy: indent by relative depth so the user can see
+  // the tree shape at a glance. Current is highlighted; ancestors
+  // are above and dimmer; descendants are below.
+  const indent = Math.max(0, node.depth) * 8;
+  const tone = kind === "current"
+    ? "var(--rf-text1)"
+    : kind === "ancestor" ? "var(--rf-text3)" : "var(--rf-text2)";
+  const bg = kind === "current" ? "rgba(99,102,241,0.10)" : "transparent";
+  const border = kind === "current"
+    ? "1px solid rgba(99,102,241,0.30)"
+    : "1px solid transparent";
+  const icon = node.is_root ? "●" : kind === "ancestor" ? "↑" : "↳";
+  return (
+    <a
+      href={`/assistant?s=${node.id}`}
+      title={`${node.title || "Untitled session"} · ${node.namespace_key || "no namespace"}`}
+      style={{
+        textDecoration: "none",
+        padding: "3px 6px",
+        marginLeft: indent,
+        background: bg,
+        borderRadius: 4,
+        border: border,
+        display: "flex",
+        gap: 6,
+        alignItems: "center",
+        cursor: kind === "current" ? "default" : "pointer",
+        pointerEvents: kind === "current" ? "none" : "auto",
+      }}
+    >
+      <span style={{ fontSize: "9px", color: "var(--rf-text5)", width: 10, textAlign: "center" }}>{icon}</span>
+      <span style={{
+        fontSize: "10.5px", color: tone, fontWeight: kind === "current" ? 700 : 500,
+        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        maxWidth: 200,
+      }}>
+        {node.title || "Untitled"}
+      </span>
+    </a>
+  );
+}
+
+/**
+ * One-shot loader of the user's memory inspection state for the
+ * Active Context rail. Renders a tiny badge showing whether memory
+ * injection is on or paused, plus the entry counts the assistant
+ * could potentially surface this turn. Clicking the badge jumps to
+ * Settings → Memory so the user can flip the pause toggle without
+ * having to leave the assistant tab and hunt for it.
+ *
+ * Loaded lazily — only when the Active Context section is expanded.
+ * Fails silent: if the request errors, the row simply doesn't
+ * render, never breaking the rail.
+ */
+
+
+function MemoryInjectionRow({ namespaceKey }: { namespaceKey: string }) {
+  const [injectionEnabled, setInjectionEnabled] = useState<boolean | null>(null);
+  const [counts, setCounts] = useState<{ medium: number; long: number } | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+  const [busy, setBusy] = useState(false);
+  // Re-load when the namespace changes (user switched session), when
+  // the tab regains focus (they may have flipped the toggle in
+  // Settings in another tab), and on a soft 60s heartbeat so a stale
+  // rail catches up to background changes (auto-memory consolidation
+  // bumping counts, supersession events shrinking them).
+  const refresh = useCallback(async () => {
+    try {
+      const d = await api.get<{
+        injection_enabled: boolean;
+        counts: { medium: number; long: number };
+        injection_overrides: Record<string, boolean>;
+      }>("/settings/memory");
+      setInjectionEnabled(!!d.injection_enabled);
+      setCounts(d.counts);
+      setOverrides(d.injection_overrides || {});
+    } catch {
+      // Silent fail — rail is advisory, not critical.
+    }
+  }, []);
+  useEffect(() => {
+    let cancel = false;
+    void refresh();
+    // Refresh when the tab regains focus — covers the common case
+    // where the user flipped a toggle in Settings → Memory in a
+    // different tab and switched back to the assistant.
+    const onFocus = () => { if (!cancel) void refresh(); };
+    const onVisibility = () => {
+      if (!cancel && document.visibilityState === "visible") void refresh();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    // Heartbeat refresh. 60s is gentle (one request/min is invisible
+    // load) and catches background-task changes (auto-memory
+    // consolidation, supersession) without polling-heavy load.
+    const beat = window.setInterval(() => { if (!cancel) void refresh(); }, 60_000);
+    return () => {
+      cancel = true;
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(beat);
+    };
+  }, [refresh, namespaceKey]);
+  if (injectionEnabled === null) return null;
+  // Compute the EFFECTIVE state for this namespace: an override
+  // shadows the global toggle. If the user is in a namespace and
+  // an override is set for it, surface that as the active state
+  // and let them flip it inline. Otherwise show the global.
+  const hasOverride = !!namespaceKey && namespaceKey in overrides;
+  const effective = hasOverride ? overrides[namespaceKey] : injectionEnabled;
+  const total = (counts?.medium || 0) + (counts?.long || 0);
+
+  async function toggle(e: React.MouseEvent) {
+    // Toggle the per-namespace override when we have a namespace
+    // context, otherwise the global flag. Stop propagation so the
+    // wrapping link doesn't navigate to /settings.
+    e.preventDefault();
+    e.stopPropagation();
+    if (busy) return;
+    setBusy(true);
+    try {
+      const next = !effective;
+      const body: Record<string, unknown> = { enabled: next };
+      if (namespaceKey) body.namespace_key = namespaceKey;
+      await api.post("/settings/memory/injection", body);
+      if (namespaceKey) {
+        setOverrides(prev => ({ ...prev, [namespaceKey]: next }));
+      } else {
+        setInjectionEnabled(next);
+      }
+    } catch {
+      // Silent fail — the user can re-try in Settings.
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const scopeLabel = namespaceKey
+    ? (hasOverride ? `namespace override` : `(global)`)
+    : "global";
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "2px 0" }}>
+      <a
+        href="/settings?tab=memory"
+        style={{
+          fontSize: "10.5px", color: "var(--rf-text5)", textDecoration: "none",
+        }}
+        title="Open the Memory tab in Settings"
+      >
+        Memory <span style={{ fontSize: "9px", color: "var(--rf-text6, var(--rf-text5))" }}>· {scopeLabel}</span>
+      </a>
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={busy}
+        title={
+          (effective
+            ? "Memory injection is ON for this scope — click to pause"
+            : "Memory injection is PAUSED for this scope — click to resume")
+          + (namespaceKey
+            ? " (per-namespace override; global default unaffected)"
+            : "")
+        }
+        style={{
+          fontSize: "10.5px", fontWeight: 600,
+          color: effective ? "#a3e635" : "#fbbf24",
+          background: "none", border: "none", padding: 0, cursor: busy ? "wait" : "pointer",
+          textAlign: "right", maxWidth: "60%",
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}
+      >
+        {effective ? `injecting · ${total}` : `paused · ${total} stored`}
+      </button>
+    </div>
+  );
+}
+
 // ─── Composer ──────────────────────────────────────────────────────────────
 
 function Composer({
   inputRef, input, setInput, onSubmit, submitting,
   pendingAttachments, onRemoveAttachment, onAttachNote, onAttachUrl, onAttachFile,
+  quotedSelection, onClearQuotedSelection,
 }: {
   inputRef: React.RefObject<HTMLTextAreaElement>;
   input: string;
@@ -2362,6 +2781,8 @@ function Composer({
   onAttachNote: (label: string, content: string) => void;
   onAttachUrl: (url: string, label: string) => void;
   onAttachFile: (file: File) => Promise<void>;
+  quotedSelection?: string | null;
+  onClearQuotedSelection?: () => void;
 }) {
   const [showAttach, setShowAttach] = useState(false);
 
@@ -2386,6 +2807,48 @@ function Composer({
 
   return (
     <footer style={{ padding: "12px 18px 16px", borderTop: "1px solid var(--rf-border)" }}>
+      {quotedSelection && quotedSelection.trim() && (
+        <div style={{
+          display: "flex", alignItems: "flex-start", gap: 8,
+          padding: "8px 10px", borderRadius: 8, marginBottom: 8,
+          background: "rgba(99,102,241,0.08)",
+          border: "1px solid rgba(99,102,241,0.30)",
+        }}
+          title="This selection will be quoted at the top of your next message"
+        >
+          <span style={{
+            color: "#818cf8", fontSize: "11px", fontWeight: 700,
+            marginTop: 1, flexShrink: 0,
+          }}>“</span>
+          <div style={{
+            flex: 1, minWidth: 0,
+            color: "var(--rf-text2)", fontSize: "11px", lineHeight: 1.5,
+            fontStyle: "italic",
+            // Cap height so a huge selection doesn't shove the
+            // composer off-screen; internal scroll keeps the user
+            // in control.
+            maxHeight: 120, overflowY: "auto",
+            whiteSpace: "pre-wrap", wordBreak: "break-word",
+          }}>
+            {quotedSelection.length > 600
+              ? quotedSelection.slice(0, 600) + "…"
+              : quotedSelection}
+          </div>
+          <button
+            type="button"
+            onClick={onClearQuotedSelection}
+            title="Remove quote"
+            aria-label="Remove quoted selection"
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              color: "var(--rf-text4)", padding: 2, borderRadius: 4,
+              flexShrink: 0,
+            }}
+          >
+            <XIcon size={11} />
+          </button>
+        </div>
+      )}
       {pendingAttachments.length > 0 && (
         <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
           {pendingAttachments.map(a => (
@@ -2803,19 +3266,27 @@ function MessageBlock({
               </div>
             </div>
           ) : (
-            <MessageBody
-              msg={msg}
-              isInflight={!!(taskForMsg && (taskForMsg.status === "running" || taskForMsg.status === "pending"))}
-              onSuggestionClick={onSuggestionClick}
-              onOpenPaper={onOpenPaper}
-              streamingText={streamingContent[msg.id]}
-              highlightsForMessage={highlightsForMessage}
-              searchQuery={searchQuery}
-              searchCaseSensitive={searchCaseSensitive}
-              searchWholeWord={searchWholeWord}
-              highlightModeActive={highlightModeActive}
-              onRemoveHighlight={onRemoveHighlight}
-            />
+            // ``data-rf-quotable="assistant"`` scopes this subtree
+            // to the assistant chat popover. Scoping (instead of the
+            // legacy ``"1"``) ensures that when other chat surfaces
+            // (PaperPanel, Genie Idea Dive) are layered on top, only
+            // ONE popover fires per selection and the quote routes
+            // to the correct composer.
+            <div data-rf-quotable={msg.role === "assistant" ? "assistant" : undefined}>
+              <MessageBody
+                msg={msg}
+                isInflight={!!(taskForMsg && (taskForMsg.status === "running" || taskForMsg.status === "pending"))}
+                onSuggestionClick={onSuggestionClick}
+                onOpenPaper={onOpenPaper}
+                streamingText={streamingContent[msg.id]}
+                highlightsForMessage={highlightsForMessage}
+                searchQuery={searchQuery}
+                searchCaseSensitive={searchCaseSensitive}
+                searchWholeWord={searchWholeWord}
+                highlightModeActive={highlightModeActive}
+                onRemoveHighlight={onRemoveHighlight}
+              />
+            </div>
           )}
           <div style={{ marginTop: 8, display: "flex", justifyContent: "flex-end", gap: 4 }}>
             {onAddNote && (
@@ -3488,11 +3959,19 @@ function MessageBody({
           }
         });
       } else if (b.kind === "arxiv_grid" && b.papers) {
+        // External citation index. ``external_id`` is the canonical
+        // arXiv reference; ``source_url`` is the load-bearing fallback
+        // for DOI hits, non-arXiv preprints, and citation_finder
+        // results where the upstream tool didn't surface a parseable
+        // arXiv id. Always picking the broader fallback keeps the
+        // chip clickable — without it, [A*] markers next to a
+        // non-arXiv candidate render styled but functionally inert.
         b.papers.forEach((p: ArxivCandidate, idx: number) => {
-          if (p.external_id) {
-            map[`A${idx + 1}`] = {
-              url: `https://arxiv.org/abs/${p.external_id}`,
-            };
+          const url = p.external_id
+            ? `https://arxiv.org/abs/${p.external_id}`
+            : (p.source_url || "");
+          if (url) {
+            map[`A${idx + 1}`] = { url };
           }
         });
       }
@@ -3524,9 +4003,17 @@ function MessageBody({
   // Show live streaming text (synthesis tokens arriving) or Thinking... animation
   if (!blocks.length && !msg.content && isInflight) {
     if (streamingText) {
+      // Expand any ``[N]-[M]`` adjacency the LLM has emitted so the
+      // user never sees the compressed range form even mid-stream.
+      // The same expansion runs server-side on the final answer
+      // (synthesizer's _strip_unresolvable_citations pass), but the
+      // streaming display arrives BEFORE that pass — without this
+      // client-side fallback, the user briefly sees the compressed
+      // form and then it snaps to expanded once streaming finishes.
+      const expanded = expandCitationRangesForStream(streamingText);
       return (
         <div style={{ fontSize: "12.5px", color: "var(--rf-text1)", lineHeight: 1.55 }}>
-          <MarkdownRenderer content={streamingText} onCitationClick={handleCitation} decorations={decorations} />
+          <MarkdownRenderer content={expanded} onCitationClick={handleCitation} decorations={decorations} />
           <span style={{ display: "inline-flex", alignItems: "center", gap: 3, marginTop: 4 }}>
             <ThinkingDots />
           </span>
@@ -3605,6 +4092,8 @@ function BlockRenderer({
       return <FredDataBlock title={block.title} series={block.series} />;
     case "code_results":
       return <CodeResultsBlock title={block.title} items={block.items} />;
+    case "citation_table":
+      return <CitationTableBlock title={block.title} rows={block.rows} onOpenPaper={onOpenPaper} />;
     case "suggestion_chips":
       return null;
     case "actions_taken":
@@ -3683,11 +4172,29 @@ function ArxivGridBlock({
       </button>
       {open && (
       <div style={{ display: "grid", gap: 6 }}>
-        {papers.map((p, i) => (
-          <a key={p.external_id || i}
-             href={p.external_id ? `https://arxiv.org/abs/${p.external_id}` : "#"}
-             target="_blank" rel="noopener noreferrer"
-             style={{ ...cardStyle(), textDecoration: "none", display: "block" }}>
+        {papers.map((p, i) => {
+          // Resolve the destination URL: prefer the arXiv abs URL when
+          // we have an external_id, otherwise use the source_url
+          // fallback the backend captured from the upstream tool
+          // (citation_finder DOI hit, frontier_scan publisher page,
+          // etc.). Cards with neither destination are kept inert
+          // rather than left pointing at "#".
+          const href = p.external_id
+            ? `https://arxiv.org/abs/${p.external_id}`
+            : (p.source_url || "");
+          const cardProps = href
+            ? { href, target: "_blank" as const, rel: "noopener noreferrer" }
+            : {};
+          return (
+          <a key={p.external_id || p.source_url || i}
+             {...cardProps}
+             style={{
+               ...cardStyle(),
+               textDecoration: "none",
+               display: "block",
+               cursor: href ? "pointer" : "default",
+               opacity: href ? 1 : 0.85,
+             }}>
             {/* The yellow [A N] index makes it immediately obvious which
                 inline citation marker in the body this card resolves to. */}
             <div style={{
@@ -3714,7 +4221,8 @@ function ArxivGridBlock({
               </div>
             )}
           </a>
-        ))}
+          );
+        })}
       </div>
       )}
     </div>
@@ -3795,6 +4303,63 @@ function PaperCardInline({
   );
 }
 
+/**
+ * Mirror of the backend's ``_expand_adjacent_marker_ranges`` so the
+ * streaming display never shows a compressed citation range
+ * (``[3]-[6]`` / ``[3]_[6]``). The backend runs the same expansion
+ * on the FINAL answer string, but the stream arrives token-by-token
+ * BEFORE that pass — without this client-side fallback the user
+ * briefly sees ``[3]-[6]`` and then it snaps to ``[3] [4] [5] [6]``
+ * once streaming completes.
+ *
+ * Kept conservative: only expands when both endpoints look like
+ * valid bracketed indices. Reversed ranges and pathological spans
+ * are left untouched. The user spec is explicit: "very strictly
+ * ensure no citation compression".
+ */
+function expandCitationRangesForStream(text: string): string {
+  if (!text) return text;
+  // Separator class mirrors backend ``_RANGE_SEP`` — hyphen,
+  // unicode dashes, minus sign, underscore, with optional
+  // whitespace on either side.
+  const SEP = "\\s*[-‐‑‒–—−_]\\s*";
+  const corpusRe = new RegExp(`\\[(\\d+)\\]${SEP}\\[(\\d+)\\]`, "g");
+  const arxivRe = new RegExp(`\\[A(\\d+)\\]${SEP}\\[A(\\d+)\\]`, "g");
+  const MAX_EXPANSION = 50;
+  function expandOnce(input: string): string {
+    let out = input.replace(arxivRe, (m, a, b) => {
+      const lo = parseInt(a, 10);
+      const hi = parseInt(b, 10);
+      if (!isFinite(lo) || !isFinite(hi)) return m;
+      if (lo < 1 || hi < 1 || lo > hi) return m;
+      if (hi - lo + 1 > MAX_EXPANSION) return m;
+      const parts: string[] = [];
+      for (let i = lo; i <= hi; i++) parts.push(`[A${i}]`);
+      return parts.join(" ");
+    });
+    out = out.replace(corpusRe, (m, a, b) => {
+      const lo = parseInt(a, 10);
+      const hi = parseInt(b, 10);
+      if (!isFinite(lo) || !isFinite(hi)) return m;
+      if (lo < 1 || hi < 1 || lo > hi) return m;
+      if (hi - lo + 1 > MAX_EXPANSION) return m;
+      const parts: string[] = [];
+      for (let i = lo; i <= hi; i++) parts.push(`[${i}]`);
+      return parts.join(" ");
+    });
+    return out;
+  }
+  // Three-pass to resolve chains like ``[1]-[3]-[5]`` the way the
+  // backend does. Bail early if a pass produced no change.
+  let cur = text;
+  for (let p = 0; p < 3; p++) {
+    const next = expandOnce(cur);
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+
 function whyBadges(paper: PaperBlock): { label: string; signal: string }[] {
   const out: { label: string; signal: string }[] = [];
   if ((paper.novelty_score ?? 0) >= 0.78) out.push({ signal: "novelty", label: "high novelty" });
@@ -3803,6 +4368,169 @@ function whyBadges(paper: PaperBlock): { label: string; signal: string }[] {
   if (paper.match_type === "frontier") out.push({ signal: "frontier", label: "frontier" });
   return out;
 }
+
+/**
+ * Consolidated citation table rendered at the end of every grounded
+ * message. The user explicitly asked for this so they can audit every
+ * cited source at a glance — marker, title, evidence tier, verdict,
+ * and clickable destination — without having to cross-reference inline
+ * markers with the separate grids. Rows whose ``verdict`` is
+ * ``unresolved`` are highlighted in amber so a citation we can't link
+ * back to a real source surfaces honestly instead of looking grounded.
+ */
+function CitationTableBlock({
+  title, rows, onOpenPaper,
+}: {
+  title?: string;
+  rows: CitationRow[];
+  onOpenPaper: (paperId: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  if (!rows || rows.length === 0) return null;
+  const tierLabel = (tier: CitationRow["evidence_tier"]) =>
+    tier === "experiment-verified" ? "experiment-verified"
+    : tier === "method-verified" ? "method-verified"
+    : tier === "abstract-only" ? "abstract-only"
+    : "unverified";
+  const tierColour = (tier: CitationRow["evidence_tier"]) =>
+    tier === "experiment-verified" ? "#34d399"
+    : tier === "method-verified" ? "#a3e635"
+    : tier === "abstract-only" ? "var(--rf-text4)"
+    : "#fbbf24";
+  const verdictColour = (v: CitationRow["verdict"]) =>
+    v === "verified" ? "#34d399"
+    : v === "contradicted" ? "#fb7185"
+    : v === "unresolved" ? "#fbbf24"
+    : v === "unverified" ? "#fbbf24"
+    : "var(--rf-text4)";
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: "flex", alignItems: "center", gap: 8, width: "100%",
+          background: "none", border: "none", cursor: "pointer", padding: 0,
+          marginBottom: open ? 6 : 0, textAlign: "left",
+        }}
+      >
+        <BlockTitle style={{ marginBottom: 0, flex: 1 }}>{title || "Citations"}</BlockTitle>
+        <span style={{
+          fontSize: "9px", color: "var(--rf-text5)",
+          padding: "2px 7px", borderRadius: 8,
+          background: "var(--rf-surface3)", border: "1px solid var(--rf-border)",
+        }}>
+          {rows.length} citation{rows.length === 1 ? "" : "s"} {open ? "−" : "+"}
+        </span>
+      </button>
+      {open && (
+        <div style={{ display: "grid", gap: 4 }}>
+          {rows.map((r, i) => {
+            // Click target: corpus rows open Paper Panel; external rows
+            // open the URL in a new tab. Rows with neither destination
+            // (verdict === "unresolved") render as inert.
+            const clickable = r.is_external ? !!r.url : !!r.paper_id;
+            const onClick = () => {
+              if (r.is_external && r.url) {
+                window.open(r.url, "_blank", "noopener,noreferrer");
+              } else if (r.paper_id) {
+                onOpenPaper(r.paper_id);
+              }
+            };
+            const markerBg = r.is_external
+              ? "rgba(251,191,36,0.10)"
+              : "rgba(129,140,248,0.10)";
+            const markerBorder = r.is_external
+              ? "1px solid rgba(251,191,36,0.30)"
+              : "1px solid rgba(129,140,248,0.30)";
+            const markerColour = r.is_external ? "#fbbf24" : "#818cf8";
+            return (
+              <div
+                key={`${r.marker}-${i}`}
+                onClick={clickable ? onClick : undefined}
+                onKeyDown={(e) => {
+                  if (clickable && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
+                    onClick();
+                  }
+                }}
+                role={clickable ? "button" : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                style={{
+                  ...cardStyle(),
+                  cursor: clickable ? "pointer" : "default",
+                  opacity: clickable ? 1 : 0.85,
+                  display: "grid",
+                  gridTemplateColumns: "auto 1fr auto",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "6px 8px",
+                  // Unresolved citations get a soft amber outline so
+                  // they read as "we cited this but can't link it" —
+                  // the user explicitly asked us to surface these.
+                  borderColor: r.verdict === "unresolved"
+                    ? "rgba(251,191,36,0.45)"
+                    : undefined,
+                }}
+              >
+                <div style={{
+                  display: "inline-block",
+                  fontSize: "10px", fontWeight: 700, color: markerColour,
+                  background: markerBg,
+                  border: markerBorder,
+                  padding: "1px 6px", borderRadius: 6,
+                  minWidth: 30, textAlign: "center",
+                }}>
+                  [{r.marker}]
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{
+                    color: "var(--rf-text1)", fontWeight: 600, fontSize: "12px",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    {r.title || "(untitled)"}
+                  </div>
+                  <div style={{
+                    fontSize: "10.5px", color: "var(--rf-text4)", marginTop: 2,
+                    display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+                  }}>
+                    {r.authors.length > 0 && (
+                      <span>{r.authors.join(", ")}{r.authors.length >= 3 ? "…" : ""}</span>
+                    )}
+                    {r.namespace_key && (
+                      <span style={{ color: "var(--rf-text5)" }}>· {r.namespace_key}</span>
+                    )}
+                  </div>
+                </div>
+                <div style={{
+                  display: "flex", gap: 4, alignItems: "center",
+                  fontSize: "9.5px", fontWeight: 600,
+                }}>
+                  <span style={{
+                    color: tierColour(r.evidence_tier),
+                    padding: "1px 5px", borderRadius: 4,
+                    background: "var(--rf-surface3)",
+                    border: "1px solid var(--rf-border)",
+                  }}>
+                    {tierLabel(r.evidence_tier)}
+                  </span>
+                  <span style={{
+                    color: verdictColour(r.verdict),
+                    padding: "1px 5px", borderRadius: 4,
+                    background: "var(--rf-surface3)",
+                    border: "1px solid var(--rf-border)",
+                  }}>
+                    {r.verdict}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function WebResultsBlock({
   title, results,

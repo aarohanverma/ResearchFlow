@@ -241,3 +241,78 @@ class AssistantArtifact(Base):
     href: Mapped[str | None] = mapped_column(String(500), nullable=True)
     preview: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MemoryRevision(Base):
+    """Append-only audit trail for every long-term memory write.
+
+    Each user-facing change to a tracked memory entry (auto-write,
+    manual write, overwrite, delete, restore) lands here as one row so
+    the user can inspect history, compare versions, and restore an
+    earlier value. The live state still lives on
+    :class:`AssistantSession.state` JSONB — this table is the *audit
+    log*, never the source of truth for retrieval.
+
+    Strict isolation: every row carries ``user_id`` directly and the
+    inspect endpoints query by ``user_id`` first. A leaked session id
+    from another user can never surface someone else's revision
+    history.
+
+    ``action`` is one of:
+        * ``create``     — first time this key was written.
+        * ``update``     — value changed; ``previous_value`` records
+                           the prior value for compare/restore.
+        * ``delete``     — the entry was removed.
+        * ``restore``    — an earlier revision's value was reapplied.
+        * ``supersede``  — auto-memory consolidation merged two entries.
+
+    ``status`` reflects the entry's state AT THE TIME of this revision
+    (active / stale / superseded / deleted). The current entry's
+    status is recomputed from the most recent revision plus the live
+    state (TTL freshness).
+    """
+
+    __tablename__ = "memory_revisions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    # Root session that owns the memory bucket — for both medium (tree
+    # memory) and long (namespace memory), the bucket sits on the
+    # root session's state.
+    root_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assistant_sessions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    # Originating session — for medium/short writes via the memory
+    # tool, this is the child session that triggered the write. For
+    # long-tier writes via auto_memory it equals root_session_id. Kept
+    # so the audit trail shows which conversation the entry came
+    # from.
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    tier: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # short / medium / long
+    namespace_key: Mapped[str] = mapped_column(String(120), default="")
+    # Subject / topic tags carried over from the namespace classifier so
+    # the inspect API can filter by them without re-parsing
+    # ``namespace_key`` on every read. Subject is the broad bucket
+    # (e.g. ``cs``); topic is the fine-grained leaf (e.g. ``AI``).
+    subject: Mapped[str] = mapped_column(String(60), default="", index=True)
+    topic: Mapped[str] = mapped_column(String(60), default="", index=True)
+    key: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    previous_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_type: Mapped[str] = mapped_column(String(40), default="context")
+    source: Mapped[str] = mapped_column(String(40), default="manual")  # manual / auto / restore
+    action: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active / stale / superseded / deleted
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    extras: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )

@@ -97,6 +97,14 @@ class LoopState:
     banned_tools: set[str] = field(default_factory=set)
     tool_failures: int = 0
     successful_retrievals: int = 0
+    # Per-tool TOTAL invocation counter (successes + failures) for the
+    # per-turn cap. Distinct from ``tool_fail_counts`` (failures only)
+    # because a tool that succeeded 5 times this turn is also worth
+    # banning further calls of — the planner is plausibly stuck in a
+    # loop on it. Mirrors the LangChain ``ToolCallLimitMiddleware``
+    # ``run_limit`` semantics: scoped to the current turn, resets on
+    # next turn via fresh ``LoopState``.
+    tool_invocation_counts: dict[str, int] = field(default_factory=dict)
     semantic_check_done: bool = False
     iteration_count: int = 0
     completed_normally: bool = False

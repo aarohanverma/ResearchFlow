@@ -245,7 +245,11 @@ async def test_yield_marking_unverifiable_sweeps_stranded_in_flight():
     ledger.add(claim)
 
     state = _make_state(claim_ledger=ledger)
-    state.forced_paper_qa = 2  # cap exhausted
+    # Drive forced_paper_qa to the module's per-turn cap, whatever it is.
+    from app.assistant.react.middlewares.full_paper_gate import (
+        _MAX_FORCED_PAPER_QA_PER_TURN,
+    )
+    state.forced_paper_qa = _MAX_FORCED_PAPER_QA_PER_TURN
     mw = FullPaperVerificationMiddleware()
 
     with patch(
@@ -257,3 +261,73 @@ async def test_yield_marking_unverifiable_sweeps_stranded_in_flight():
     assert isinstance(gate, FinalizeAllow)
     assert claim.verdict == "unverifiable"
     assert "did not resolve" in claim.verification_note
+
+
+# ── Type-aware verification question ────────────────────────────────────────
+
+
+def test_numeric_claim_question_targets_results_section():
+    """A numeric claim must produce a question that asks for the
+    table / figure / experimental passage — not a generic 'does the
+    paper support this?' prompt that the in-paper retriever has no
+    anchor for."""
+    from app.assistant.react.middlewares.full_paper_gate import (
+        _build_verification_question,
+    )
+    claim = _provisional_claim(span="Our model achieves 95% accuracy on benchmark Q.")
+    q = _build_verification_question(claim)
+    assert "RESULTS" in q or "EXPERIMENTS" in q
+    assert "quote" in q.lower()
+    assert "95%" in q
+
+
+def test_causal_claim_question_asks_for_ablation():
+    """SOTA / causal claims must push the in-paper retriever to look
+    for the controlled comparison, not just the abstract's repetition
+    of the claim."""
+    from app.assistant.react.middlewares.full_paper_gate import (
+        _build_verification_question,
+    )
+    claim = _provisional_claim(span="Attention causes the model to outperform all baselines.")
+    q = _build_verification_question(claim)
+    assert "ABLATION" in q or "ablation" in q.lower()
+    assert "baseline" in q.lower()
+
+
+def test_comparative_claim_question_asks_for_head_to_head():
+    from app.assistant.react.middlewares.full_paper_gate import (
+        _build_verification_question,
+    )
+    claim = _provisional_claim(span="Our system outperforms GPT-4 on this task.")
+    q = _build_verification_question(claim)
+    assert "head-to-head" in q.lower()
+    assert "matched" in q.lower() or "fair" in q.lower()
+
+
+def test_generic_claim_falls_back_to_default_prompt():
+    from app.assistant.react.middlewares.full_paper_gate import (
+        _build_verification_question,
+    )
+    claim = _provisional_claim(span="The proposed approach handles edge cases gracefully.")
+    q = _build_verification_question(claim)
+    assert "full text" in q.lower()
+    assert "body" in q.lower()
+
+
+def test_priority_abstract_sourced_claims_first():
+    """A strong claim sourced from an abstract is more dangerous than
+    one sourced from a paper_qa chunk, so the priority ordering must
+    surface the abstract-sourced claim first when both are otherwise
+    equivalent."""
+    from app.assistant.react.middlewares.full_paper_gate import _priority
+    from app.assistant.claim_ledger import SOURCE_ABSTRACT, SOURCE_CHUNK, StrongClaim
+    abs_claim = StrongClaim(
+        span="Achieves 95% on benchmark Q.", paper_id="p1", paper_title="X",
+        source_field=SOURCE_ABSTRACT, iteration_seen=1,
+    )
+    chunk_claim = StrongClaim(
+        span="Achieves 95% on benchmark Q.", paper_id="p2", paper_title="Y",
+        source_field=SOURCE_CHUNK, iteration_seen=1,
+    )
+    ordered = sorted([chunk_claim, abs_claim], key=_priority)
+    assert ordered[0] is abs_claim

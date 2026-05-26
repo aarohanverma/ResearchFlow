@@ -45,6 +45,7 @@ from typing import Any
 
 from app.assistant.claim_ledger import (
     StrongClaim,
+    evidence_tier_from_structure,
     extract_claims_from_result,
     resolve_paper_qa_verdict,
 )
@@ -62,12 +63,14 @@ log = logging.getLogger(__name__)
 
 # How many forced paper_qa rounds we allow at finalize before
 # yielding. Each round costs one tool dispatch (LLM-backed paper_qa
-# synthesis) so we bound this to keep tail latency manageable. Two
-# rounds covers the common case: usually only one or two strong
-# claims survive un-verified to finalize time, since the model
-# already calls paper_qa proactively when it sees abstract-sourced
-# claims it wants to lean on.
-_MAX_FORCED_PAPER_QA_PER_TURN = 2
+# synthesis). The user spec is "make full-paper verification deeper
+# and more targeted" + "avoid deadlines/budgets — user can wait for
+# quality outputs," so we lift this from 2 → 4. In practice the
+# ledger rarely holds more than 3-4 surviving strong claims at
+# finalize because the model already calls paper_qa proactively
+# during the loop; this cap exists to bound the pathological case,
+# not to limit the common one.
+_MAX_FORCED_PAPER_QA_PER_TURN = 4
 
 # Wait until at least one retrieval has populated the paper ledger
 # before scanning for strong claims. Below this threshold the
@@ -75,20 +78,105 @@ _MAX_FORCED_PAPER_QA_PER_TURN = 2
 _MIN_LEDGER_FOR_SCAN = 1
 
 
-def _priority(claim: StrongClaim) -> int:
-    """Lower = higher priority. Causal / SOTA spans get the most
-    aggressive verification because they're the most over-claimed
-    in practice; numeric comparisons land in the middle; pure
-    comparatives last."""
+_CLAIM_TYPE_CAUSAL = "causal"
+_CLAIM_TYPE_NUMERIC = "numeric"
+_CLAIM_TYPE_COMPARATIVE = "comparative"
+_CLAIM_TYPE_GENERIC = "generic"
+
+
+def _classify_claim(claim: StrongClaim) -> str:
+    """Tag the claim with a coarse type so the verification question
+    can be tailored. Pure text inspection; cheap; namespace-agnostic."""
     span = (claim.span or "").lower()
     if any(kw in span for kw in (
-        "state-of-the-art", "sota", "first to ", "causes ", "drives ", "leads to ",
-        "outperforms all", "surpasses all",
+        "state-of-the-art", "sota", "first to ", "causes ", "drives ",
+        "leads to ", "outperforms all", "surpasses all", "the only ",
+        "best ", "novel ",
     )):
-        return 0
-    if any(kw in span for kw in ("%", "accuracy", "f1", "bleu", "speedup", "latency")):
-        return 1
-    return 2
+        return _CLAIM_TYPE_CAUSAL
+    if any(kw in span for kw in (
+        "%", "accuracy", "f1", "bleu", "rouge", "speedup", "latency",
+        "throughput", "auc", "perplexity", "mse", "rmse",
+    )):
+        return _CLAIM_TYPE_NUMERIC
+    if any(kw in span for kw in (
+        "outperforms", "better than", "improves over", "exceeds",
+        "compared to", "versus", " vs ",
+    )):
+        return _CLAIM_TYPE_COMPARATIVE
+    return _CLAIM_TYPE_GENERIC
+
+
+def _priority(claim: StrongClaim) -> int:
+    """Lower = higher priority. Source field also matters: a strong
+    claim sourced from an abstract is more dangerous than one sourced
+    from a paper_qa chunk (which already saw paper body), so the
+    abstract-sourced ones surface first."""
+    source_bonus = 0 if (claim.source_field or "").lower() in {
+        "abstract", "snippet", "title", "tldr",
+    } else 1
+    ctype = _classify_claim(claim)
+    type_rank = {
+        _CLAIM_TYPE_CAUSAL: 0,
+        _CLAIM_TYPE_NUMERIC: 1,
+        _CLAIM_TYPE_COMPARATIVE: 2,
+        _CLAIM_TYPE_GENERIC: 3,
+    }[ctype]
+    return type_rank * 2 + source_bonus
+
+
+def _build_verification_question(claim: StrongClaim) -> str:
+    """Compose a targeted paper_qa question keyed off the claim's
+    type. A generic "does the paper support this claim?" loses signal
+    on quantitative or causal claims that need a specific evidence
+    artefact (table, ablation, controlled comparison). The
+    type-specific phrasing pushes the in-paper retriever toward the
+    right section and the LLM toward a verdict that surfaces the
+    exact passage.
+
+    The original short prompt is preserved as fallback for the
+    generic bucket so we don't bloat the prompt when there's
+    nothing specific to ask for."""
+    span = (claim.span or "")[:380]
+    ctype = _classify_claim(claim)
+    if ctype == _CLAIM_TYPE_NUMERIC:
+        return (
+            "Does the paper's RESULTS / EXPERIMENTS section actually report "
+            "this number? Quote the exact passage (table, figure caption, or "
+            "results sentence) and state the experimental setting (dataset, "
+            "model size, evaluation protocol). If the number is reported but "
+            "with caveats (best-of-N, single seed, narrow benchmark slice), "
+            "list those caveats explicitly. If NOT supported, say so clearly.\n\n"
+            "Claim: " + span
+        )
+    if ctype == _CLAIM_TYPE_CAUSAL:
+        return (
+            "Does the paper actually establish this causal / superlative "
+            "relationship, or is the language a soft suggestion? Identify "
+            "the specific ABLATION, controlled comparison, or theoretical "
+            "result that supports the causal direction. If the support is "
+            "only correlational or limited to a single benchmark, say so. "
+            "If the claim is SOTA / 'outperforms all', list the baselines "
+            "the paper actually compared against — silence on common "
+            "stronger baselines counts as unsupported.\n\n"
+            "Claim: " + span
+        )
+    if ctype == _CLAIM_TYPE_COMPARATIVE:
+        return (
+            "Does the paper substantiate this comparison with a head-to-head "
+            "experiment? Identify the exact comparison setting (same dataset, "
+            "same compute, same evaluation), quote the passage, and note "
+            "whether the comparison is fair (matched conditions) or relies "
+            "on numbers reported elsewhere. If the comparison is not "
+            "head-to-head, say so explicitly.\n\n"
+            "Claim: " + span
+        )
+    return (
+        "Does the paper's full text actually support this claim? Quote the "
+        "relevant passages from the paper body (not just the abstract) or "
+        "state clearly if the claim is NOT supported by the body.\n\n"
+        "Claim: " + span
+    )
 
 
 class FullPaperVerificationMiddleware(BaseMiddleware):
@@ -176,6 +264,7 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         answer = (out.get("answer") or "")
         if out.get("found") is False or not answer:
             target.verdict = "unverifiable"
+            target.evidence_tier = "unverified"
             target.verification_note = (
                 "paper_qa could not resolve the paper / chunk index — "
                 "claim left unverifiable"
@@ -186,9 +275,34 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         target.verdict = verdict
         target.verification_note = note
         target.verified_at_iteration = state.iteration_count
+        # Upgrade the evidence tier using the paper's own structure —
+        # WHERE in the document the answer-grounding chunks lie.
+        # ``chunk_positions`` is the primary signal (namespace-
+        # agnostic: works across CS / physics / biology / math /
+        # economics without per-discipline section-name lists);
+        # ``sections_used`` is read only to honour the canonical
+        # ``abstract`` tag every ingestion path stamps on abstract
+        # rows.
+        positions = out.get("chunk_positions") or []
+        sections = out.get("sections_used") or []
+        if verdict == "verified":
+            target.evidence_tier = evidence_tier_from_structure(
+                chunk_positions=positions, section_types=sections,
+            )
+        elif verdict == "contradicted":
+            # We still know which part of the paper refuted it; preserve
+            # the tier so the answer can say "refuted against the
+            # paper's experimental section" rather than a generic
+            # refutation.
+            target.evidence_tier = evidence_tier_from_structure(
+                chunk_positions=positions, section_types=sections,
+            )
+        else:
+            target.evidence_tier = "unverified"
         state.pad.think(
             f"Full-paper gate: paper_qa returned for forced verification — "
-            f"claim={target.span[:160]!r} → {verdict.upper()} ({note[:120]})"
+            f"claim={target.span[:160]!r} → {verdict.upper()} "
+            f"[{target.evidence_tier}] ({note[:120]})"
         )
 
     async def gate_finalize(self, state: Any) -> FinalizeGate:
@@ -259,16 +373,11 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         inflight[str(target.paper_id)] = target.span or ""
         state._fpg_inflight = inflight
 
-        # Build a focused question — the loop will call paper_qa with
-        # the claim as the question, so the LLM can answer "does the
-        # paper support this exact statement?". Trim aggressively so
-        # the synthesizer prompt inside paper_qa doesn't bloat.
-        question = (
-            "Does the paper's full text actually support this claim? "
-            "Quote the relevant passages or state clearly if the claim "
-            "is NOT supported by the paper body.\n\nClaim: "
-            + target.span[:380]
-        )
+        # Type-targeted question — numeric / causal / comparative
+        # claims each need a different evidence artefact, so a single
+        # generic prompt loses signal on the dangerous claims. Falls
+        # back to the generic phrasing for unclassifiable spans.
+        question = _build_verification_question(target)
         return FinalizeForceAction(
             action="paper_qa",
             params={
@@ -301,6 +410,7 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         flagged = 0
         for claim in state.claim_ledger.unverified():
             claim.verdict = "unverifiable"
+            claim.evidence_tier = "unverified"
             claim.verification_note = (
                 f"full-paper verification skipped at finalize ({reason})"
             )
@@ -311,6 +421,7 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         for claim in state.claim_ledger.by_key.values():
             if claim.verdict == "in_flight":
                 claim.verdict = "unverifiable"
+                claim.evidence_tier = "unverified"
                 claim.verification_note = (
                     f"paper_qa dispatched but did not resolve ({reason})"
                 )

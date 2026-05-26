@@ -150,7 +150,23 @@ class GenieSynthesizeTool:
             name=f"ra:genie:{gid}",
         )
         _GENIE_BG_TASKS.add(bg)
-        bg.add_done_callback(_GENIE_BG_TASKS.discard)
+
+        def _on_bg_done(t: asyncio.Task, _gid: str = gid) -> None:
+            _GENIE_BG_TASKS.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                # Without this the failure surfaces only as an asyncio
+                # "exception was never retrieved" debug warning that
+                # production logs typically filter out — the IdeaCapsule
+                # row stays in ``running`` forever with no operator signal.
+                log.warning(
+                    "genie background synthesis failed gid=%s: %s",
+                    _gid, exc,
+                )
+
+        bg.add_done_callback(_on_bg_done)
 
         if not params.inline:
             await ctx.emit_progress(100, "Genie synthesis queued")

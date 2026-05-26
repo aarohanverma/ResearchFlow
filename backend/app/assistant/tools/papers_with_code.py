@@ -167,11 +167,23 @@ class PapersWithCodeTool:
             headers={"User-Agent": "ResearchFlow/1.0"},
         )
         resp.raise_for_status()
-        # Guard against redirect-to-HTML responses (e.g. PwC → HuggingFace redirect chain)
+        # Guard against redirect-to-HTML responses (e.g. PwC → HuggingFace redirect chain).
+        # When this trips it's invisible to the caller — log so the
+        # "always 0 results" failure mode is debuggable instead of silent.
         content_type = resp.headers.get("content-type", "")
         if "json" not in content_type:
+            log.warning(
+                "papers_with_code: /papers/?q=%r returned non-JSON (%s) — "
+                "API may have changed or be rate-limited",
+                query, content_type,
+            )
             return [], 0
         data = resp.json()
+        # Some PwC endpoints return ``{"results": null}`` on empty
+        # searches rather than an empty list — coerce so downstream
+        # iteration is safe regardless.
+        if not data.get("results"):
+            log.info("papers_with_code: empty results for query=%r", query)
         items = data.get("results") or []
         out = []
         for p in items[:limit]:

@@ -30,6 +30,7 @@ import {
 import { cleanAbstract } from "@/lib/utils";
 import { useAuthStore } from "@/store/auth";
 import { useNamespaceStore } from "@/store/namespace";
+import { useResizableWidth, RESIZE_HANDLE_STYLE } from "@/hooks/use-resizable-width";
 import { useBookmarksStore } from "@/store/bookmarks";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
 
@@ -230,6 +231,16 @@ function FolderSidebar({
   const [newColor, setNewColor] = useState(FOLDER_COLORS[0]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
+  // Drag-resizable width persisted across reloads. Bounds keep the
+  // folder labels legible (>=180) without letting the sidebar swallow
+  // the bookmark list area (<=420).
+  const { width: folderW, onResizeStart, reset } = useResizableWidth({
+    storageKey: "rf-bookmarks-folder-w",
+    defaultWidth: 208,  // matches the legacy w-52
+    minWidth: 180,
+    maxWidth: 420,
+    anchor: "left",
+  });
 
   async function submitCreate() {
     if (!newName.trim()) return;
@@ -276,7 +287,17 @@ function FolderSidebar({
   }
 
   return (
-    <div className="w-52 shrink-0 border-r border-white/5 flex flex-col bg-gray-950/50 transition-all">
+    <div
+      className="shrink-0 border-r border-white/5 flex flex-col bg-gray-950/50 transition-[background] relative"
+      style={{ width: folderW }}
+    >
+      {/* Drag-resize handle pinned to the RIGHT edge of the sidebar */}
+      <div
+        onMouseDown={onResizeStart}
+        onDoubleClick={reset}
+        title="Drag to resize · double-click to reset"
+        style={{ ...RESIZE_HANDLE_STYLE, right: -3 }}
+      />
       <div className="p-3 border-b border-white/5">
         <div className="flex items-center justify-between mb-2">
           <p className="text-[10px] font-bold text-gray-600 uppercase tracking-wider">Folders</p>

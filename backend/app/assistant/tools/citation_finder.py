@@ -56,20 +56,38 @@ class CitationFinderTool:
     async def run(self, ctx: ToolContext, params: CitationFinderInput) -> ToolResult:
         await ctx.emit_progress(15, f"Finding citations for: {params.claim[:60]}")
 
-        # Step 1: Search corpus via deep_search-style retrieval
+        # Step 1: Search corpus via deep_search-style retrieval.
+        # The earlier signature was wrong (passed ``user_id``, missing
+        # ``job_id`` and ``limit``) — every call raised TypeError, the
+        # broad except swallowed it, and citation_finder returned 0
+        # papers every time. That was the "always 0 results" bug the
+        # user flagged. Pass the real parameter shape: keyword-only
+        # arguments matching ``_run_deep_search``'s signature.
         corpus_papers: list[dict] = []
         try:
+            import uuid as _uuid
             from app.api.v1.search import _run_deep_search
             from app.db.session import async_session_factory
 
+            # ``include_arxiv_mcp=True`` widens results beyond the
+            # local corpus so a fresh user with no ingested papers
+            # still gets candidates. namespace_keys=None lets the
+            # search span every indexed paper; passing a single ns
+            # is too restrictive for citation-hunting which is
+            # inherently cross-domain.
+            search_ns = (
+                ctx.namespace_keys or
+                ([ctx.namespace_key] if ctx.namespace_key else None)
+            )
             async with async_session_factory() as db:
                 ds_result = await _run_deep_search(
+                    job_id=f"citation_finder:{_uuid.uuid4()}",
                     query=params.claim,
-                    user_id=ctx.user_id,
-                    namespace_keys=[ctx.namespace_key] if ctx.namespace_key else None,
+                    namespace_keys=search_ns,
+                    limit=max(params.limit, 6),
+                    db=db,
                     include_arxiv_mcp=True,
                     arxiv_max_results=8,
-                    db=db,
                 )
                 for p in (ds_result.results or [])[:params.limit]:
                     paper_dict = p.model_dump() if hasattr(p, "model_dump") else dict(p)

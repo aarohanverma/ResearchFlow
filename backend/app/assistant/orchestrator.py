@@ -67,32 +67,46 @@ _MAX_GROUNDING_PAPERS = 10
 # rendering unrelated papers in the Grounded block.
 _MIN_QUERY_PAPER_SIMILARITY = 0.50
 
-# Phrases/patterns that reliably indicate an off-topic request — i.e., not
-# research, learning, synthesis, exploration, or platform-adjacent tasks.
-# Kept conservative: we only reject when confident, never when in doubt.
+# Safety-critical hard-block patterns. ONLY the categories where a
+# response is unambiguously harmful regardless of research framing.
+# Everything else — including superficially "off-topic" queries like
+# ``stock price prediction methods``, ``NLP for movie reviews``,
+# ``cooking ingredient parsing`` — must reach the planner so RA can
+# decide intelligently whether to address it as a legitimate research
+# question or politely steer. The previous broad pattern list was a
+# generalisation failure: a finance researcher asking ``what are the
+# best models for stock price prediction?`` got hard-blocked because
+# the substring ``stock price`` matched. The user's explicit spec is
+# "RA should generalize well for all subjects" — that means the guard
+# stays narrow and the model handles intent.
 _OFF_TOPIC_PATTERNS = (
-    r"\b(recipe|cooking|bake|baking|cook\b|dish\b|cuisine|ingredient|restaurant)\b",
-    r"\b(horoscope|astrology|zodiac|tarot|psychic|fortune\s*tell)\b",
-    r"\b(lottery|gambling|casino|bet\b|betting|wager)\b",
-    r"\b(sports\s+(score|result|game|match|team|player|league)|nfl|nba|mlb|nhl|fifa|cricket\s+score)\b",
-    r"\b(stock\s+(price|ticker|quote)|share\s+price|crypto\s+price|bitcoin\s+price)\b",
-    r"\b(movie\s+(review|plot|trailer)|tv\s+(show|series|episode)|celebrity|gossip)\b",
-    r"\b(write\s+(me\s+a\s+(poem|song|story|joke|rap)|lyrics)|tell\s+me\s+a\s+joke)\b",
+    # Account hijack / credential theft.
     r"\bpassword\b.{0,30}\brecover|hack\s+(account|password|into|email)\b",
-    r"\b(illegal|commit\s+a\s+crime|how\s+to\s+(steal|cheat|defraud))\b",
+    # Direct illegal-act asks. The conservative wording avoids
+    # blocking legitimate research on crime/fraud/security topics —
+    # those use the noun form ("research on fraud", "study of
+    # cybercrime") which doesn't match the verb-phrase pattern.
+    r"\b(commit\s+a\s+crime|how\s+to\s+(steal|cheat|defraud))\b",
 )
 
 _OFF_TOPIC_REDIRECT = (
-    "I'm focused on research, learning, literature exploration, synthesis, "
-    "and scientific discovery — this question looks like it falls outside that scope.\n\n"
-    "If there's a research angle I can help with — finding papers, explaining "
-    "concepts, exploring the scientific literature, or connecting ideas — just let me know."
+    "I can't help with that request. If there's a research angle — "
+    "literature on the topic, methods, or related concepts — I'm "
+    "happy to dig in."
 )
 
 import re as _re
 
 def _is_off_topic(query: str) -> bool:
-    """Return True when the query clearly belongs to a non-research domain."""
+    """Return True when the query is unambiguously unsafe / out-of-scope.
+
+    Deliberately narrow — this is a *safety hard-block*, not a
+    relevance gate. Almost every "is this a research question?"
+    decision belongs in the planner / intent classifier, which can
+    weigh context, namespace, and the user's prior turns. The
+    function only fires on requests that no responsible answer can
+    address (credential theft, instructions for illegal acts).
+    """
     q_lower = (query or "").lower()
     return any(_re.search(pat, q_lower) for pat in _OFF_TOPIC_PATTERNS)
 
@@ -213,6 +227,45 @@ class Orchestrator:
                 short_memory = getattr(session, "_short_memory", {})
                 tree_memory = getattr(session, "_tree_memory", {})
                 ns_memory = getattr(session, "_ns_memory", {})
+
+                # Respect the per-user "pause memory injection" toggle,
+                # with optional per-namespace overrides. When disabled,
+                # RA skips persistent memory (medium/long tiers) in
+                # planner / synthesizer prompts — the user's spec is
+                # "disable injection without deleting stored memory".
+                # Short-term chat memory is left intact (it's the
+                # current conversation context the model already
+                # sees inline). Per-namespace overrides shadow the
+                # global toggle, so a user can leave injection ON
+                # globally and pause it for a single noisy namespace.
+                injection_enabled = True
+                injection_scope = "global"
+                try:
+                    from app.models.user import User as _User
+                    user_row = await db.execute(
+                        select(_User).where(_User.id == task.user_id),
+                    )
+                    user_obj = user_row.scalar_one_or_none()
+                    if user_obj is not None:
+                        global_flag = bool(
+                            getattr(user_obj, "memory_injection_enabled", True),
+                        )
+                        overrides = (
+                            getattr(user_obj, "memory_injection_overrides", None) or {}
+                        )
+                        ns_for_lookup = primary_ns or ""
+                        if isinstance(overrides, dict) and ns_for_lookup in overrides:
+                            injection_enabled = bool(overrides[ns_for_lookup])
+                            injection_scope = "namespace"
+                        else:
+                            injection_enabled = global_flag
+                except Exception as _mi_exc:
+                    log.debug("memory injection toggle read failed: %s", _mi_exc)
+
+                if not injection_enabled:
+                    tree_memory = {}
+                    ns_memory = {}
+
                 # Carry memory across to _finalize_turn so the synthesizer
                 # prompt can pick it up without re-loading the session.
                 try:
@@ -220,6 +273,7 @@ class Orchestrator:
                         "short": short_memory,
                         "medium": tree_memory,
                         "long": ns_memory,
+                        "injection_enabled": injection_enabled,
                     }
                 except Exception:
                     pass
@@ -432,6 +486,12 @@ class Orchestrator:
                     disabled_features=disabled_features,
                     research_brief=brief_text or None,
                     intent_hint=intent_hint_text or None,
+                    # session_id anchors the semantic-rank embedding
+                    # cache (see ``memory_injector.select_relevant_memory``)
+                    # so the planner's query-aware memory filter reuses
+                    # vectors computed on prior turns instead of paying
+                    # the embed cost each call.
+                    session_id=task.session_id,
                 )
             else:
                 plan = self._planner.plan(
@@ -763,8 +823,44 @@ class Orchestrator:
 
     # Rolling history: keep this many recent messages verbatim; older messages
     # are compressed into a single rich summary injected as a system message.
+    #
+    # The COUNT thresholds below act as conservative lower bounds — the
+    # actual cutoff is driven by the token budget computed against the
+    # model's context window in :meth:`_build_rolling_history`. A long
+    # single message (e.g. a user paste of a paper body) can blow a
+    # count-only budget even when only 3 turns are loaded; the token-
+    # aware path catches that by spilling older verbatim turns into the
+    # summary as soon as the rolling slice approaches the budget. The
+    # count threshold is still useful as the "don't pay a summary LLM
+    # call on tiny sessions" gate, but it never expands beyond the
+    # token budget.
     _HISTORY_VERBATIM = 10
     _HISTORY_SUMMARIZE_THRESHOLD = 14  # start summarizing when total > this
+    # Approximate context-window size we plan against. Most modern
+    # adapter targets (gpt-4o, gpt-5.4, Claude Sonnet/Opus, Gemini
+    # 1.5/2) carry 128k+, but planner / synthesizer prompts already
+    # consume a sizable chunk for the system message, tool catalog,
+    # and structured agent_notes block. We budget conservatively so
+    # the verbatim history slice plus everything else fits comfortably
+    # without provider truncation surprises. The orchestrator does NOT
+    # need to know each adapter's precise window — it only needs an
+    # honest upper bound, and the token estimator is itself a
+    # heuristic.
+    _APPROX_CONTEXT_WINDOW_TOKENS = 128_000
+    # Maximum tokens we'll spend on verbatim recent messages. The rest
+    # of the window is reserved for the system prompt, tool catalog,
+    # rolling-summary block, current user turn, agent_notes, and the
+    # response. 40% is a comfortable upper bound for a deep-research
+    # turn; the 60% reservation comes from empirical sizing of the
+    # synthesizer prompt.
+    _HISTORY_VERBATIM_BUDGET_TOKENS = int(_APPROX_CONTEXT_WINDOW_TOKENS * 0.40)
+    # Token-equivalent character heuristic. tiktoken is the precise
+    # tool but adds a heavy dependency for what is, in practice, a
+    # budget estimate. Chars-per-token of ~4 is the well-known rough
+    # equivalence for English and code mixed corpora; it under-counts
+    # for languages with multi-byte tokens, which is fine — we'd
+    # rather budget conservatively than blow the window.
+    _CHARS_PER_TOKEN = 4
 
     # Guardrail limits — prevent runaway agentic loops
     _MAX_STEPS_PER_TURN = 12          # absolute cap on planned steps
@@ -974,6 +1070,143 @@ class Orchestrator:
         task._session_active_context = active_context_inventory  # type: ignore[attr-defined]
         return task, session, query, namespace_keys, primary_ns, orientation, expertise
 
+    @staticmethod
+    def _estimate_msg_tokens(msg: dict) -> int:
+        """Cheap upper-bound token estimate for one message.
+
+        Uses the chars/4 rough equivalence (well-known approximation for
+        mixed English/code). Adds a small per-message overhead to
+        account for role tags and chat-template wrapping the provider
+        will add. Conservative: it's better to under-pack the verbatim
+        slice than to blow the context window.
+
+        Multimodal / tool-use messages: content can be a list of typed
+        blocks (Anthropic ``{"type": "tool_use", "input": {...}}`` or
+        OpenAI ``{"type": "text", "text": "..."}``). We sum text from
+        ``text``/``content``/``input`` so a long tool-call history
+        contributes its real cost — the previous version only counted
+        ``text`` keys, under-counting tool-heavy turns enough to blow
+        the verbatim budget. Image blocks are still excluded (priced
+        separately by every provider; the text part is what the
+        window budgets against).
+        """
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            total_chars = 0
+            for part in content:
+                if isinstance(part, dict):
+                    total_chars += Orchestrator._sum_text_chars(part)
+                elif isinstance(part, str):
+                    total_chars += len(part)
+        else:
+            total_chars = len(str(content))
+        # Tool-call results that ride on the message itself (some
+        # providers attach a ``tool_calls`` list at message-level rather
+        # than embedding them in ``content``). OpenAI's shape is
+        # ``[{"id": ..., "type": "function", "function": {"name": ...,
+        # "arguments": "..."}}]`` — the load-bearing payload sits
+        # under ``function``, whose key name isn't on our known-text
+        # list. So for these top-level tool-call channels we sum
+        # every string leaf, matching the input/arguments treatment.
+        for key in ("tool_calls", "function_call"):
+            extra = msg.get(key)
+            if extra is not None:
+                total_chars += Orchestrator._sum_string_leaves_any(extra)
+        # +12 token overhead per message for role / template framing —
+        # a small constant relative to a real turn but it adds up over
+        # 10+ verbatim messages.
+        return max(1, total_chars // Orchestrator._CHARS_PER_TOKEN) + 12
+
+    # Keys we KNOW carry text relevant to the token budget. The first
+    # group (``text``/``content``) carries chat text; the second group
+    # (``input``/``arguments``) carries tool-call payloads. When we
+    # land on one of those, we descend into the value generically —
+    # tool-call payloads are user-defined dicts whose own key names
+    # we cannot enumerate ahead of time (could be ``query``,
+    # ``paper_id``, ``filters``, …), so for those we sum every string
+    # leaf the structure contains.
+    _TOKEN_TEXT_KEYS: frozenset[str] = frozenset({"text", "content"})
+    _TOKEN_PAYLOAD_KEYS: frozenset[str] = frozenset({"input", "arguments"})
+    # Keys we deliberately IGNORE — they describe media or routing,
+    # not text the model consumes against the context window.
+    # Providers price these separately.
+    _TOKEN_SKIP_KEYS: frozenset[str] = frozenset({
+        "image", "image_url", "source", "id", "name", "type", "role",
+    })
+
+    @staticmethod
+    def _sum_text_chars(part: dict) -> int:
+        """Recursively sum the length of every textual leaf inside a
+        message-content block, splitting two cases:
+
+        1. Known text-carrying keys (``text`` / ``content``): walk
+           their values structurally and sum string leaves found via
+           the same known-keys path.
+        2. Known payload-carrying keys (``input`` / ``arguments`` —
+           used by tool-call blocks for both Anthropic and OpenAI):
+           the value is a user-defined dict / JSON whose key names
+           we cannot enumerate ahead of time, so we sum EVERY string
+           leaf the value contains.
+
+        Image-style keys (``image_url``, ``source``, etc.) are
+        skipped — providers price those separately and they don't
+        consume the text window in the same chars/token sense.
+        """
+        total = 0
+        for key, v in part.items():
+            if key in Orchestrator._TOKEN_SKIP_KEYS:
+                continue
+            if key in Orchestrator._TOKEN_TEXT_KEYS:
+                total += Orchestrator._sum_string_leaves_in_known_path(v)
+            elif key in Orchestrator._TOKEN_PAYLOAD_KEYS:
+                # Tool-call payload — sum every string leaf because the
+                # caller defines the schema and we cannot anticipate
+                # which keys carry the load.
+                total += Orchestrator._sum_string_leaves_any(v)
+        return total
+
+    @staticmethod
+    def _sum_string_leaves_in_known_path(v: Any) -> int:
+        """Sum string lengths reachable through the known
+        text-key path (``text`` / ``content``). Nested dicts are
+        walked via :meth:`_sum_text_chars` so we follow only the
+        known channels — keeps the estimate honest by not counting
+        sidecar metadata as text.
+        """
+        if isinstance(v, str):
+            return len(v)
+        if isinstance(v, list):
+            total = 0
+            for sub in v:
+                if isinstance(sub, dict):
+                    total += Orchestrator._sum_text_chars(sub)
+                elif isinstance(sub, str):
+                    total += len(sub)
+            return total
+        if isinstance(v, dict):
+            return Orchestrator._sum_text_chars(v)
+        return 0
+
+    @staticmethod
+    def _sum_string_leaves_any(v: Any) -> int:
+        """Sum the length of every string leaf reachable from ``v``,
+        regardless of key name.
+
+        Used only inside tool-call payload subtrees (``input`` /
+        ``arguments``), where keys are user-defined and we must
+        account for the whole serialised structure to bound the
+        budget honestly. A 4 KB ``query`` value inside a tool-call
+        input was previously invisible to the estimator because its
+        key wasn't on our walk list — this method closes that gap.
+        """
+        if isinstance(v, str):
+            return len(v)
+        if isinstance(v, list):
+            return sum(Orchestrator._sum_string_leaves_any(item) for item in v)
+        if isinstance(v, dict):
+            return sum(Orchestrator._sum_string_leaves_any(val) for val in v.values())
+        return 0
+
     async def _build_rolling_history(
         self,
         *,
@@ -982,28 +1215,96 @@ class Orchestrator:
         session_id: str,
         namespace_key: str,
     ) -> list[dict]:
-        """Build the history list using a rolling window with lazy summarization.
+        """Build the history list using a token-aware rolling window
+        with lazy summarization.
 
-        When the conversation is short (≤ threshold), returns all messages.
-        When longer, keeps the last ``_HISTORY_VERBATIM`` messages verbatim and
-        prepends a rich system summary of the older turns. The summary is stored
-        in session.state["history_summary"] so it is generated ONCE and reused
-        on every subsequent turn — no redundant LLM calls.
+        Behavior:
 
-        The cached summary is keyed by the message index of the last message
-        included in it, so it is only regenerated when new messages fall out
-        of the verbatim window (i.e., when the conversation grows past the
-        next summarization checkpoint).
+        * **Short session** — when the count is below
+          ``_HISTORY_SUMMARIZE_THRESHOLD`` AND the total token estimate
+          fits the verbatim budget, returns all messages untouched.
+          Avoids the cost of summarising tiny conversations.
+        * **Long session by count** — keeps the last ``_HISTORY_VERBATIM``
+          messages verbatim, summarises the older ones into a system
+          message. Cached in ``session.state["history_summary"]``,
+          regenerated only when the cutoff index moves (i.e. a new
+          verbatim turn pushed an older one off the tail).
+        * **Long single message (token-driven)** — even a single user
+          paste of a large document can blow the verbatim budget. When
+          the verbatim slice's token estimate exceeds
+          ``_HISTORY_VERBATIM_BUDGET_TOKENS``, we walk backwards from
+          the latest message including only as many as fit; everything
+          older spills into the summary. The current turn (last
+          message) is always preserved verbatim — even if a single
+          message exceeds the budget, we keep it and rely on the
+          provider's own truncation to surface the issue clearly.
+
+        Returns:
+            A list of message dicts whose total token estimate fits
+            within ``_HISTORY_VERBATIM_BUDGET_TOKENS`` plus the
+            summary block. Order is preserved (summary first, then
+            verbatim messages in chronological order).
+
+        Side effects:
+            Writes the freshly-computed summary back to
+            ``session.state["history_summary"]`` and to the in-process
+            ``session_state`` dict. Failures to persist are logged but
+            never abort the turn — the summary is rebuilt next turn if
+            persistence failed.
         """
         total = len(all_msgs)
-        if total <= self._HISTORY_SUMMARIZE_THRESHOLD:
-            # Short session — return all messages, no summary needed.
+        if total == 0:
             return all_msgs
 
-        # Split into "old" (to be summarized) and "recent" (verbatim).
-        cutoff = total - self._HISTORY_VERBATIM
+        # ── Token-aware verbatim cutoff ────────────────────────────────
+        # Walk backwards from the latest message accumulating token
+        # estimates. Stop when adding the next message would exceed
+        # the verbatim budget. The current (last) message is always
+        # included, even if it alone exceeds the budget — losing the
+        # user's most recent turn would defeat the purpose of the
+        # conversation.
+        budget = self._HISTORY_VERBATIM_BUDGET_TOKENS
+        running = 0
+        keep_from = total  # index where the verbatim slice starts
+        for i in range(total - 1, -1, -1):
+            cost = self._estimate_msg_tokens(all_msgs[i])
+            # Always keep the last message (current user turn) even if
+            # it alone exceeds the budget — provider-side truncation
+            # is more informative than us silently dropping it.
+            if i == total - 1:
+                running += cost
+                keep_from = i
+                continue
+            if running + cost > budget:
+                break
+            running += cost
+            keep_from = i
+
+        # The legacy COUNT threshold remains in force as a "don't pay
+        # a summary LLM call on tiny sessions" gate. If the conversation
+        # is small AND token-fits, return all messages untouched. We
+        # take the LARGER of the two cutoff bounds — token cutoff or
+        # count cutoff — so a session that's "short by count" but
+        # massive by token still spills into a summary.
+        count_cutoff_ok = total <= self._HISTORY_SUMMARIZE_THRESHOLD
+        token_cutoff_ok = keep_from == 0
+        if count_cutoff_ok and token_cutoff_ok:
+            # Short session AND token-fits — return all messages, no
+            # summary needed.
+            return all_msgs
+
+        # Choose the more aggressive of the two cutoffs: token-driven
+        # ``keep_from`` (back-walked from the end) vs count-driven
+        # ``total - _HISTORY_VERBATIM``. Whichever leaves FEWER recent
+        # messages verbatim is the one that protects the budget.
+        count_cutoff = max(0, total - self._HISTORY_VERBATIM)
+        cutoff = max(keep_from, count_cutoff)
         old_msgs = all_msgs[:cutoff]
         recent_msgs = all_msgs[cutoff:]
+        if not old_msgs:
+            # All messages still fit verbatim under the budget; no
+            # summary needed.
+            return all_msgs
 
         # Check cache: summary is still valid if the cutoff index hasn't moved.
         cached = session_state.get("history_summary") or {}
@@ -1632,6 +1933,32 @@ class Orchestrator:
         intent_hint = getattr(task, "_intent_hint_text", "") or ""
         shape_hint = getattr(task, "_shape_hint_text", "") or ""
         skip_reflection = bool(getattr(task, "_skip_reflection", False))
+        # ── Streaming strategy ──────────────────────────────────────────
+        # The synthesizer's post-synth pipeline (reflection / critique /
+        # repair / final_evaluator / output quality safeguard /
+        # low-grounding notice) ONLY runs when ``on_delta`` is None.
+        # When the caller streams, the synthesizer returns early
+        # (synthesizer.py:898 / 911) and the user sees raw, unaudited
+        # LLM output token-by-token — no revision pass, no evaluator
+        # signal, no quality safeguard.
+        #
+        # User requirement: never stream a wrong / unaudited answer.
+        # Strategy:
+        #   * Deep tier — full audit machinery is most valuable here.
+        #     We disable real streaming, let the synthesizer run its
+        #     full pipeline (including the final_evaluator that may
+        #     trigger ONE re-synthesis), then replay the FINAL post-
+        #     audit text via ``_fake_stream_answer`` so the UI still
+        #     animates the answer in. The user only ever sees the
+        #     revised, audited version.
+        #   * Trivial / single tier — these turns set
+        #     ``skip_reflection=True`` so the audit pipeline is a
+        #     no-op anyway, and they're latency-sensitive. Real
+        #     streaming preserves snappy time-to-first-token without
+        #     skipping any audit that would have run.
+        depth_tier = getattr(task, "_depth_tier", "") or ""
+        use_real_streaming = depth_tier != "deep"
+        on_delta_for_synth = _on_delta if use_real_streaming else None
 
         # Distill the ReAct scratchpad into a compact ``agent_notes``
         # dict so the synthesizer can honor the agent's own
@@ -1661,6 +1988,16 @@ class Orchestrator:
         # would have nowhere to land the new reports.
         if agent_notes is None:
             agent_notes = {}
+        # Surface the actual Genie tool status (done / running / queued
+        # / timeout / failed) so the synthesizer's agent_notes block
+        # can tell the model whether the idea finished or is still
+        # being synthesized. Without this directive the answer
+        # narrates synthesis as "completed" even on timeout/queued
+        # outcomes — the bug the user flagged as "don't silently
+        # finalize as if Genie completed".
+        genie_status = self._genie_status_from_results(results)
+        if genie_status:
+            agent_notes["genie_status"] = genie_status
         synth_output: dict[str, Any] = {}
         answer = await synthesize_answer(
             query=query,
@@ -1682,9 +2019,32 @@ class Orchestrator:
             user_id=task.user_id,
             skip_reflection=skip_reflection,
             agent_notes=agent_notes,
-            on_delta=_on_delta,
+            on_delta=on_delta_for_synth,
             output=synth_output,
         )
+        # Deep tier: the synthesizer ran in non-streaming mode so the
+        # reflection / repair / final_evaluator pipeline could mutate
+        # ``answer`` if needed. Replay the AUDITED text to the SSE
+        # channel now so the UI animation matches the streaming UX of
+        # the other tiers — only ever emitting the final, revised,
+        # post-quality-checked version.
+        if not use_real_streaming and answer:
+            try:
+                await self._fake_stream_answer(job_id, message_id, answer)
+            except asyncio.CancelledError:
+                # User-driven cancel during fake-stream propagates so
+                # the run_turn ``except CancelledError`` runs the
+                # standard cancel cleanup. The persisted DB row will
+                # reflect cancelled status; the streamed-so-far
+                # deltas the frontend received are harmless.
+                raise
+            except Exception as _stream_exc:  # noqa: BLE001
+                # Fake-stream is purely UI animation — failure must
+                # not block persistence or completion of the turn.
+                # The answer is already finalised; the user will see
+                # it on the ``message_completed`` event regardless.
+                log.debug("fake-stream skipped: %s", _stream_exc)
+
         # Merge synth side-channel reports into the persisted agent_notes
         # so they round-trip to the UI and to future-turn diagnostics.
         if isinstance(agent_notes, dict):
@@ -1721,6 +2081,13 @@ class Orchestrator:
             fred_series=fred_series,
             trials_results=trials_results,
             code_results=code_results,
+            # Plumb agent_notes through so the consolidated citation
+            # table can carry per-paper evidence-tier labels (sourced
+            # from the strong-claim ledger) and per-marker verdicts
+            # (sourced from the provenance verifier). Without this the
+            # table would only show titles + URLs, losing the
+            # verification verdicts the user explicitly asked for.
+            agent_notes=agent_notes,
         )
 
         # ``payload.workflow.actions`` and friends preserved for backward
@@ -2214,9 +2581,40 @@ class Orchestrator:
         clickable References section. Deduplicate by external_id (or title
         as a fallback) to avoid the same arXiv id showing up twice when
         multiple retrieval tools rediscovered it.
+
+        We preserve a ``source_url`` fallback in addition to the arXiv
+        external_id so the frontend can resolve external citations to a
+        clickable destination even when the upstream tool didn't surface
+        a parseable arXiv id (e.g. citation_finder hits that returned a
+        DOI or publisher page, frontier_scan results stored only
+        ``source_url``). Without this fallback the [A*] chips render
+        styled but functionally inert.
         """
         merged: list[dict] = []
         seen: set[str] = set()
+
+        def _derive_url(it: dict, ext: str) -> str:
+            """Resolve the most authoritative URL for the candidate."""
+            url = (it.get("source_url") or it.get("url") or it.get("pdf_url") or "").strip()
+            if url:
+                return url
+            ext = (ext or "").strip()
+            if not ext:
+                return ""
+            # ``external_id`` is occasionally a full URL when an upstream
+            # tool conflated id + URL (citation_finder hits, frontier_scan
+            # rows). Surface it directly rather than concatenating it onto
+            # an arxiv.org/abs prefix — without this guard the frontend
+            # would render ``https://arxiv.org/abs/https://...`` which
+            # 404s and looks broken to the user.
+            if ext.lower().startswith(("http://", "https://")):
+                return ext
+            # arXiv ids look like 1234.5678 or cs/0102003 — bare ids;
+            # DOIs (which contain "/") sneak in but resolve through
+            # doi.org/<doi>.
+            if "/" in ext and not ext.lower().startswith("arxiv:"):
+                return f"https://doi.org/{ext}"
+            return f"https://arxiv.org/abs/{ext}"
 
         def _take(items: list[dict] | None) -> None:
             if not items:
@@ -2234,12 +2632,18 @@ class Orchestrator:
                 if not key or key in seen:
                     continue
                 seen.add(key)
+                ext = it.get("external_id") or it.get("arxiv_id") or ""
+                src_url = _derive_url(it, ext)
                 # Normalise the minimal shape the frontend needs.
+                # ``source_url`` is the load-bearing fallback for
+                # citation clicks when ``external_id`` is empty (DOI
+                # hits, non-arXiv preprints, citation_finder results).
                 merged.append({
-                    "external_id": it.get("external_id") or it.get("arxiv_id") or "",
+                    "external_id": ext or "",
                     "title": it.get("title") or "",
                     "authors": it.get("authors") or [],
                     "abstract": it.get("abstract") or it.get("tldr") or "",
+                    "source_url": src_url,
                 })
 
         ai = results.get("arxiv_import")
@@ -2291,6 +2695,32 @@ class Orchestrator:
     def _genie_from_results(results: dict[str, ToolResult]) -> str | None:
         gs = results.get("genie_synthesize")
         return gs.output.get("genie_session_id") if gs else None
+
+    @staticmethod
+    def _genie_status_from_results(results: dict[str, ToolResult]) -> dict | None:
+        """Surface the genie_synthesize tool's status + capsule preview
+        so the synthesizer can talk about Genie honestly.
+
+        Returns ``None`` when Genie didn't run this turn. Otherwise a
+        dict the synthesizer's agent_notes block renders as a short
+        directive: ``done`` → cite the capsule normally; ``running`` /
+        ``queued`` / ``timeout`` → tell the user the idea is still being
+        synthesized and link to the Genie tab rather than describing it
+        as if it had completed; ``failed`` / ``done_empty`` → mention
+        the failure honestly so the user isn't misled.
+        """
+        gs = results.get("genie_synthesize")
+        if not gs:
+            return None
+        out = gs.output or {}
+        capsule = out.get("capsule") if isinstance(out.get("capsule"), dict) else None
+        return {
+            "session_id": str(out.get("genie_session_id") or "") or None,
+            "status": str(out.get("status") or "").lower() or "unknown",
+            "seed_count": int(out.get("seed_count") or 0),
+            "capsule_id": str(capsule.get("id") or "") or None if capsule else None,
+            "capsule_title": (capsule.get("title") or "")[:200] if capsule else None,
+        }
 
     @staticmethod
     def _web_results_from_results(results: dict[str, ToolResult]) -> list[dict]:
@@ -2509,6 +2939,79 @@ class Orchestrator:
             self._bus.publish(AssistantEvent(kind=kind, job_id=job_id, payload=payload))
         except Exception:
             log.exception("event bus publish failed kind=%s job=%s", kind, job_id)
+
+    async def _fake_stream_answer(
+        self,
+        job_id: str,
+        message_id: UUID | None,
+        answer: str,
+        *,
+        chunk_size: int = 24,
+        delay_s: float = 0.02,
+    ) -> None:
+        """Replay an already-finalised answer to the SSE channel as
+        ``message_delta`` events.
+
+        Used on deep-tier turns where the synthesizer ran without
+        ``on_delta`` so the post-synth pipeline (reflection / repair /
+        final_evaluator / output quality safeguard / low-grounding
+        notice) could fully audit and possibly revise the answer
+        before any byte reached the user. The user-facing contract
+        stays "tokens stream into the bubble", but the stream is
+        always the POST-AUDIT text — never the raw, possibly-broken
+        first-pass answer.
+
+        Cancellation:
+            ``asyncio.sleep`` is a cancellation point; if the user
+            clicks Stop while we are replaying, ``CancelledError``
+            propagates to the outer ``run_turn`` whose existing
+            ``except`` runs the standard cancel-cleanup. We do NOT
+            catch it here — that would leave the orchestrator
+            thinking the turn completed normally.
+
+        Failure mode:
+            ``self._publish`` swallows event-bus errors internally
+            (best-effort). ``asyncio.sleep`` itself doesn't fail.
+            So short of cancellation, this coroutine always runs to
+            completion. The caller's outer try/except is purely
+            defensive — for forward-compatibility with future
+            additions that might raise.
+
+        Args:
+            job_id: SSE channel key.
+            message_id: Assistant message the deltas attach to.
+                Cast to string before going on the wire to match the
+                shape the real-streaming ``_on_delta`` callback uses
+                and the frontend already parses.
+            answer: The finalised answer text. May be empty — the
+                early-return guard makes that a no-op (no deltas
+                emitted, no sleeps).
+            chunk_size: Characters per emitted delta. 24 ≈ 4-5 words,
+                which mirrors the perceived granularity of a real
+                provider stream without flooding the SSE bus with
+                single-character events.
+            delay_s: Sleep between chunks. 20ms ≈ 50 deltas/sec, so
+                a typical 3000-character answer streams in ~2.5s
+                — roughly what a fast model stream feels like. Long
+                answers stream proportionally longer, which is fine
+                because users read at the same pace either way.
+        """
+        if not answer:
+            return
+        mid_str = str(message_id) if message_id is not None else ""
+        # Iterate by fixed slice. Word-boundary slicing was considered
+        # but adds branching for no UX gain — the visual cadence is
+        # dominated by the sleep delay, not the chunk-cut points.
+        for i in range(0, len(answer), max(1, chunk_size)):
+            self._publish(job_id, "message_delta", {
+                "message_id": mid_str,
+                "delta": answer[i:i + chunk_size],
+            })
+            # ``asyncio.sleep`` yields control so a concurrent
+            # cancellation (the user clicked Stop) can propagate here
+            # as CancelledError — single-thread asyncio's cooperative
+            # cancellation channel.
+            await asyncio.sleep(delay_s)
 
     def _make_cancel_checker(self, job_id: str):
         async def check() -> bool:

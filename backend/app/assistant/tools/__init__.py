@@ -35,6 +35,7 @@ from app.assistant.tools import (
     nasa_ads,
     nvd_cve,
     oeis,
+    deep_paper_analysis,
     paper_import,
     paper_qa,
     papers_with_code,
@@ -83,6 +84,7 @@ register_tool(wikipedia.wikipedia_tool)
 register_tool(crossref.crossref_tool)
 register_tool(research_trends.research_trends_tool)
 register_tool(paper_qa.paper_qa_tool)
+register_tool(deep_paper_analysis.deep_paper_analysis_tool)
 register_tool(study_paper.study_paper_tool)
 register_tool(citation_finder.citation_finder_tool)
 register_tool(latex_parse.latex_parse_tool)

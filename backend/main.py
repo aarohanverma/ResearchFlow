@@ -567,6 +567,69 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as exc:
         log.warning("papers.is_manually_imported migration skipped: %s", exc)
 
+    # Create memory_revisions table (idempotent) — append-only audit
+    # trail backing the Settings → Memory inspect / restore UI.
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text("""
+                CREATE TABLE IF NOT EXISTS memory_revisions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    root_session_id UUID NOT NULL REFERENCES assistant_sessions(id) ON DELETE CASCADE,
+                    origin_session_id UUID,
+                    tier VARCHAR(20) NOT NULL,
+                    namespace_key VARCHAR(120) NOT NULL DEFAULT '',
+                    subject VARCHAR(60) NOT NULL DEFAULT '',
+                    topic VARCHAR(60) NOT NULL DEFAULT '',
+                    key VARCHAR(200) NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    previous_value TEXT,
+                    entry_type VARCHAR(40) NOT NULL DEFAULT 'context',
+                    source VARCHAR(40) NOT NULL DEFAULT 'manual',
+                    action VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'active',
+                    confidence DOUBLE PRECISION,
+                    ttl_days INTEGER,
+                    extras JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+            # Composite index for the most common query: list every
+            # revision for a (user, tier, namespace, key) tuple
+            # ordered by recency. This is the inspect endpoint's
+            # primary read path.
+            await conn.execute(_text("""
+                CREATE INDEX IF NOT EXISTS idx_memory_revisions_lookup
+                ON memory_revisions (user_id, tier, namespace_key, key, created_at DESC)
+            """))
+        log.info("memory_revisions table ensured")
+    except Exception as exc:
+        log.warning("memory_revisions migration skipped: %s", exc)
+
+    # Per-user memory injection pause (idempotent). Lets the user
+    # disable RA's auto-memory injection without deleting stored
+    # entries — they remain inspectable in Settings → Memory and the
+    # toggle can be flipped back on at any time. ``overrides`` is a
+    # JSONB map of per-namespace toggles that shadow the global
+    # default; empty by default.
+    try:
+        from app.db.session import engine
+        from sqlalchemy import text as _text
+        async with engine.begin() as conn:
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "memory_injection_enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            ))
+            await conn.execute(_text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "memory_injection_overrides JSONB NOT NULL DEFAULT '{}'::jsonb"
+            ))
+        log.info("users.memory_injection_enabled + overrides columns ensured")
+    except Exception as exc:
+        log.warning("memory_injection_enabled migration skipped: %s", exc)
+
     # Create paper_namespace_hides table (idempotent) — stores per-user, per-namespace hide state
     try:
         from app.db.session import engine

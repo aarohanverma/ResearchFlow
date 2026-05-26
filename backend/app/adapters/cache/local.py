@@ -62,6 +62,13 @@ class LocalFileCache(CacheBackend):
         Returns:
             The stored value, or ``None`` if the key does not exist or its
             TTL has elapsed.
+
+        Notes:
+            If the JSON payload is corrupted (truncated by a previous crash
+            mid-write, or a non-atomic concurrent overwrite from another
+            process), the corrupt file is deleted so the next ``set`` writes
+            cleanly. Without this self-heal a corrupted entry persists as a
+            permanent cache miss for the lifetime of the directory.
         """
         path = self._path(key)
         if not await asyncio.to_thread(path.exists):
@@ -73,6 +80,15 @@ class LocalFileCache(CacheBackend):
                 await self.delete(key)
                 return None
             return raw.get("value")
+        except (json.JSONDecodeError, ValueError):
+            # Corrupted entry — evict so the next write is clean. Swallow
+            # any unlink error since the only goal here is "don't return a
+            # bad value"; we already return None on the line below.
+            try:
+                await asyncio.to_thread(path.unlink, missing_ok=True)
+            except Exception:
+                pass
+            return None
         except Exception:
             return None
 
@@ -83,14 +99,42 @@ class LocalFileCache(CacheBackend):
             key: Cache key string.
             value: JSON-serialisable value to store.
             ttl_seconds: Seconds until expiry. ``None`` means no expiry.
+
+        Atomicity:
+            Writes go to ``<path>.<pid>.tmp`` first, then ``os.replace`` it
+            onto the final path. ``os.replace`` is atomic on POSIX +
+            modern Windows, so a concurrent reader either sees the old file
+            or the fully-written new file — never a truncated tail. A
+            process killed mid-write leaves the ``.tmp`` sibling behind
+            (cleaned up on next write attempt for the same key) but the
+            cache entry stays consistent.
         """
         path = self._path(key)
         payload = {
             "value": value,
             "expires": time.time() + ttl_seconds if ttl_seconds else None,
         }
-        async with aiofiles.open(path, "w") as f:
-            await f.write(json.dumps(payload, default=str))
+        # PID + monotonic-ns suffix so two concurrent writers on the SAME
+        # key (different coroutines / processes) never collide on the
+        # temp filename. The last replace() to land wins, which is the
+        # right semantics for a cache.
+        tmp_path = path.with_suffix(
+            f"{path.suffix}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        )
+        try:
+            async with aiofiles.open(tmp_path, "w") as f:
+                await f.write(json.dumps(payload, default=str))
+            await asyncio.to_thread(os.replace, str(tmp_path), str(path))
+        except Exception:
+            # Best-effort cleanup of the temp file on failure so the cache
+            # directory doesn't accumulate .tmp leftovers.
+            try:
+                await asyncio.to_thread(
+                    lambda: tmp_path.unlink(missing_ok=True),
+                )
+            except Exception:
+                pass
+            raise
 
     async def delete(self, key: str) -> None:
         """Delete the cache file for the given key, if it exists.

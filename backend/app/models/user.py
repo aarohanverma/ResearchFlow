@@ -99,6 +99,21 @@ class User(Base):
     notify_digest: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_breakthrough: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # User-controlled pause for RA's long-term memory injection. When
+    # FALSE, the orchestrator skips the namespace + session-tree
+    # memory blocks in planner / synthesizer prompts. Stored memory
+    # is preserved either way — the toggle is a "pause, don't delete"
+    # knob.
+    memory_injection_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Per-namespace overrides on top of the global toggle above. The
+    # JSONB shape is ``{ "<namespace_key>": bool }``; a key present
+    # here shadows the global default for that namespace. Empty by
+    # default — most users only ever interact with the global toggle.
+    # Using a JSONB map (rather than a separate table) keeps reads
+    # cheap (single column on the user row already loaded for auth)
+    # and writes append-only without joins.
+    memory_injection_overrides: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

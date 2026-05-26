@@ -329,13 +329,31 @@ class RedisJobStore(JobStore):
             log.debug("RedisJobStore.delete failed: %s", exc)
 
     async def clear_all(self) -> None:
+        """Remove every job record under both the per-job and user-index prefixes.
+
+        Uses ``SCAN`` with batched ``DEL`` instead of ``KEYS *``. ``KEYS`` is
+        O(N) and blocks Redis for the duration of the scan — in production
+        with a large keyspace (other namespaces' keys live in the same
+        instance) a dev-reset call could stall every concurrent request
+        sharing the Redis server. SCAN streams keys in bounded batches and
+        never holds the server for a full pass.
+
+        Idempotent; safe against transient Redis errors (logs and returns).
+        """
         client = await self._get_client()
         if client is None:
             return
         try:
-            keys = await client.keys(f"{self._KEY_PREFIX}:*")
-            if keys:
-                await client.delete(*keys)
+            batch: list[str] = []
+            for prefix in (self._KEY_PREFIX, self._USER_INDEX_PREFIX):
+                pattern = f"{prefix}:*"
+                async for k in client.scan_iter(match=pattern, count=200):
+                    batch.append(k)
+                    if len(batch) >= 200:
+                        await client.delete(*batch)
+                        batch.clear()
+            if batch:
+                await client.delete(*batch)
         except Exception as exc:  # noqa: BLE001
             log.debug("RedisJobStore.clear_all failed: %s", exc)
 

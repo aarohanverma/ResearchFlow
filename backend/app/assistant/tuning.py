@@ -123,6 +123,15 @@ REACT_DEFAULT_DEADLINE_SECONDS = _env_float("RA_REACT_DEFAULT_DEADLINE_SECONDS",
 REACT_MIN_ITERS_BEFORE_FREE_FINALIZE = _env_int("RA_REACT_MIN_ITERS_BEFORE_FREE_FINALIZE", 3)
 REACT_SAME_TOOL_FAILURE_CAP = _env_int("RA_REACT_SAME_TOOL_FAILURE_CAP", 2)
 REACT_MAX_FANOUT_BRANCHES = _env_int("RA_REACT_MAX_FANOUT_BRANCHES", 4)
+# Per-tool TOTAL invocation cap per turn (successes + failures). The
+# existing failure-only cap (``REACT_SAME_TOOL_FAILURE_CAP``) bans a
+# repeatedly-broken tool; this cap prevents a planner that is stuck
+# in a successful-but-redundant loop (e.g. eight calls to deep_search
+# with slightly different queries) from chewing budget. Mirrors the
+# LangChain ``ToolCallLimitMiddleware`` ``run_limit``; tunable per
+# deployment via env. Set conservatively — a healthy turn rarely
+# calls the same tool more than 3–4 times.
+REACT_PER_TOOL_INVOCATION_CAP = _env_int("RA_REACT_PER_TOOL_INVOCATION_CAP", 5)
 
 
 # ── External services ────────────────────────────────────────────────────────
@@ -153,4 +162,5 @@ class TuningSnapshot:
     react_min_iters_before_free_finalize: int = REACT_MIN_ITERS_BEFORE_FREE_FINALIZE
     react_same_tool_failure_cap: int = REACT_SAME_TOOL_FAILURE_CAP
     react_max_fanout_branches: int = REACT_MAX_FANOUT_BRANCHES
+    react_per_tool_invocation_cap: int = REACT_PER_TOOL_INVOCATION_CAP
     mcp_search_timeout_seconds: float = MCP_SEARCH_TIMEOUT_SECONDS

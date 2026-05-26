@@ -119,6 +119,56 @@ class InvestigationPlan:
                 return t
         return None
 
+    def fuzzy_resolve(self, ref: str, *, text: str = "") -> Todo | None:
+        """Try harder to find the todo the model is referring to.
+
+        The model regularly invents ids like ``"t1"`` / ``"todo_1"`` /
+        ``"1"`` that don't match the slugs we actually generated, OR
+        emits ``id=""`` with a populated ``text``. This helper tries
+        several lookups so the loop doesn't surface "unknown id" noise
+        on what is, in practice, a legible reference:
+
+        1. Exact id match (the normal happy path).
+        2. ``ref`` parses as an int → match the Nth open todo, 1-indexed.
+        3. ``ref`` matches ``t<N>`` or ``todo_<N>`` → same as (2).
+        4. ``text`` is non-empty AND exactly matches an existing
+           todo's ``text`` → return that todo.
+        5. ``text`` is a substring of exactly one existing todo →
+           return that todo (last-resort fuzzy match).
+
+        Returns ``None`` only when nothing plausible matches.
+        """
+        ref = (ref or "").strip().lower()
+        # 1) exact
+        if ref:
+            t = self.by_id(ref)
+            if t is not None:
+                return t
+        # 2/3) positional (open todos only — completed are stable)
+        idx: int | None = None
+        if ref.isdigit():
+            idx = int(ref)
+        else:
+            import re as _re
+            m = _re.match(r"^(?:t|todo_?)(\d+)$", ref)
+            if m:
+                idx = int(m.group(1))
+        if idx is not None and idx >= 1:
+            open_t = self.open_todos()
+            if idx <= len(open_t):
+                return open_t[idx - 1]
+        # 4) exact text match
+        clean_text = (text or "").strip()
+        if clean_text:
+            for t in self.todos:
+                if t.text.strip() == clean_text:
+                    return t
+            # 5) substring fallback — only when unique
+            cands = [t for t in self.todos if clean_text in t.text or t.text in clean_text]
+            if len(cands) == 1:
+                return cands[0]
+        return None
+
     def stuck_in_progress(self, *, current_iteration: int, slack: int = 2) -> list[Todo]:
         """Todos that have been ``in_progress`` for more iterations
         than ``slack`` allows. The synthesizer surfaces these as
@@ -226,6 +276,15 @@ class InvestigationPlan:
         if not text:
             return "skipped add: empty text"
         text = text[:_MAX_TODO_TEXT]
+        # Dedupe: a model that repeats the same ``add`` op across
+        # iterations was producing duplicate rows that cluttered the
+        # plan block. If an EXISTING todo (any status) has the same
+        # text, treat the new add as a no-op and surface a friendlier
+        # note so the model can self-correct without a "duplicate
+        # added" warning.
+        for existing in self.todos:
+            if existing.text.strip() == text:
+                return f"add: duplicate of existing {existing.id} — no-op"
         todo_id = self._next_slug()
         status: TodoStatus = str(op.get("status") or "pending")  # type: ignore[assignment]
         if status not in {"pending", "in_progress", "completed", "cancelled"}:
@@ -238,9 +297,16 @@ class InvestigationPlan:
 
     def _op_update(self, op: dict[str, Any], *, iteration: int) -> str:
         todo_id = str(op.get("id") or "").strip()
-        target = self.by_id(todo_id)
+        text_hint = str(op.get("text") or "").strip()
+        # Empty id + no text hint is unrecoverable — emit a short
+        # note that doesn't leak the bare empty-string repr. Empty
+        # id + text hint OR fuzzy-matchable id falls through to
+        # ``fuzzy_resolve``.
+        if not todo_id and not text_hint:
+            return "skipped update: no id or text provided"
+        target = self.fuzzy_resolve(todo_id, text=text_hint)
         if not target:
-            return f"update: unknown id {todo_id!r}"
+            return f"update: no todo matched id={todo_id!r}"
         if op.get("text"):
             target.text = str(op["text"])[:_MAX_TODO_TEXT]
         new_status = op.get("status")
@@ -260,9 +326,12 @@ class InvestigationPlan:
 
     def _op_complete(self, op: dict[str, Any], *, iteration: int) -> str:
         todo_id = str(op.get("id") or "").strip()
-        target = self.by_id(todo_id)
+        text_hint = str(op.get("text") or "").strip()
+        if not todo_id and not text_hint:
+            return "skipped complete: no id or text provided"
+        target = self.fuzzy_resolve(todo_id, text=text_hint)
         if not target:
-            return f"complete: unknown id {todo_id!r}"
+            return f"complete: no todo matched id={todo_id!r}"
         target.status = "completed"
         target.iteration = iteration
         ev = op.get("evidence")
@@ -277,9 +346,12 @@ class InvestigationPlan:
 
     def _op_cancel(self, op: dict[str, Any], *, iteration: int) -> str:
         todo_id = str(op.get("id") or "").strip()
-        target = self.by_id(todo_id)
+        text_hint = str(op.get("text") or "").strip()
+        if not todo_id and not text_hint:
+            return "skipped cancel: no id or text provided"
+        target = self.fuzzy_resolve(todo_id, text=text_hint)
         if not target:
-            return f"cancel: unknown id {todo_id!r}"
+            return f"cancel: no todo matched id={todo_id!r}"
         target.status = "cancelled"
         target.iteration = iteration
         return f"cancelled {todo_id}"

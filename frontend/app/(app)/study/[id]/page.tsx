@@ -32,6 +32,7 @@ import type { StudySection, Paper, GeneratedArtifact, GenerationType, Generation
 import { useAuthStore } from "@/store/auth";
 import { api, openSSE } from "@/lib/api";
 import { useJobsStore } from "@/store/jobs";
+import { AskOnSelectionPopover } from "@/components/ui/AskOnSelectionPopover";
 
 // ── Shiki singleton ───────────────────────────────────────────────────────────
 
@@ -599,39 +600,53 @@ function PaperHero({ paper }: { paper: Paper }) {
         )}
       </div>
 
-      {/* Key concepts + external link */}
-      <div className="flex items-center gap-2 flex-wrap">
-        {paper.key_concepts.slice(0, 6).map((c) => (
-          <span
-            key={c}
-            className="px-2.5 py-1 rounded-lg bg-gray-800/50 border border-gray-700/40 text-gray-500 text-[11px]"
-          >
-            {c}
-          </span>
-        ))}
-        {paper.source_url && (
-          <a
-            href={paper.source_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="ml-auto flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gray-800/60 border border-gray-700/50 text-gray-300 hover:text-white hover:border-indigo-600/50 hover:bg-indigo-950/30 transition-all text-xs font-semibold"
-          >
-            <ExternalLinkIcon size={11} />
-            View Paper
-          </a>
-        )}
-        {paper.pdf_url && (
-          <a
-            href={paper.pdf_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-red-950/30 border border-red-800/40 text-red-400 hover:text-red-300 hover:border-red-700/60 transition-all text-xs font-semibold"
-          >
-            <ExternalLinkIcon size={11} />
-            PDF
-          </a>
-        )}
-      </div>
+      {/* Key concepts — wrap freely on their own row. */}
+      {paper.key_concepts.length > 0 && (
+        <div className="flex items-center gap-2 flex-wrap">
+          {paper.key_concepts.slice(0, 6).map((c) => (
+            <span
+              key={c}
+              className="px-2.5 py-1 rounded-lg bg-gray-800/50 border border-gray-700/40 text-gray-500 text-[11px]"
+            >
+              {c}
+            </span>
+          ))}
+        </div>
+      )}
+      {/* External links pinned to their OWN row, fixed-position. The
+          earlier layout shared a row with the concept chips and a
+          long chip list pushed the View-Paper / PDF buttons onto the
+          next line, making them look detached. Splitting onto a
+          dedicated row guarantees they always land directly under
+          the chips at a predictable position. ``mt-4`` and ``gap-3``
+          add the vertical and horizontal breathing room the user
+          asked for so the two CTAs don't read as crammed together. */}
+      {(paper.source_url || paper.pdf_url) && (
+        <div className="mt-4 flex items-center gap-3 flex-wrap">
+          {paper.source_url && (
+            <a
+              href={paper.source_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gray-800/60 border border-gray-700/50 text-gray-300 hover:text-white hover:border-indigo-600/50 hover:bg-indigo-950/30 transition-all text-xs font-semibold flex-shrink-0"
+            >
+              <ExternalLinkIcon size={11} />
+              View Paper
+            </a>
+          )}
+          {paper.pdf_url && (
+            <a
+              href={paper.pdf_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-red-950/30 border border-red-800/40 text-red-400 hover:text-red-300 hover:border-red-700/60 transition-all text-xs font-semibold flex-shrink-0"
+            >
+              <ExternalLinkIcon size={11} />
+              PDF
+            </a>
+          )}
+        </div>
+      )}
     </motion.div>
   );
 }
@@ -1187,9 +1202,59 @@ function StudyChatPanel({
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // Selection-driven quote captured by AskOnSelectionPopover when
+  // the user highlights text inside an assistant reply in this panel.
+  // Uses ``scope="study"`` so the popover only fires for selections
+  // inside THIS chat — not in the underlying study guide body or any
+  // other quotable surface on the page.
+  const [quotedSelection, setQuotedSelection] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Resizable panel width — persists across sessions. Defaults to
+  // 420px (the prior hard-coded width) so behaviour is unchanged for
+  // users who never resize; min/max guard against unusable sizes.
+  const [panelW, setPanelW] = useState<number>(() => {
+    if (typeof window === "undefined") return 420;
+    try {
+      const saved = parseInt(localStorage.getItem("rf_study_chat_w") || "", 10);
+      if (Number.isFinite(saved) && saved >= 320 && saved <= 1100) return saved;
+    } catch {}
+    return 420;
+  });
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelW;
+    const onMove = (ev: MouseEvent) => {
+      const dx = startX - ev.clientX;
+      const w = Math.min(1100, Math.max(320, startW + dx));
+      setPanelW(w);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      try { localStorage.setItem("rf_study_chat_w", String(panelW)); } catch {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  useEffect(() => {
+    try { localStorage.setItem("rf_study_chat_w", String(panelW)); } catch {}
+  }, [panelW]);
+  // Publish the live panel width as a CSS variable so the main study
+  // column can subtract the exact width from its right edge. Without
+  // this, the column used ``mr-[420px]`` that drifted out of sync
+  // the moment the user resized the panel — visible as overlap or
+  // gap depending on direction.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.documentElement.style.setProperty("--rf-study-chat-w", `${panelW}px`);
+    return () => {
+      document.documentElement.style.removeProperty("--rf-study-chat-w");
+    };
+  }, [panelW]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1200,9 +1265,16 @@ function StudyChatPanel({
   useEffect(() => () => abortRef.current?.abort(), []);
 
   async function sendMessage() {
-    const text = input.trim();
+    let text = input.trim();
     if (!text || busy) return;
+    // Prepend any quoted selection as a markdown blockquote so the
+    // chat endpoint sees the explicit reference the user pointed at.
+    if (quotedSelection && quotedSelection.trim()) {
+      const q = quotedSelection.trim();
+      text = q.split("\n").map((l) => `> ${l}`).join("\n") + "\n\n" + text;
+    }
     setInput("");
+    setQuotedSelection(null);
     setBusy(true);
 
     const history = messages
@@ -1289,8 +1361,14 @@ function StudyChatPanel({
       animate={{ x: 0, opacity: 1 }}
       exit={{ x: "100%", opacity: 0 }}
       transition={{ type: "spring", damping: 30, stiffness: 340 }}
-      className="fixed right-0 top-0 bottom-0 w-[420px] bg-gray-950 border-l border-gray-800/70 flex flex-col z-40 shadow-2xl shadow-black/60"
+      className="fixed right-0 top-0 bottom-0 bg-gray-950 border-l border-gray-800/70 flex flex-col z-40 shadow-2xl shadow-black/60"
+      style={{ width: `${panelW}px` }}
     >
+      <div
+        onMouseDown={startResize}
+        className="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize hover:bg-indigo-500/30 transition-colors z-20"
+        title="Drag to resize"
+      />
       <div className="flex items-center justify-between px-4 py-3.5 border-b border-gray-800/60 bg-gray-950/95 backdrop-blur-sm">
         <div className="flex items-center gap-2.5">
           <div className="w-7 h-7 rounded-lg bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center">
@@ -1340,7 +1418,13 @@ function StudyChatPanel({
               {msg.role === "user" ? (
                 <span className="whitespace-pre-wrap">{msg.content}</span>
               ) : (
-                <MarkdownRenderer content={msg.content} />
+                // ``data-rf-quotable="study"`` scopes selections to
+                // this chat — the popover below filters by the same
+                // scope so it never fires for selections inside the
+                // study guide body or other chat surfaces.
+                <div data-rf-quotable="study">
+                  <MarkdownRenderer content={msg.content} />
+                </div>
               )}
               {msg.streaming && (
                 <span className="inline-block w-1.5 h-4 bg-indigo-400 rounded-sm animate-pulse ml-0.5 align-middle" />
@@ -1352,6 +1436,29 @@ function StudyChatPanel({
       </div>
 
       <div className="p-3 border-t border-gray-800/60">
+        {quotedSelection && quotedSelection.trim() && (
+          <div
+            className="flex items-start gap-2 mb-2 px-2.5 py-1.5 rounded-lg bg-indigo-950/30 border border-indigo-700/30 text-[11px] text-gray-300 italic"
+            title="This selection will be quoted at the top of your next message"
+          >
+            <span className="text-indigo-300 font-bold flex-shrink-0">“</span>
+            <div
+              className="flex-1 min-w-0 whitespace-pre-wrap leading-relaxed"
+              style={{ maxHeight: 80, overflowY: "auto" }}
+            >
+              {quotedSelection.length > 320
+                ? quotedSelection.slice(0, 320) + "…"
+                : quotedSelection}
+            </div>
+            <button
+              onClick={() => setQuotedSelection(null)}
+              className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+              title="Remove quote"
+            >
+              <XIcon size={11} />
+            </button>
+          </div>
+        )}
         <div className="flex gap-2 items-center bg-gray-900 border border-gray-800 rounded-xl px-3 py-2.5 focus-within:border-indigo-500/50 transition-colors">
           <input
             ref={inputRef}
@@ -1380,6 +1487,14 @@ function StudyChatPanel({
           </button>
         </div>
       </div>
+      <AskOnSelectionPopover
+        label="Ask about this paper"
+        scope="study"
+        onAsk={(text) => {
+          setQuotedSelection(text);
+          inputRef.current?.focus();
+        }}
+      />
     </motion.div>
   );
 }
@@ -1915,10 +2030,14 @@ function StudyContent() {
       <div
         ref={scrollRef}
         onScroll={onScroll}
-        className={`flex-1 overflow-y-auto transition-all duration-300 ${
-          showChat ? "mr-[420px]" : ""
-        }`}
-        style={{ background: "var(--rf-bg)" }}
+        className="flex-1 overflow-y-auto transition-all duration-300"
+        style={{
+          background: "var(--rf-bg)",
+          // ``--rf-study-chat-w`` is set by StudyChatPanel via the
+          // documentElement so the margin always tracks the live
+          // panel width. Falls back to 0 when the chat is closed.
+          marginRight: showChat ? "var(--rf-study-chat-w, 420px)" : 0,
+        }}
       >
         {/* Reading progress bar */}
         <div className="sticky top-0 left-0 right-0 h-0.5 bg-gray-800/40 z-20">

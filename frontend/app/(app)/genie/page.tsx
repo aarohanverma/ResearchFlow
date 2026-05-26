@@ -23,6 +23,8 @@ import {
   SendIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   BrainIcon,
   BeakerIcon,
   AlertTriangleIcon,
@@ -35,6 +37,8 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import { useResizableWidth, RESIZE_HANDLE_STYLE } from "@/hooks/use-resizable-width";
+import { AskOnSelectionPopover } from "@/components/ui/AskOnSelectionPopover";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -220,7 +224,13 @@ export default function GeniePage() {
   // discriminate the other origins for users who want to triage by
   // how the idea was produced. Client-side filter so the SWR cache
   // and the namespace filter stay untouched.
-  type SourceFilter = "all" | "ra_assistant" | "manual" | "auto" | "combined";
+  // Source filter chips on the Ideas tab. ``query`` is the synthesis
+  // path where the user typed a free-form prompt in the Cauldron;
+  // ``ra_assistant`` is the path where the Research Assistant's
+  // ReAct loop produced the capsule itself. The two are distinct
+  // signals — the user explicitly asked for both to be exposed as
+  // separate filters so they can audit which ideas came from where.
+  type SourceFilter = "all" | "ra_assistant" | "query" | "manual" | "auto" | "combined";
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const toggleCombineSelect = useCallback((capsuleId: string) => {
     setCombineSelected(prev => {
@@ -295,6 +305,36 @@ export default function GeniePage() {
   // mismatches (which can crash the page during HMR).
   const [thresholds, setThresholds] = useState<typeof DEFAULT_THRESHOLDS>(DEFAULT_THRESHOLDS);
   const [showConstraints, setShowConstraints] = useState(false);
+  // Drag-resizable source-panel width — persisted across reloads.
+  // 240 default keeps the existing layout intact for first-time
+  // users; the bounds keep the source list readable without
+  // collapsing or eating the centre.
+  const {
+    width: sourceW,
+    onResizeStart: onSourceResizeStart,
+    reset: resetSourceWidth,
+  } = useResizableWidth({
+    storageKey: "rf-genie-source-w",
+    defaultWidth: 256,  // matches the legacy w-64
+    minWidth: 220,
+    maxWidth: 480,
+    anchor: "left",
+  });
+  // Collapse toggle — separate from resize so the user can park
+  // the source panel as a thin strip without losing their custom
+  // width. Persisted independently.
+  const [sourceCollapsed, setSourceCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try { return localStorage.getItem("rf-genie-source-collapsed") === "1"; }
+    catch { return false; }
+  });
+  const toggleSourceCollapsed = useCallback(() => {
+    setSourceCollapsed(prev => {
+      const next = !prev;
+      try { localStorage.setItem("rf-genie-source-collapsed", next ? "1" : "0"); } catch {}
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     try {
@@ -751,13 +791,58 @@ export default function GeniePage() {
       </AnimatePresence>
 
       {/* ── Left: Source panel ─────────────────────────────────────────── */}
-      <aside className="w-64 shrink-0 border-r border-white/5 flex flex-col">
+      {sourceCollapsed ? (
+        // Collapsed strip — narrow rail with an expand button and a
+        // quick "mode" indicator dot so the user can still tell which
+        // source mode is active without expanding. Click anywhere on
+        // the strip to expand.
+        <aside
+          className="shrink-0 border-r border-white/5 flex flex-col items-center pt-3 gap-2 bg-gray-950/50"
+          style={{ width: 32 }}
+        >
+          <button
+            onClick={toggleSourceCollapsed}
+            title="Expand Genie source panel"
+            aria-label="Expand Genie source panel"
+            className="text-gray-500 hover:text-gray-200 p-1 rounded transition-colors"
+          >
+            <ChevronRightIcon size={14} />
+          </button>
+          <div
+            className="w-6 h-6 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center"
+            title="Genie"
+          >
+            <FlaskConicalIcon size={11} className="text-white" />
+          </div>
+        </aside>
+      ) : (
+      <aside
+        className="shrink-0 border-r border-white/5 flex flex-col relative"
+        style={{ width: sourceW }}
+      >
+        {/* Drag-resize handle pinned to the panel's RIGHT edge. The
+            invisible strip widens the hit area without adding visible
+            chrome; double-click resets to the default width. */}
+        <div
+          onMouseDown={onSourceResizeStart}
+          onDoubleClick={resetSourceWidth}
+          title="Drag to resize · double-click to reset"
+          style={{ ...RESIZE_HANDLE_STYLE, right: -3 }}
+        />
         <div className="p-4 border-b border-white/5">
           <div className="flex items-center gap-2 mb-3">
             <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center">
               <FlaskConicalIcon size={13} className="text-white" />
             </div>
-            <span className="text-sm font-bold text-white">Genie</span>
+            <span className="text-sm font-bold text-white flex-1">Genie</span>
+            <button
+              onClick={toggleSourceCollapsed}
+              title="Collapse Genie source panel"
+              aria-label="Collapse Genie source panel"
+              className="text-gray-600 hover:text-gray-300 p-0.5 rounded transition-colors"
+            >
+              <ChevronLeftIcon size={12} />
+            </button>
           </div>
 
           <div className="flex bg-gray-900 rounded-xl p-0.5 gap-0.5">
@@ -1224,6 +1309,7 @@ export default function GeniePage() {
           </AnimatePresence>
         </div>
       </aside>
+      )}
 
       {/* ── Center ─────────────────────────────────────────────────────── */}
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -1389,8 +1475,10 @@ export default function GeniePage() {
                   {([
                     { key: "all" as SourceFilter, label: "All sources",
                       count: capsules.length },
-                    { key: "ra_assistant" as SourceFilter, label: "From Assistant",
+                    { key: "ra_assistant" as SourceFilter, label: "RA generated",
                       count: capsules.filter(c => c.source_mode === "ra_assistant").length },
+                    { key: "query" as SourceFilter, label: "Query",
+                      count: capsules.filter(c => c.source_mode === "query").length },
                     { key: "manual" as SourceFilter, label: "Manual",
                       count: capsules.filter(c => c.source_mode === "manual").length },
                     { key: "auto" as SourceFilter, label: "Auto",
@@ -1410,7 +1498,9 @@ export default function GeniePage() {
                             : "bg-gray-900/40 text-gray-400 border-white/8 hover:text-gray-200 hover:border-white/20")
                         }
                         title={opt.key === "ra_assistant"
-                          ? "Show only ideas synthesised by the Research Assistant"
+                          ? "Show only ideas synthesised by the Research Assistant's ReAct loop"
+                          : opt.key === "query"
+                          ? "Show only ideas synthesised from a free-form prompt in the Cauldron"
                           : `Filter by ${opt.label}`}
                       >
                         {opt.label}
@@ -1506,6 +1596,7 @@ export default function GeniePage() {
                   const sourceFiltered = capsules.filter((c) => {
                     if (sourceFilter === "all") return true;
                     if (sourceFilter === "ra_assistant") return c.source_mode === "ra_assistant";
+                    if (sourceFilter === "query") return c.source_mode === "query";
                     if (sourceFilter === "auto") return c.source_mode === "auto" || c.is_scout_generated;
                     return c.source_mode === sourceFilter;
                   });
@@ -2194,9 +2285,20 @@ function CapsulePreview({
   );
 }
 
-/** Extract the first sentence (or first ~28 words) of a markdown blob —
- * used for one-line previews on capsule cards. Strips simple markdown
- * markers so the preview reads naturally.
+/** Return a crisp preview blurb — the first complete sentence,
+ * capped at ~26 words so a long opening doesn't dominate the card.
+ *
+ * Two competing constraints from the user spec:
+ *   1. "Make it very crisp and concise" — the card is a peek, not
+ *      a summary. The full sections live on the dedicated idea page.
+ *   2. "Do not show incomplete or truncated info" — cutting after
+ *      half a sentence looks like a stub.
+ *
+ * Resolution: end on a sentence boundary whenever one falls inside
+ * the cap; fall back to a word-bounded cut with an ellipsis only
+ * when no sentence terminator appears. ``line-clamp-2`` on
+ * ``CapsulePreview`` is the visual safety net for the rare case the
+ * first sentence is still longer than two rendered lines.
  */
 function firstSentenceOf(blob: string): string {
   if (!blob) return "";
@@ -2207,11 +2309,18 @@ function firstSentenceOf(blob: string): string {
     .replace(/\s+/g, " ")
     .trim();
   if (!cleaned) return "";
-  const m = cleaned.match(/^(.+?[.!?])(\s|$)/);
-  if (m && m[1].length >= 24) return m[1];
+  const WORD_CAP = 26;
+  // Prefer ending on a sentence terminator within the cap.
+  const sentenceEnd = cleaned.search(/[.!?](?:\s|$)/);
+  if (sentenceEnd !== -1) {
+    const firstSentence = cleaned.slice(0, sentenceEnd + 1).trim();
+    if (firstSentence.split(" ").length <= WORD_CAP) {
+      return firstSentence;
+    }
+  }
   const words = cleaned.split(" ");
-  if (words.length <= 28) return cleaned;
-  return words.slice(0, 28).join(" ") + "…";
+  if (words.length <= WORD_CAP) return cleaned;
+  return words.slice(0, WORD_CAP).join(" ") + "…";
 }
 
 // ── Capsule chat overlay ───────────────────────────────────────────────────────
@@ -2228,6 +2337,11 @@ function CapsuleChatOverlay({
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  // Selection-driven quote that prepends to the next outgoing
+  // message as a markdown blockquote so the RAG endpoint sees the
+  // explicit reference.
+  const [quotedSelection, setQuotedSelection] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -2237,8 +2351,13 @@ function CapsuleChatOverlay({
 
   async function sendMessage() {
     if (!input.trim() || streaming) return;
-    const userMsg = input.trim();
+    let userMsg = input.trim();
+    if (quotedSelection && quotedSelection.trim()) {
+      const q = quotedSelection.trim();
+      userMsg = q.split("\n").map(l => `> ${l}`).join("\n") + "\n\n" + userMsg;
+    }
     setInput("");
+    setQuotedSelection(null);
     setMessages((m) => [...m, { role: "user", content: userMsg }]);
     setStreaming(true);
 
@@ -2328,7 +2447,10 @@ function CapsuleChatOverlay({
                 msg.role === "user" ? "bg-indigo-600 text-white" : "bg-gray-800/60 text-gray-200"
               }`}>
                 {msg.role === "assistant"
-                  ? <MarkdownRenderer content={msg.content || (streaming ? "▍" : "")} />
+                  // ``data-rf-quotable`` marks this subtree so the
+                  // ``AskOnSelectionPopover`` mounted below only fires
+                  // for selections inside the assistant's reply.
+                  ? <div data-rf-quotable="idea"><MarkdownRenderer content={msg.content || (streaming ? "▍" : "")} /></div>
                   : msg.content}
               </div>
             </div>
@@ -2337,8 +2459,27 @@ function CapsuleChatOverlay({
         </div>
 
         <div className="p-4 border-t border-white/5 shrink-0">
+          {quotedSelection && quotedSelection.trim() && (
+            <div
+              className="flex items-start gap-2 mb-2 px-2.5 py-1.5 rounded-lg bg-indigo-950/30 border border-indigo-700/30 text-[11px] text-gray-300 italic"
+              title="This selection will be quoted in your next message"
+            >
+              <span className="text-indigo-300 font-bold flex-shrink-0">“</span>
+              <div className="flex-1 min-w-0 whitespace-pre-wrap leading-relaxed" style={{ maxHeight: 80, overflowY: "auto" }}>
+                {quotedSelection.length > 320 ? quotedSelection.slice(0, 320) + "…" : quotedSelection}
+              </div>
+              <button
+                onClick={() => setQuotedSelection(null)}
+                className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+                title="Remove quote"
+              >
+                <XIcon size={11} />
+              </button>
+            </div>
+          )}
           <div className="flex items-center gap-2 bg-gray-800/60 border border-white/5 rounded-xl px-3.5 py-2.5">
             <input
+              ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
@@ -2351,6 +2492,14 @@ function CapsuleChatOverlay({
           </div>
         </div>
       </motion.div>
+      <AskOnSelectionPopover
+        label="Ask about this idea"
+        scope="idea"
+        onAsk={(text) => {
+          setQuotedSelection(text);
+          inputRef.current?.focus();
+        }}
+      />
     </motion.div>
   );
 }

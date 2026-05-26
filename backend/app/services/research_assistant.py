@@ -282,13 +282,38 @@ async def replay_turn(
         else:
             if target_role != "assistant":
                 raise ValueError("Only assistant messages can be regenerated")
-            # Find the most recent user message strictly before the assistant.
+            # Find the most recent user message that comes BEFORE the
+            # target assistant message in message order. We can't rely
+            # on ``created_at < target.created_at`` alone — when the
+            # user message and its paired assistant reply are inserted
+            # in the same transaction they often share a timestamp at
+            # millisecond resolution, so a strict ``<`` comparison
+            # would skip the user message that's literally one row
+            # above the target.
+            #
+            # We use ``session.messages`` AS GIVEN by the relationship.
+            # SQLAlchemy loads it ``order_by=created_at`` and the DB
+            # returns tied rows in physical-storage order — which is
+            # insert order for tables without random clustering. So the
+            # user message always precedes its paired assistant reply
+            # in the loaded list, even when timestamps tie. Resorting
+            # by (created_at, uuid) would FLIP this order for tied
+            # timestamps because UUIDs are random, hence the as-given
+            # walk.
+            ordered = list(session.messages or [])
+            try:
+                target_idx = next(
+                    i for i, m in enumerate(ordered) if m.id == target.id
+                )
+            except StopIteration:
+                raise ValueError("message not found in session")
             prior_user = None
-            for m in (session.messages or []):
+            for j in range(target_idx - 1, -1, -1):
+                m = ordered[j]
                 m_role = m.role.value if hasattr(m.role, "value") else str(m.role)
-                if m_role == "user" and m.created_at < target.created_at:
-                    if prior_user is None or m.created_at > prior_user.created_at:
-                        prior_user = m
+                if m_role == "user":
+                    prior_user = m
+                    break
             if prior_user is None:
                 raise ValueError("No preceding user message to regenerate from")
             content = prior_user.content or ""

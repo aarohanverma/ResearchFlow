@@ -273,11 +273,34 @@ def queue_generation_job(
             await runner(job_id)
         except asyncio.CancelledError:
             log.info("generation task cancelled artifact=%s", artifact_id_str)
+            raise
         finally:
             _ACTIVE_TASKS.pop(artifact_id_str, None)
 
     task = asyncio.create_task(_bootstrap(), name=f"gen:{generation_type}:{artifact_id}")
     _ACTIVE_TASKS[artifact_id_str] = task
+
+    def _on_gen_done(t: "asyncio.Task[None]") -> None:
+        # The inner ``_bootstrap`` finally already drops the registry
+        # entry, but if the task was cancelled before _bootstrap even
+        # started running (rare but possible at shutdown) the entry
+        # would otherwise leak. Belt-and-braces removal here is cheap.
+        _ACTIVE_TASKS.pop(artifact_id_str, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            # Without this, an exception that escapes _bootstrap
+            # (rare — runner usually has its own error handling)
+            # would surface only as an asyncio "exception was never
+            # retrieved" debug warning. Lift to WARNING so production
+            # logs show it paired with the DB ``failed`` row.
+            log.warning(
+                "generation task %s artifact=%s failed: %s",
+                generation_type, artifact_id_str, exc,
+            )
+
+    task.add_done_callback(_on_gen_done)
     return job_id
 
 
@@ -555,5 +578,21 @@ async def _redispatch_artifact(artifact) -> None:
         ),
         name=f"recover:{gen_type.value}:{artifact_id}",
     )
-    _ACTIVE_TASKS[str(artifact_id)] = task
-    task.add_done_callback(lambda _t: _ACTIVE_TASKS.pop(str(artifact_id), None))
+    artifact_id_str = str(artifact_id)
+    _ACTIVE_TASKS[artifact_id_str] = task
+
+    def _on_recover_done(t: "asyncio.Task[None]") -> None:
+        _ACTIVE_TASKS.pop(artifact_id_str, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            # ``run_with_recovery`` claims to never raise; if it does,
+            # the recovery itself silently dies and the artifact stays
+            # ``running`` forever. Log so operators see the trace.
+            log.warning(
+                "artifact recovery %s artifact=%s failed: %s",
+                gen_type.value, artifact_id_str, exc,
+            )
+
+    task.add_done_callback(_on_recover_done)

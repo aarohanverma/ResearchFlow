@@ -137,11 +137,16 @@ def test_unknown_kind_recorded_but_not_crashed():
 
 
 def test_update_unknown_id_does_not_crash():
+    """An update with an unrecognised id and a text that doesn't
+    match any existing todo must surface a friendly diagnostic note
+    (not "unknown id" — the new wording emphasises that no todo
+    matched). The plan itself must remain intact."""
     plan = InvestigationPlan()
     notes = plan.apply_operations(
         [{"kind": "update", "id": "missing", "text": "x"}], iteration=1,
     )
-    assert any("unknown id" in n for n in notes)
+    # Friendlier wording introduced when fuzzy_resolve landed.
+    assert any("no todo matched" in n for n in notes)
 
 
 def test_invalid_status_falls_back_to_pending():
@@ -150,6 +155,78 @@ def test_invalid_status_falls_back_to_pending():
         [{"kind": "add", "text": "task", "status": "weird"}], iteration=1,
     )
     assert plan.by_id("t1").status == "pending"
+
+
+# ── fuzzy_resolve regression guards ─────────────────────────────────────────
+
+
+def test_update_with_positional_id_resolves():
+    """The model often invents ``id='t1'`` / ``id='1'`` instead of the
+    real slug. fuzzy_resolve maps those to the Nth open todo so the
+    op lands instead of silently failing with 'unknown id'."""
+    plan = InvestigationPlan()
+    plan.apply_operations(
+        [
+            {"kind": "add", "text": "first task"},
+            {"kind": "add", "text": "second task"},
+        ],
+        iteration=1,
+    )
+    # Now update with positional id "1" — should resolve to the first
+    # open todo regardless of its actual slug.
+    notes = plan.apply_operations(
+        [{"kind": "update", "id": "1", "status": "in_progress"}], iteration=2,
+    )
+    assert any("updated" in n for n in notes)
+    # The first todo's status is now in_progress.
+    open_ = plan.open_todos()
+    assert open_[0].status == "in_progress"
+
+
+def test_update_by_text_match_resolves():
+    """When the id is empty but the text matches an existing todo
+    exactly, fuzzy_resolve picks the right one. This handles the
+    model's habit of re-emitting the same op without an id."""
+    plan = InvestigationPlan()
+    plan.apply_operations(
+        [{"kind": "add", "text": "investigate widgets"}], iteration=1,
+    )
+    notes = plan.apply_operations(
+        [{"kind": "complete", "id": "", "text": "investigate widgets"}],
+        iteration=2,
+    )
+    assert any("completed" in n for n in notes)
+    # And it stuck.
+    assert plan.todos[0].status == "completed"
+
+
+def test_empty_update_silently_skipped():
+    """An op with no id AND no text must skip with a clear note —
+    never surface 'unknown id ""' which was the original noise."""
+    plan = InvestigationPlan()
+    notes = plan.apply_operations(
+        [{"kind": "update", "id": "", "status": "completed"}], iteration=1,
+    )
+    # The note explains the skip; "unknown id ''" must NOT appear
+    # (that was the buggy wording the user flagged).
+    assert any("skipped update: no id or text" in n for n in notes)
+    assert not any("unknown id ''" in n for n in notes)
+
+
+def test_duplicate_add_collapses_to_noop():
+    """Re-emitting the same ``add`` op across iterations must NOT
+    create a duplicate row. The plan stays clean."""
+    plan = InvestigationPlan()
+    plan.apply_operations(
+        [{"kind": "add", "text": "duplicate-prone task"}], iteration=1,
+    )
+    notes = plan.apply_operations(
+        [{"kind": "add", "text": "duplicate-prone task"}], iteration=2,
+    )
+    assert any("duplicate of existing" in n for n in notes)
+    # Only ONE todo with that text.
+    matches = [t for t in plan.todos if t.text == "duplicate-prone task"]
+    assert len(matches) == 1
 
 
 # ── Eviction never drops open work ──────────────────────────────────────────

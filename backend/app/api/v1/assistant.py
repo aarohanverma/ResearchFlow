@@ -81,6 +81,116 @@ async def get_session(session_id: UUID, user_id: CurrentUserID, db: DBSession):
     return AssistantSessionResponse.model_validate(session)
 
 
+@router.get("/sessions/{session_id}/hierarchy")
+async def get_session_hierarchy(
+    session_id: UUID, user_id: CurrentUserID, db: DBSession,
+):
+    """Return the relevant hierarchy slice from the perspective of one session.
+
+    The user's spec is explicit: each session should see its own
+    ancestor path and any descendants under it — NEVER sibling
+    branches that share a parent but aren't on its line.
+
+    Shape:
+
+        {
+          "current_id": "...",
+          "ancestors": [          # root → ... → parent of current
+              {"id": "...", "title": "...", "namespace_key": "...",
+               "is_root": true | false, "depth": 0},
+              ...
+          ],
+          "current": {...},        # self (always returned, even at root)
+          "descendants": [         # transitively under current
+              {"id": "...", "title": "...", "parent_id": "...",
+               "depth": 1, "is_current": false, "branch_from_message_id": "..."},
+              ...
+          ]
+        }
+
+    Ownership is enforced at every step — every lookup goes through
+    ``repo.get_session(user_id, ...)`` so a leaked id from another
+    user never surfaces.
+    """
+    from collections import deque
+    from sqlalchemy import select as _select
+    from app.models.assistant import AssistantSession as _AS
+
+    repo = AssistantRepository(db)
+    current = await repo.get_session(user_id, session_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    def _shape(s, *, depth: int, extras: dict | None = None) -> dict:
+        out = {
+            "id": str(s.id),
+            "title": s.title or "",
+            "namespace_key": s.namespace_key or "",
+            "is_root": s.parent_session_id is None,
+            "parent_id": str(s.parent_session_id) if s.parent_session_id else None,
+            "depth": depth,
+            "branch_from_message_id": (
+                str(s.branch_from_message_id) if s.branch_from_message_id else None
+            ),
+            "is_current": str(s.id) == str(session_id),
+        }
+        if extras:
+            out.update(extras)
+        return out
+
+    # ── Ancestors: walk parent chain up to the root. Bounded at 20
+    # to match the rest of the codebase's cycle guard.
+    ancestors: list[dict] = []
+    cur = current
+    seen: set = set()
+    for _ in range(20):
+        if cur.parent_session_id is None or cur.parent_session_id in seen:
+            break
+        seen.add(cur.id)
+        parent = await repo.get_session(user_id, cur.parent_session_id)
+        if parent is None:
+            break
+        # Insert at front so the final order is root → ... → parent.
+        ancestors.insert(0, _shape(parent, depth=-(len(ancestors) + 1)))
+        cur = parent
+    # Re-number depth so root is 0 and walks down.
+    for i, a in enumerate(ancestors):
+        a["depth"] = i
+
+    # ── Descendants: BFS over children, ownership-checked. We do
+    # NOT walk siblings of the current session's ancestors — that's
+    # the "no sibling branches" guarantee the user asked for.
+    descendants: list[dict] = []
+    queue = deque([(current, 0)])
+    visited: set = {current.id}
+    # Hard cap to avoid pathological trees flooding the response.
+    while queue and len(descendants) < 200:
+        node, depth = queue.popleft()
+        children_result = await db.execute(
+            _select(_AS).where(
+                _AS.user_id == user_id,
+                _AS.parent_session_id == node.id,
+            ).order_by(_AS.created_at.asc())
+        )
+        for child in children_result.scalars().all():
+            if child.id in visited:
+                continue
+            visited.add(child.id)
+            descendants.append(_shape(child, depth=depth + 1))
+            queue.append((child, depth + 1))
+
+    return {
+        "current_id": str(current.id),
+        "current": _shape(current, depth=len(ancestors)),
+        "ancestors": ancestors,
+        "descendants": descendants,
+        "counts": {
+            "ancestors": len(ancestors),
+            "descendants": len(descendants),
+        },
+    }
+
+
 @router.get("/sessions/{session_id}/export")
 async def export_session(
     session_id: UUID,

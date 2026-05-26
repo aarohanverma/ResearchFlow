@@ -108,7 +108,12 @@ export const api = {
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
-  delete: <T>(path: string) => request<T>("DELETE", path),
+  // DELETE with optional body — RFC 7231 permits a body on DELETE,
+  // and FastAPI accepts it. The body argument was added so callers
+  // can express per-entry deletes whose identity isn't expressible
+  // in a clean URL path (e.g. memory entries scoped by
+  // tier + namespace + key + root_session_id).
+  delete: <T>(path: string, body?: unknown) => request<T>("DELETE", path, body),
 };
 
 export function logout(): void {

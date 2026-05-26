@@ -24,6 +24,7 @@ import { useBookmarksStore } from "@/store/bookmarks";
 import { BookmarkFolderPicker } from "@/components/bookmarks/BookmarkFolderPicker";
 import { topicLabelFor } from "@/store/namespace";
 import MarkdownRenderer from "@/components/ui/MarkdownRenderer";
+import { AskOnSelectionPopover } from "@/components/ui/AskOnSelectionPopover";
 
 interface Props {
   paper: Paper;
@@ -50,24 +51,37 @@ export function PaperPanel({ paper, onClose }: Props) {
   const [queued, setQueued] = useState(false);
   const [showChat, setShowChat] = useState(false);
 
-  // Resizable panel width — persists across mounts via localStorage. Bounds
-  // chosen so the panel never disappears (<320px) or eats the whole screen.
+  // Resizable panel width — persists across mounts via localStorage.
+  // Bounds chosen so the panel never disappears (<320px) and never
+  // eats more than ~50% of the viewport. The default is sized so the
+  // remaining feed area stays comfortably navigable beside the panel
+  // (the user explicitly asked: "do not fully expand by default —
+  // keep reasonable default expansion size such that user can
+  // navigate the feed as well while paper panel is open").
+  const _viewportW = (typeof window !== "undefined" && window.innerWidth) || 1440;
+  const _maxAllowed = Math.max(420, Math.floor(_viewportW * 0.50));
+  const _defaultW = Math.max(380, Math.min(520, Math.floor(_viewportW * 0.32)));
   const [panelWidth, setPanelWidth] = useState<number>(() => {
-    if (typeof window === "undefined") return 460;
+    if (typeof window === "undefined") return _defaultW;
     try {
       const saved = parseInt(localStorage.getItem("rf_paper_panel_w") || "", 10);
-      if (Number.isFinite(saved) && saved >= 320 && saved <= 1100) return saved;
+      // Honour the user's persisted width when it's within bounds —
+      // they may have resized intentionally. Clamp to current
+      // viewport-relative max so a saved width from a previously
+      // wider window doesn't dominate a smaller one.
+      if (Number.isFinite(saved) && saved >= 320 && saved <= _maxAllowed) return saved;
     } catch {}
-    return 460;
+    return _defaultW;
   });
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = panelWidth;
+    const maxAllowed = Math.max(420, Math.floor(((typeof window !== "undefined" && window.innerWidth) || 1440) * 0.50));
     const onMove = (ev: MouseEvent) => {
       // Panel is anchored to the right edge → wider = drag left.
       const dx = startX - ev.clientX;
-      const w = Math.min(1100, Math.max(320, startW + dx));
+      const w = Math.min(maxAllowed, Math.max(320, startW + dx));
       setPanelWidth(w);
     };
     const onUp = () => {
@@ -428,6 +442,12 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // Selection-driven quote for the next message. Same lifecycle as
+  // the assistant chat: AskOnSelectionPopover (mounted below) sets
+  // this when the user clicks the floating "Ask about this paper"
+  // button on a highlighted passage; we prepend it as a markdown
+  // blockquote on send, then clear.
+  const [quotedSelection, setQuotedSelection] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   // Abort controller ref so we can cancel an in-flight stream when the panel
@@ -447,9 +467,18 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
   }, [messages]);
 
   async function send() {
-    const text = input.trim();
+    let text = input.trim();
     if (!text || busy) return;
+    // Prepend the selected quote as a markdown blockquote so the
+    // RAG endpoint sees the explicit reference alongside the
+    // user's question.
+    if (quotedSelection && quotedSelection.trim()) {
+      const q = quotedSelection.trim();
+      const quotedBlock = q.split("\n").map(l => `> ${l}`).join("\n");
+      text = `${quotedBlock}\n\n${text}`;
+    }
     setInput("");
+    setQuotedSelection(null);
     setBusy(true);
 
     // Cancel any previous in-flight stream before starting a new one.
@@ -554,7 +583,13 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
               }`}
             >
               {msg.role === "assistant" ? (
-                <div className="prose-paper-chat">
+                // ``data-rf-quotable="paper"`` scopes this subtree to
+                // the paper chat popover (see scope= prop on the
+                // AskOnSelectionPopover below). Distinct scope from
+                // the assistant chat so when both are layered, only
+                // the popover whose scope matches the selection
+                // fires — preventing wrong-composer routing.
+                <div className="prose-paper-chat" data-rf-quotable="paper">
                   <MarkdownRenderer content={msg.content} />
                 </div>
               ) : (
@@ -570,6 +605,26 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
       </div>
 
       <div className="p-3 border-t border-gray-800/60">
+        {quotedSelection && quotedSelection.trim() && (
+          <div
+            className="flex items-start gap-2 mb-2 px-2.5 py-1.5 rounded-lg bg-indigo-950/30 border border-indigo-700/30 text-[11px] text-gray-300 italic"
+            title="This selection will be quoted at the top of your next message"
+          >
+            <span className="text-indigo-300 font-bold flex-shrink-0">“</span>
+            <div className="flex-1 min-w-0 whitespace-pre-wrap leading-relaxed" style={{ maxHeight: 80, overflowY: "auto" }}>
+              {quotedSelection.length > 320
+                ? quotedSelection.slice(0, 320) + "…"
+                : quotedSelection}
+            </div>
+            <button
+              onClick={() => setQuotedSelection(null)}
+              className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+              title="Remove quote"
+            >
+              <XIcon size={11} />
+            </button>
+          </div>
+        )}
         <div className="flex gap-2 items-center bg-gray-900 border border-gray-800 rounded-xl px-3 py-2 focus-within:border-indigo-500/50 transition-colors">
           <input
             ref={inputRef}
@@ -594,6 +649,14 @@ function PanelChat({ paperId, level }: { paperId: string; level: string }) {
           </button>
         </div>
       </div>
+      <AskOnSelectionPopover
+        label="Ask about this paper"
+        scope="paper"
+        onAsk={(text) => {
+          setQuotedSelection(text);
+          inputRef.current?.focus();
+        }}
+      />
     </div>
   );
 }

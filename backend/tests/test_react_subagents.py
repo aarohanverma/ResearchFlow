@@ -249,3 +249,26 @@ async def test_subagent_distillation_extracts_final_thought():
     assert "highly-relevant papers on RAG" in result.summary
     # Filtered "Auto-repaired" entries don't pollute the summary.
     assert "Auto-repaired" not in result.summary
+
+
+# ── Parallel subagent dispatch (multi-domain fan-out) ─────────────────────
+
+
+def test_max_parallel_subagents_constant_is_reasonable():
+    """Cap must be small enough to bound runaway fan-outs (<= 4 keeps
+    join-step LLM tax manageable) and >= 2 so the pattern is useful."""
+    from app.assistant.react_loop import _MAX_PARALLEL_SUBAGENTS
+    assert 2 <= _MAX_PARALLEL_SUBAGENTS <= 4
+
+
+def test_decision_schema_accepts_dispatches_field():
+    """The structured-output schema must surface the ``dispatches``
+    field so the model can emit it without being rejected by the
+    cheap-model JSON validator."""
+    from app.assistant.react_loop import _DECISION_SCHEMA
+    props = _DECISION_SCHEMA["properties"]
+    assert "dispatches" in props
+    item = props["dispatches"]["items"]
+    required = set(item.get("required") or [])
+    assert "subagent_name" in required
+    assert "task" in required

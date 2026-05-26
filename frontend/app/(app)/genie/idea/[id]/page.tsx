@@ -38,6 +38,7 @@ import MarkdownRenderer, {
 import { useHighlightSearch, HighlightSearchToolbar } from "@/components/ui/HighlightSearch";
 import { PaperPanel } from "@/components/paper/PaperPanel";
 import type { Paper } from "@/types";
+import { AskOnSelectionPopover } from "@/components/ui/AskOnSelectionPopover";
 import { useFeature } from "@/lib/features";
 import { SectionNavPanel } from "@/components/ui/SectionNavPanel";
 import { useAuthStore } from "@/store/auth";
@@ -804,6 +805,10 @@ function IdeaChatPanel({
   ]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // Selection-driven quote captured by AskOnSelectionPopover when
+  // the user highlights text inside an assistant reply in this
+  // panel. Same lifecycle as the other chat surfaces.
+  const [quotedSelection, setQuotedSelection] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -814,9 +819,14 @@ function IdeaChatPanel({
   useEffect(() => () => abortRef.current?.abort(), []);
 
   async function sendMessage() {
-    const text = input.trim();
+    let text = input.trim();
     if (!text || busy) return;
+    if (quotedSelection && quotedSelection.trim()) {
+      const q = quotedSelection.trim();
+      text = q.split("\n").map(l => `> ${l}`).join("\n") + "\n\n" + text;
+    }
     setInput("");
+    setQuotedSelection(null);
     setBusy(true);
     const history = messages.filter(m => !m.streaming).slice(-10).map(m => ({ role: m.role, content: m.content }));
     setMessages(prev => [...prev, { role: "user", content: text }, { role: "assistant", content: "", streaming: true }]);
@@ -891,6 +901,22 @@ function IdeaChatPanel({
   useEffect(() => {
     try { localStorage.setItem("rf_idea_qa_w", String(panelW)); } catch {}
   }, [panelW]);
+  // Publish the live panel width as a CSS variable so the parent
+  // content area can subtract exactly this many px from its right
+  // edge. Without this, the main column used a hard-coded
+  // ``mr-[420px]`` that drifted out of sync whenever the user
+  // resized the panel — the rendered overlap / gap is what the user
+  // reported as "wonky shapes when panels expanded". The variable
+  // is scoped to the document root because the panel is rendered
+  // under ``position: fixed`` so the reader on the main column
+  // must reach a shared scope to see it.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.documentElement.style.setProperty("--rf-idea-chat-w", `${panelW}px`);
+    return () => {
+      document.documentElement.style.removeProperty("--rf-idea-chat-w");
+    };
+  }, [panelW]);
 
   return (
     <motion.div
@@ -928,7 +954,13 @@ function IdeaChatPanel({
             <div className={`max-w-[87%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${msg.role === "user" ? "bg-violet-600 text-white rounded-tr-sm" : "bg-gray-900 border border-gray-800/60 text-gray-200 rounded-tl-sm"}`}>
               {msg.role === "user"
                 ? <span className="whitespace-pre-wrap">{msg.content}</span>
-                : <MarkdownRenderer content={msg.content} onCitationClick={onCitationClick} />}
+                // Scope this subtree to the idea-dive popover (see
+                // ``scope="idea"`` on the AskOnSelectionPopover
+                // below). Distinct scope means when this panel is
+                // layered over the assistant chat or any other
+                // surface with its own popover, only ONE matching
+                // popover fires per selection.
+                : <div data-rf-quotable="idea"><MarkdownRenderer content={msg.content} onCitationClick={onCitationClick} /></div>}
               {msg.streaming && <span className="inline-block w-1.5 h-4 bg-violet-400 rounded-sm animate-pulse ml-0.5 align-middle" />}
             </div>
           </div>
@@ -937,6 +969,24 @@ function IdeaChatPanel({
       </div>
 
       <div className="p-3 border-t border-gray-800/60">
+        {quotedSelection && quotedSelection.trim() && (
+          <div
+            className="flex items-start gap-2 mb-2 px-2.5 py-1.5 rounded-lg bg-violet-950/30 border border-violet-700/30 text-[11px] text-gray-300 italic"
+            title="This selection will be quoted in your next message"
+          >
+            <span className="text-violet-300 font-bold flex-shrink-0">“</span>
+            <div className="flex-1 min-w-0 whitespace-pre-wrap leading-relaxed" style={{ maxHeight: 80, overflowY: "auto" }}>
+              {quotedSelection.length > 320 ? quotedSelection.slice(0, 320) + "…" : quotedSelection}
+            </div>
+            <button
+              onClick={() => setQuotedSelection(null)}
+              className="text-gray-500 hover:text-gray-300 flex-shrink-0"
+              title="Remove quote"
+            >
+              <XIcon size={11} />
+            </button>
+          </div>
+        )}
         <div className="flex gap-2 items-center bg-gray-900 border border-gray-800 rounded-xl px-3 py-2.5 focus-within:border-violet-500/50 transition-colors">
           <input
             ref={inputRef} value={input} onChange={e => setInput(e.target.value)}
@@ -951,6 +1001,14 @@ function IdeaChatPanel({
           </button>
         </div>
       </div>
+      <AskOnSelectionPopover
+        label="Ask about this idea"
+        scope="idea"
+        onAsk={(text) => {
+          setQuotedSelection(text);
+          inputRef.current?.focus();
+        }}
+      />
     </motion.div>
   );
 }
@@ -1498,8 +1556,15 @@ export default function IdeaDeepDivePage() {
       <div
         ref={scrollRef}
         onScroll={onScroll}
-        className={`flex-1 overflow-y-auto transition-all duration-300 ${showChat ? "mr-[420px]" : ""}`}
-        style={{ background: "var(--rf-bg)" }}
+        className="flex-1 overflow-y-auto transition-all duration-300"
+        style={{
+          background: "var(--rf-bg)",
+          // ``--rf-idea-chat-w`` is set by IdeaChatPanel via the
+          // documentElement so the margin always tracks the live
+          // panel width. Fallback to 0 when the chat is closed (the
+          // panel unmount clears the property).
+          marginRight: showChat ? "var(--rf-idea-chat-w, 420px)" : 0,
+        }}
       >
         {/* Reading progress */}
         <div className="sticky top-0 left-0 right-0 h-0.5 bg-gray-800/40 z-20">

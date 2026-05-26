@@ -410,7 +410,21 @@ async def build_deep_graph_background(
         _run_build_deep_background(job_id, namespace_key, orientation, lock_key)
     )
     _BUILD_TASKS[job_id] = task
-    task.add_done_callback(lambda _: _BUILD_TASKS.pop(job_id, None))
+
+    def _on_build_done(t: asyncio.Task, _jid: str = job_id) -> None:
+        _BUILD_TASKS.pop(_jid, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            # Without this, a crash in build-deep before its own try/except
+            # opens (rare but possible — import / config errors) used to
+            # disappear into "task exception was never retrieved". The
+            # graph:build:{job_id} cache entry would then be stuck in
+            # ``running`` for ``_BUILD_CACHE_TTL`` with no operator signal.
+            log.warning("graph build_deep job %s failed: %s", _jid, exc)
+
+    task.add_done_callback(_on_build_done)
 
     return {
         "job_id": job_id,

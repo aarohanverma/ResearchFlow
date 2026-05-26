@@ -22,6 +22,77 @@ from app.assistant.tools.registry import describe_for_planner, get_tool
 log = logging.getLogger(__name__)
 
 
+# Cap on how many procedural memories we splice into the system
+# prompt per turn — keeps the static planner prompt small enough
+# that the soft-nudge framing still dominates and a runaway count of
+# user procedures can't shadow the platform's invariants.
+_MAX_PROCEDURAL_INJECT = 6
+# Memory types that count as procedural for the hot-path inject.
+# Anything else stays in the user-prompt memory block, which is the
+# right channel for facts/episodes/context.
+_PROCEDURAL_TYPES: frozenset[str] = frozenset({"skill", "procedure"})
+
+
+def _render_procedural_block(memory: dict[str, Any]) -> str:
+    """Return a soft procedural-memory section to append to the
+    planner system prompt, or the empty string when no procedural
+    entries are stored.
+
+    Pulls from the medium (tree) and long (namespace) tiers — short
+    tier is per-chat context and rarely carries procedural intent.
+    The block is framed as "soft preferences" so the planner treats
+    them as guidance, not as overrides for the platform's hard
+    invariants (HITL gates, graph-build ban, etc.).
+
+    Each entry is rendered on its own line as ``- [type] key: value``
+    so the model can attribute the procedure to a specific stored
+    instruction. Values truncated at 240 chars so a runaway user
+    write can't bloat the prompt.
+    """
+    if not memory:
+        return ""
+
+    procedurals: list[tuple[str, str, str, str]] = []  # (tier, key, ptype, value)
+    for tier_key in ("medium", "long"):
+        tier_view = memory.get(tier_key) or {}
+        if not isinstance(tier_view, dict):
+            continue
+        for key, entry in tier_view.items():
+            if not isinstance(entry, dict):
+                continue
+            etype = str(entry.get("type") or "").lower()
+            if etype not in _PROCEDURAL_TYPES:
+                continue
+            value = str(entry.get("value") or "").strip()
+            if not value:
+                continue
+            procedurals.append((tier_key, str(key), etype, value[:240]))
+            if len(procedurals) >= _MAX_PROCEDURAL_INJECT:
+                break
+        if len(procedurals) >= _MAX_PROCEDURAL_INJECT:
+            break
+
+    if not procedurals:
+        return ""
+
+    lines = [
+        "",
+        "",
+        "════════════════════════════════════════",
+        "USER PROCEDURAL MEMORY (soft preferences)",
+        "════════════════════════════════════════",
+        "",
+        "These are durable behavioural preferences the user has saved. "
+        "Honour them when they fit; they are guidance, not commands. The "
+        "platform invariants above (HITL gates, tool catalogue, "
+        "minimum-sufficient-set discipline) always win when they conflict.",
+        "",
+    ]
+    for tier, key, etype, value in procedurals:
+        lines.append(f"- [{tier}/{etype}] {key}: {value}")
+    return "\n".join(lines)
+
+
 _PLANNER_SYSTEM = """You are the planner for ResearchFlow's Research Assistant (RA).
 
 You read the user's query, conversation history, memory, and inferred-intent
@@ -75,6 +146,17 @@ table. The actual choice should follow the user's specific working intent.
 • Cache-first tools (``study_paper``, ``genie_deep_dive``) return
   instantly on a cache hit. Pick them confidently when the intent matches.
 
+• Full-paper analysis tools — when you need to GO DEEP on a specific paper:
+    - ``paper_qa`` for ONE focused question against the paper body.
+    - ``deep_paper_analysis`` for a comprehensive multi-aspect read
+      (methods + results + limitations + ablations in one call). Pick
+      this when the user asks to "go deeper", "give me a thorough
+      read", "what are the limitations", "what ablations did they run",
+      OR when you need full-paper grounding instead of abstract-only.
+      Requires the paper to be in the corpus — call arxiv_import /
+      deep_search first if needed. More expensive than paper_qa
+      (4× LLM rounds) but the right tool when the user wants depth.
+
 • Memory tools: ``memory_recall`` only when continuity / prior context
   is genuinely needed; ``memory_write`` only when a substantive fact is
   worth persisting; ``memory_delete`` only on explicit forget requests.
@@ -94,6 +176,39 @@ DISCIPLINE:
 • Don't bundle "just in case". Every step costs latency + tokens.
 • Heavier retrieval first; analysis/synthesis/comparison on top of it.
 • Run independent lookups in parallel (``parallel: true``).
+
+════════════════════════════════════════
+BROAD "TEACH + DIRECT" QUERIES — STAY ON THE MAIN TOPIC
+════════════════════════════════════════
+
+When the user asks something broad like "teach me X, then propose
+research directions" or "explain Y deeply and suggest where to take
+it next", the right plan is FOCUSED, not exhaustive:
+
+  1. Ground the CANONICAL FOUNDATION first — the core mechanism, the
+     standard formulation, the most-cited reference. Use
+     ``concept_explain`` and ``literature_survey`` on the main
+     topic; do NOT chase tangential subfields yet.
+  2. Build a concept map: core mechanism → variants → limitations
+     → applications → open questions. Each branch grounded in
+     1-2 strong papers, not 10 scattered ones.
+  3. Verify load-bearing claims with full-paper checks
+     (``paper_qa`` / ``deep_paper_analysis``) on the papers the
+     final answer relies on. Don't waste verification budget on
+     side-citations.
+  4. Rank research directions by clarity, impact, feasibility,
+     novelty, and falsifiability — proposing one well-scoped
+     direction beats listing six speculative ones.
+  5. ONLY THEN, if a contradiction or adjacent thread MATERIALLY
+     affects the main thesis, follow it. Contradiction-hunting is
+     valuable when it changes the answer, not when it ornaments it.
+
+Anti-pattern to avoid: chasing every contradiction signal the loop
+surfaces. The contradiction middleware should NOT pull retrieval off
+the main topic to investigate a side claim that doesn't change the
+recommendation. The user's central topic stays the centre of the
+plan; adjacent threads are explored only when they alter the
+conclusion.
 
 ════════════════════════════════════════
 QUERY CRAFTING — TOOLS NEED TIGHT INPUTS
@@ -150,6 +265,13 @@ expected output. Forbidden patterns:
   ✗ ``"paper_id": "<TODO>"``       — angle-bracket placeholders
   ✗ ``"paper_ids": ["{fill}"]``    — brace placeholders inside arrays
   ✗ ``"paper_ids": []`` when the field is required with min_items ≥ 1
+  ✗ Cross-step reference templates — ``"$STEP2.paper_ids[0]"``,
+    ``"{{step_1.output}}"``, ``"STEP3.paper_id"``. There is NO
+    substitution layer downstream; these reach the tool as literal
+    strings and fail. Either (a) leave ``paper_id``/``paper_ids``
+    empty on the dependent step so the orchestrator's ledger fills
+    them from the prior step's actual retrieval results, or (b)
+    plan the dependent step in a later turn after the IDs are known.
   ✗ Inventing paper UUIDs / DOIs / IDs — only use IDs that come back
     from a retrieval step you planned earlier in this same plan.
 
@@ -402,8 +524,29 @@ class LLMPlanner:
         disabled_features: set[str] | None = None,
         research_brief: str | None = None,
         intent_hint: str | None = None,
+        session_id: Any = None,
     ) -> Plan:
-        """Async planner — calls the LLM with adaptive compute based on query complexity."""
+        """Async planner — calls the LLM with adaptive compute based on query complexity.
+
+        Memory injection is **query-aware**: before building the prompt,
+        ``memory_injector.select_relevant_memory`` collapses each tier
+        to its preferences plus the top-K entries semantically closest
+        to ``query``. This is the middleware layer described in the
+        LangChain memory-pattern guide — the planner prompt receives a
+        compact, high-signal slice instead of the full memory dump.
+
+        Behavioural guarantees:
+          * If the embedder is unavailable, ``select_relevant_memory``
+            falls back to a recency-ordered slice of the same shape;
+            the planner never sees a missing-memory failure.
+          * If ``session_id`` is omitted, ranking still happens but
+            the per-entry embedding cache cannot be persisted, so
+            successive turns re-embed the same entries. Acceptable for
+            tests; the production orchestrator always passes session_id.
+          * Buckets already small enough (≤ per_tier_k non-preference
+            entries) are passed through untouched — no semantic call
+            is made, no extra latency incurred.
+        """
         # Pass namespace_key + disabled features so any tool gated by a flag
         # the admin turned off (or that's overridden off for this user) is
         # invisible to the planner. Without this the LLM would happily pick
@@ -418,6 +561,29 @@ class LLMPlanner:
         # Assess query complexity to choose planning model + depth
         complexity = _assess_query_complexity(query, history or [])
 
+        # ── Memory injection middleware ───────────────────────────────
+        # Replace the flat per-tier dump with a query-aware focused
+        # slice before any prompt building. Preferences are preserved
+        # in full; non-preference entries are ranked by semantic
+        # similarity to the user query (with graceful recency
+        # fallback). This addresses the "automatic, compact, high-
+        # signal memory injection" middleware pattern documented in
+        # the LangChain agentic harness guide — the explicit
+        # memory_recall / memory_write / memory_delete tools remain
+        # the agent-controlled path; this is the automatic complement.
+        focused_memory: dict | None = memory
+        if memory:
+            try:
+                from app.assistant.memory_injector import select_relevant_memory
+                focused_memory = await select_relevant_memory(
+                    query=query,
+                    memory_view=memory,
+                    session_id=session_id,
+                )
+            except Exception as _mi_exc:  # noqa: BLE001 — never block planning
+                log.debug("memory_injector skipped: %s", _mi_exc)
+                focused_memory = memory
+
         try:
             from app.adapters.llm import get_llm_adapter
 
@@ -430,19 +596,34 @@ class LLMPlanner:
                 orientation=orientation,
                 expertise=expertise,
                 catalogue=catalogue,
-                memory=memory or {},
+                memory=focused_memory or {},
                 complexity=complexity,
                 research_brief=research_brief,
                 intent_hint=intent_hint,
             )
+            # Soft procedural-memory injection. Procedural entries
+            # (``skill`` / ``procedure`` types) describe HOW the agent
+            # should behave — they're instructions, not facts. The
+            # natural channel for those is the system prompt, so the
+            # planner is shaped by them throughout the decision rather
+            # than reading them as an aside. The block is appended
+            # AFTER the static prompt so any user-defined procedure
+            # can refine (but never replace) the platform's invariants.
+            # Empty-input case is a no-op; the static prompt is used
+            # unchanged.
+            system_prompt = _PLANNER_SYSTEM + _render_procedural_block(memory or {})
             messages = [
-                {"role": "system", "content": _PLANNER_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ]
-            # Always use quality_model for planning — reasoning model adds latency
-            # with negligible plan quality gain. The synthesizer uses the reasoning
-            # model where it matters: grounded evidence composition.
-            plan_model = llm.quality_model
+            # Use the REASONING model for planning per user spec:
+            # "Use a strong model for planning as well as evaluation."
+            # The trade-off (extra latency) is acceptable because the
+            # planner is the single most-leveraged LLM call in a turn
+            # — every downstream tool depends on its choices. A
+            # smarter planner saves more tool round-trips than the
+            # extra planning latency costs.
+            plan_model = llm.reasoning_model
             reasoning_effort = None
             raw = await llm.complete_structured(
                 messages,
@@ -557,17 +738,26 @@ class LLMPlanner:
         if inject_memory and (short_mem or medium_mem or long_mem):
             memory_blob = (
                 "\nResearch memory (advisory — let it shape the plan only when it "
-                "clearly applies; ignore if stale or off-topic):\n"
+                "clearly applies; ignore if stale or off-topic). "
+                "Entries are tagged ``[tier/type]`` so you can weight them: "
+                "``preference`` and ``skill``/``procedure`` describe HOW to behave, "
+                "``finding``/``concept``/``paper_note`` are facts about the world, "
+                "``episode`` is a record of a past interaction.\n"
             )
-            # Preferences always first regardless of tier.
+            # Preferences always first regardless of tier — they're the
+            # single most load-bearing kind of memory for plan shaping.
             for tier_label, tier_dict in (("chat", short_mem), ("tree", medium_mem), ("namespace", long_mem)):
                 prefs = [(k, v) for k, v in tier_dict.items() if _entry_type(v) == "preference"]
                 for k, v in prefs[:4]:
-                    memory_blob += f"  [pref/{tier_label}] {k}: {_mem_val(v)[:200]}\n"
+                    memory_blob += f"  [{tier_label}/preference] {k}: {_mem_val(v)[:200]}\n"
+            # Then everything else — surface the entry type explicitly
+            # so the planner can tell an episode (past event) from a
+            # finding (durable fact) and weight them differently.
             for tier_label, tier_dict in (("chat", short_mem), ("tree", medium_mem), ("namespace", long_mem)):
                 others = [(k, v) for k, v in tier_dict.items() if _entry_type(v) != "preference"]
                 for k, v in others[:5]:
-                    memory_blob += f"  [{tier_label}] {k}: {_mem_val(v)[:200]}\n"
+                    etype = _entry_type(v) or "context"
+                    memory_blob += f"  [{tier_label}/{etype}] {k}: {_mem_val(v)[:200]}\n"
 
         # Namespace pack hint — tell the planner about domain-specific tools available
         from app.assistant.tools.namespace_packs import get_pack_description
