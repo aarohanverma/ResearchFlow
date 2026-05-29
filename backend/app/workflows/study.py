@@ -364,7 +364,11 @@ async def _fetch_and_parse(state: StudyState) -> StudyState:
 
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=60) as client:
+        # follow_redirects: arXiv/publisher PDF URLs frequently 301→https or
+        # to a CDN; without it ``resp.content`` is an empty redirect stub and
+        # the parse silently degrades to abstract-only. parse_with_fallback's
+        # magic-byte guard rejects any non-PDF body that still slips through.
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             resp = await client.get(paper.pdf_url)
             pdf_bytes = resp.content
 
@@ -1754,7 +1758,11 @@ async def _ensure_papers_fully_chunked(paper_ids: list[UUID]) -> None:
 
             try:
                 import httpx
-                async with httpx.AsyncClient(timeout=60) as client:
+                # follow_redirects so arXiv/CDN 3xx hops resolve to the real
+                # PDF body; parse_with_fallback rejects non-PDF bytes via its
+                # magic-byte guard so a redirect-to-HTML page can't poison the
+                # bookmarks RAG index with hallucinated chunks.
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
                     resp = await client.get(paper.pdf_url)
                     pdf_bytes = resp.content
 

@@ -1,0 +1,15 @@
+# Sphinx API-reference build dependencies.
+#
+# Build the HTML docs with:
+#   pip install -r docs/sphinx/requirements.txt
+#   python -m sphinx -b html docs/sphinx/source docs/sphinx/build/html
+#
+# All other Sphinx extensions used by conf.py (autodoc, napoleon, viewcode,
+# intersphinx, githubpages) ship inside Sphinx itself — no extra packages.
+#
+# Heavy backend runtime deps (fastapi, pydantic, sqlalchemy, langgraph, torch,
+# marker-pdf, …) are mocked via ``autodoc_mock_imports`` in conf.py, so this
+# file does NOT need the backend's requirements.txt. conf.py adds ``backend/``
+# to ``sys.path`` so ``import app.*`` resolves without installing the package.
+sphinx==8.2.3
+sphinx-rtd-theme==3.0.2

@@ -20,7 +20,7 @@ All API endpoints that read/write these tables MUST enforce
 | --- | --- |
 | ``users`` | The user record itself. |
 | ``user_provider_settings`` | API key overrides, encrypted. |
-| ``user_interest_profile`` | Concept affinity / hot-cold subtopics. |
+| ``user_interest_profiles`` | Concept affinity / hot-cold subtopics. |
 | ``assistant_sessions`` | Chat session metadata + ``state`` JSONB. |
 | ``assistant_messages`` | Chat messages (FK to session). |
 | ``assistant_tasks`` | Background orchestration tasks. |
@@ -29,8 +29,10 @@ All API endpoints that read/write these tables MUST enforce
 | ``assistant_attachments`` | User-uploaded notes / URLs / files attached to a session. |
 | ``bookmarks`` + ``bookmark_folders`` + ``bookmark_folder_members`` | Bookmarks and their folders. |
 | ``feed_feedback`` | Per-user like / dismiss signals. |
-| ``paper_namespace_hide`` | Per-user dismissals from feed. |
+| ``paper_namespace_hides`` | Per-user dismissals from feed. |
+| ``annotations`` | Per-user paper highlights + notes. |
 | ``query_logs`` | Per-user search history. |
+| ``generated_artifacts`` | Per-user media outputs (podcast/slides). Owner column + cross-user reuse lookup — see §2. |
 | ``idea_capsules`` | Genie idea capsules (owner cascade). |
 | ``genie_sessions`` | Genie synthesis jobs (owner). |
 | ``token_usage`` | Per-user LLM token accounting (billing). |
@@ -73,13 +75,17 @@ ingestion / generation pipelines.
 | ``paper_citations`` | Citation graph edges. |
 | ``paper_of_day`` | Per-namespace daily highlight. |
 | ``summaries`` | Cached Study Mode output. Keyed by ``(paper_id, expertise_level)``. |
-| ``graph_nodes`` / ``graph_edges`` | Knowledge graph (when not user-scoped). |
+| ``knowledge_nodes`` / ``knowledge_edges`` | Knowledge graph. |
 | ``source_mappings`` | Namespace → arXiv-category map. |
-| ``shared_generation_outputs`` (new) | Deterministic media output dedup. |
 
-The "deterministic" promise: given identical inputs (source_id +
-expertise_level + orientation + prompt_hash + model_id + parser_version),
-the output is reusable across users. Versioning columns guard against
+Media-generation dedup is **not** a separate table — it reuses
+``generated_artifacts`` (a §1 owner-scoped table) through a user-agnostic
+lookup, ``ArtifactRepository.find_reusable_completed_global``. The
+"deterministic" promise: given matching ``source_type`` + ``source_id`` +
+``generation_type`` + ``expertise_level`` + ``orientation`` + ``provider`` +
+``model_used`` (+ ``parser_used``), a completed artifact from any user can be
+reused. The same fields keyed to the requesting ``user_id`` drive the
+per-user cache (``find_reusable_completed``). These columns guard against
 silent staleness when prompts or models change.
 
 ---
@@ -95,7 +101,7 @@ shared rows.
 | Feed scoring | ``papers`` | ``user_interest_profile``, ``feed_feedback``, ``paper_namespace_hide`` |
 | Bookmarked papers | ``papers`` | ``bookmarks`` |
 | Study session | ``summaries`` | ``assistant_sessions``, ``assistant_attachments`` |
-| Generated media | ``shared_generation_outputs`` | ``generated_artifacts`` (owner + reference FK) |
+| Generated media | ``generated_artifacts`` (global reusable lookup) | ``generated_artifacts`` (owner-scoped row) |
 | Search results | ``paper_chunks`` indices | per-request scoring nudge from orientation |
 
 ---
@@ -121,8 +127,9 @@ Static or admin-managed. Not user-keyed, not content-keyed.
   inherently public (paper metadata, namespace catalog) — these are
   documented in this file and audited.
 - ``/dev/reset`` and any other destructive admin endpoint MUST require
-  an explicit feature flag (``ALLOW_DEV_RESET=1``) and a valid user
-  session, regardless of environment.
+  an explicit feature flag (``ENABLE_DEV_RESET=true``, read via
+  ``settings.enable_dev_reset``) and a valid user session, regardless of
+  environment.
 
 ---
 

@@ -84,6 +84,40 @@ _CLAIM_TYPE_COMPARATIVE = "comparative"
 _CLAIM_TYPE_GENERIC = "generic"
 
 
+# Generic research vocabulary that carries no disambiguating signal when
+# deciding whether a claim is central to the user's question.
+_LOAD_BEARING_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "with",
+    "this", "that", "these", "those", "from", "into", "over", "model",
+    "models", "method", "methods", "result", "results", "paper", "papers",
+    "study", "approach", "system", "data", "task", "show", "shows", "using",
+})
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Lowercase content-bearing tokens (≥4 chars, non-stopword)."""
+    import re
+    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]+", (text or "").lower())
+    return {w for w in raw if len(w) >= 4 and w not in _LOAD_BEARING_STOPWORDS}
+
+
+def _load_bearing_rank(claim: StrongClaim, query: str) -> int:
+    """0 when the claim is central to the user's question, else 1.
+
+    With a bounded per-turn paper_qa budget, verification should land on
+    the claims the final answer will actually lean on — those that share
+    vocabulary with the user's question — rather than incidental strong-
+    sounding spans mined from tangential papers. When the query is too
+    thin to discriminate, every claim is treated as load-bearing so the
+    type/source priority still decides ordering.
+    """
+    q = _content_tokens(query)
+    if not q:
+        return 0
+    s = _content_tokens(claim.span or "")
+    return 0 if (q & s) else 1
+
+
 def _classify_claim(claim: StrongClaim) -> str:
     """Tag the claim with a coarse type so the verification question
     can be tailored. Pure text inspection; cheap; namespace-agnostic."""
@@ -335,8 +369,10 @@ class FullPaperVerificationMiddleware(BaseMiddleware):
         if not pending:
             return FinalizeAllow()
 
-        # Highest-priority claim first.
-        pending.sort(key=_priority)
+        # Most load-bearing claim first: claims central to the user's
+        # question take the limited verification budget before incidental
+        # ones, and within each band the type/source priority decides.
+        pending.sort(key=lambda c: (_load_bearing_rank(c, state.query), _priority(c)))
         target = pending[0]
 
         state.forced_paper_qa += 1

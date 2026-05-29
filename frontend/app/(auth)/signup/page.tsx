@@ -47,7 +47,7 @@ export default function SignupPage() {
         // Token created but profile fetch failed — token is valid, the layout
         // guard will retry `/auth/me`. Don't block the user with an error.
       }
-      router.push("/settings/onboarding");
+      router.push("/feed");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {

@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 _RRF_K = 60            # standard RRF constant — tunable
 _MAX_KW_RESULTS = 50
 _MAX_SEM_RESULTS = 50  # distinct papers returned from semantic path
-_SEM_INNER_LIMIT = 200 # ANN candidate pool before dedup — uses IVFFlat index
+_SEM_INNER_LIMIT = 200 # ANN candidate pool before dedup — uses the pgvector HNSW index
 _MIN_SEM_SCORE = 0.20  # discard chunks with very low cosine similarity
 _KW_WEIGHT  = 0.8      # keyword is fallback; hybrid wins when both fire
 _SEM_WEIGHT = 1.2      # semantic preferred — captures conceptual matches
@@ -112,7 +112,8 @@ class SearchRepository:
         Keyword path covers title, tldr, abstract, key_concepts, and
         methods_used for improved method/concept recall.  Semantic path uses an
         ANN-friendly two-step approach: LIMIT on the raw vector scan (uses
-        IVFFlat index), then GROUP BY paper_id for deduplication, then JOIN to
+        the HNSW index, falling back to an exact scan if pgvector HNSW is
+        unavailable), then GROUP BY paper_id for deduplication, then JOIN to
         papers, with a minimum similarity floor of 0.20.
 
         Args:
@@ -308,7 +309,7 @@ class SearchRepository:
     ) -> list[dict]:
         """Vector similarity search — returns distinct papers (best chunk per paper).
 
-        Uses a two-step approach that leverages the IVFFlat ANN index:
+        Uses a two-step approach that leverages the HNSW ANN index:
           1. ORDER BY distance LIMIT inner_limit  →  uses the ANN index (fast)
           2. GROUP BY paper_id keeping max score   →  one result per paper
           3. Filter below minimum similarity floor →  remove noise

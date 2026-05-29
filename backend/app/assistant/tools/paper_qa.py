@@ -23,6 +23,20 @@ log = logging.getLogger(__name__)
 _MAX_CHUNKS = 12          # chunks fed to LLM for synthesis
 _CHUNK_CHARS = 800        # chars per chunk passed to LLM
 
+# Minimum fraction of meaningful title tokens that must appear in a
+# candidate's title before the fuzzy fallback will commit to it. Below
+# this the match is too weak to trust — we'd rather report not-found and
+# let the loop retrieve the exact paper than answer against the wrong one.
+_TITLE_MATCH_THRESHOLD = 0.6
+
+# Common words that carry no disambiguating signal in a title match.
+_TITLE_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "with",
+    "via", "using", "based", "toward", "towards", "from", "into", "over",
+    "this", "that", "study", "paper", "approach", "method", "methods",
+    "model", "models", "novel", "new", "framework", "analysis",
+})
+
 
 class PaperQAInput(BaseModel):
     question: str = Field(min_length=5, max_length=500, description="Specific question to answer using the paper's content")
@@ -171,31 +185,69 @@ class PaperQATool:
 
         if paper is None and params.paper_title.strip():
             title_lower = params.paper_title.strip().lower()
-            words = title_lower.split()[:4]
-            # Title fallback: bound the candidate scan to a recent slice
-            # so a global title search stays cheap. The lookup is only
-            # used when the model could not produce a paper_id from the
-            # ledger.
-            result = await ctx.db.execute(
-                select(Paper).order_by(Paper.ingested_at.desc()).limit(200)
-            )
+            # Meaningful tokens only — drop short/stopwords so a single
+            # incidental overlap ("the", "of", "a") cannot resolve a
+            # title to an unrelated paper.
+            q_tokens = [
+                w for w in title_lower.split()
+                if len(w) > 3 and w not in _TITLE_STOPWORDS
+            ]
+            # Scope the candidate scan to the namespace(s) the caller
+            # supplied. These args were previously accepted but ignored,
+            # so a fuzzy title match could silently resolve to a recent
+            # paper from an unrelated field. Honouring them keeps the
+            # fallback inside the question's subject area.
+            ns_scope = [
+                ns for ns in ([params.namespace_key] + list(params.namespace_keys))
+                if ns and ns.strip()
+            ]
+            stmt = select(Paper)
+            if ns_scope:
+                stmt = stmt.where(Paper.namespace_key.in_(ns_scope))
+            stmt = stmt.order_by(Paper.ingested_at.desc()).limit(200)
+            result = await ctx.db.execute(stmt)
             all_papers = result.scalars().all()
-            # Score by word overlap with title
-            def _score(p: Paper) -> int:
+
+            def _score(p: Paper) -> float:
                 t = (p.title or "").lower()
-                return sum(1 for w in words if w in t)
-            scored = [(p, _score(p)) for p in all_papers if _score(p) > 0]
+                if not t:
+                    return 0.0
+                # Exact / containment match is the strongest signal.
+                if title_lower == t or title_lower in t or t in title_lower:
+                    return 1.0
+                if not q_tokens:
+                    return 0.0
+                hits = sum(1 for w in q_tokens if w in t)
+                return hits / len(q_tokens)
+
+            scored = [(p, _score(p)) for p in all_papers]
+            scored = [ps for ps in scored if ps[1] > 0.0]
             if scored:
-                paper = max(scored, key=lambda x: x[1])[0]
+                best_paper, best_score = max(scored, key=lambda x: x[1])
+                # Require a real relevance threshold. A weak partial
+                # overlap is NOT enough to commit an answer to a specific
+                # paper — better to report not-found and let the loop run
+                # a retrieval tool than to answer against the wrong paper.
+                if best_score >= _TITLE_MATCH_THRESHOLD:
+                    paper = best_paper
 
         if paper is None:
+            # Signal the loop to retrieve rather than treat this as a hard
+            # dead-end: a missing/weak title match means we should populate
+            # the ledger with the right paper before retrying, not answer
+            # against an unrelated one.
             return ToolResult(
                 output={
                     "answer": "", "paper_title": "", "paper_id": "",
                     "chunks_used": 0, "found": False, "sections_used": [],
                     "chunk_positions": [], "total_chunks": 0,
+                    "recoverable_hint": "retrieve_then_retry",
                 },
-                summary=f"Paper not found: {params.paper_title or params.paper_id}",
+                summary=(
+                    f"Paper not found (no confident match): "
+                    f"{params.paper_title or params.paper_id}. Run a retrieval "
+                    "tool to surface the exact paper_id, then call paper_qa again."
+                ),
             )
 
         await ctx.emit_progress(35, f"Retrieved paper: {paper.title}")

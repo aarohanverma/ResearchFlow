@@ -283,7 +283,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
                     WITH (m = 16, ef_construction = 64)
                 """))
             except Exception:
-                pass  # pgvector HNSW not available — IVFFlat/exact scan fallback
+                # pgvector build too old for HNSW — leave the column unindexed;
+                # vector queries fall back to an exact (sequential) scan, which is
+                # correct, just slower. No IVFFlat index is created here.
+                pass
         log.info("search indexes ensured")
     except Exception as exc:
         log.warning("search index creation skipped: %s", exc)

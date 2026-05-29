@@ -31,6 +31,7 @@ It runs entirely on your own infrastructure — local Docker for development, fo
   - [Why this exists](#why-this-exists)
   - [Table of Contents](#table-of-contents)
   - [What it does](#what-it-does)
+  - [Media Generation (Audio · Slides)](#media-generation-audio--slides)
   - [Architecture overview](#architecture-overview)
   - [Prerequisites](#prerequisites)
   - [API Keys](#api-keys)
@@ -58,9 +59,12 @@ It runs entirely on your own infrastructure — local Docker for development, fo
   - [Nightly Ingestion Schedule](#nightly-ingestion-schedule)
   - [Environment Variables Reference](#environment-variables-reference)
   - [Azure Deployment](#azure-deployment)
+  - [AWS Deployment](#aws-deployment)
+  - [Vercel Deployment](#vercel-deployment)
   - [Project Structure](#project-structure)
   - [Verbose Debug Mode](#verbose-debug-mode)
   - [Running Unit Tests](#running-unit-tests)
+  - [Token Usage Tracking](#token-usage-tracking)
   - [Common Issues](#common-issues)
   - [License](#license)
 
@@ -78,14 +82,14 @@ It runs entirely on your own infrastructure — local Docker for development, fo
 | **Bookmarks** | Save papers with notes and organize into folders. |
 | **Knowledge Graph** | 8-level force-directed graph: **Subject → Topic → Subtopic → Area → Sub-area → Cluster → Papers → Concepts/Methods**. Subject root node (e.g. "Computer Science") groups all domain topics. Scope: Full Feed (namespace-isolated) or Bookmarks (folder filter). Semantically-related papers shown as dotted violet edges. Subgraph cached (4h TTL). LLM uses **2-phase taxonomy** (Phase 1: canonical bounded structure; Phase 2: paper assignment) to prevent area explosion across batches. **Build Deep runs as a background job** for all selected namespaces — tracks progress in the notification panel, re-enables the button only when complete, and auto-refreshes the graph when done (even after navigating away and returning). Concurrent builds are capped at 2 namespaces at a time. Each area is committed incrementally so partial progress appears in the graph as the build runs. Works across all arXiv subjects — Mathematics, Physics, Statistics, Biology, Economics, etc. — using curated labels for 100+ known namespaces and automatic label derivation for any others. A per-topic filter in the toolbar lets you narrow the graph to a single topic when multiple are selected. |
 | **RAG Chat** | Chat grounded in your indexed papers. Answer depth/vocabulary adapts to expertise level; emphasis adapts to orientation. Namespace-isolated. |
-| **Genie** | Idea synthesizer with three modes: **Manual** (bookmarks, 2–10), **Auto** (full feed 2–5), **Query** (natural language → papers, 2–5). Each capsule tagged Manual/Auto/Query; Query capsules show the input query. Orientation + expertise level shape all modes. Each capsule tagged Manual/Auto/Query; hover over element library items to see TL;DR. Ideas are automatically hidden when their subject is deselected — the capsule list is scoped to the user's current topic subscriptions. |
+| **Genie** | Idea synthesizer with three modes: **Manual** (bookmarks, 2–10), **Auto** (full feed 2–5), **Query** (natural language → papers, 2–5). Each capsule is tagged Manual/Auto/Query; Query capsules show the input query. Orientation + expertise level shape all modes. Hover over element library items to see their TL;DR. Ideas are automatically hidden when their subject is deselected — the capsule list is scoped to the user's current topic subscriptions. |
 | **Genie Auto Discovery** | Operates on the **full feed** (all papers in subscribed namespaces, up to 200 per run). 5-signal pair scoring; O(N²) capped at N=200 for sub-second pairing. Namespace-isolated via user subscriptions. |
 | **Genie Query Mode** | Natural-language query → LLM validation + rewrite → semantic paper discovery → compatibility scoring → best synthesis group. Best-group papers are auto-selected; users can toggle any paper (bookmarked or feed) in/out. Hover shows TL;DR. Caps at 2–5 papers. |
 | **Deep Dive** | Full research synthesis article for any Idea Capsule — multi-phase generation with LLM-as-judge refinement. Runs inline (streaming) or in the background. |
 | **Audio Podcast** | One-click podcast generation from any paper or Genie capsule. Multi-speaker HOST/EXPERT teaching conversation, expertise-adapted depth, orientation-shaped emphasis, OpenAI TTS voices. Runs in background; embeds in-page audio player when complete. |
 | **Slide Deck** | Marp-based slide deck generation. LLM plans and writes a presentation-grade deck (12–18 slides) with equations, results tables, diagrams, and methodology breakdown. Density guards prevent overflow. Rendered to standalone HTML via marp-cli (falls back to raw Markdown). |
 | **Annotations** | Highlight text in any paper and attach personal notes, accessible from the Paper Detail panel. |
-| **Research Assistant** | Persistent AI-native research workspace. Each session is a long-running investigation: messages, branching, background tool execution, retrieved papers, and synthesized artifacts all attached to one durable session. The assistant uses an LLM planner (with heuristic fallback) that selects from **41 registered tools** per turn — deep search, arXiv import, frontier scan, Genie synthesis (with **HITL approval gate**), concept explanation, paper comparison, web search, domain-specific tools (PubMed, NASA ADS, INSPIRE HEP, FRED, NVD CVE, ClinicalTrials, GitHub, HuggingFace, Wolfram Alpha), and more. On deep-tier turns a **ReAct mid-turn loop** (max 8 iterations, 90 s deadline) lets the model fan out, spawn context-quarantined subagents, run inline critique, and force full-paper verification on strong numeric / SOTA / causal claims through a 9-step middleware chain (param hygiene → tool ban → HITL gate → diminishing returns → paper ledger → retrieval observability → critic gate → contradiction detector → full-paper claim gate). Each tool call writes a checkpointed `AssistantStep` row; a crashed worker resumes from the last completed step on restart (tasks younger than 2 h are resumed automatically; older are marked failed). Sessions can be branched (up to 3 levels deep) from any message. Rolling conversation history is lazily compressed via LLM summarization (verbatim window: last 10 messages; summary regenerated only when older messages fall out of the window). File uploads (PDF, image, DOCX, plain text, code; 25 MB cap) are parsed and attached as session-scoped context. Every assistant turn streams typed `AssistantEvent` objects over SSE (plan, step, ReAct, HITL, message_delta). |
+| **Research Assistant** | Persistent AI-native research workspace. Each session is a long-running investigation: messages, branching, background tool execution, retrieved papers, and synthesized artifacts all attached to one durable session. The assistant uses an LLM planner (with heuristic fallback) that selects from **42 registered tools** per turn — deep search, arXiv import, frontier scan, Genie synthesis (with **HITL approval gate**), concept explanation, paper comparison, web search, domain-specific tools (PubMed, NASA ADS, INSPIRE HEP, FRED, NVD CVE, ClinicalTrials, GitHub, HuggingFace, Wolfram Alpha), and more. On deep-tier turns a **ReAct mid-turn loop** (max 8 iterations, 30-minute wall-clock deadline — generous on purpose for multi-round verification; subagents get 35–45 s) lets the model fan out, spawn context-quarantined subagents, run inline critique, and force full-paper verification on strong numeric / SOTA / causal claims through a 9-step middleware chain (param hygiene → tool ban → HITL gate → diminishing returns → paper ledger → retrieval observability → critic gate → contradiction detector → full-paper claim gate). Each tool call writes a checkpointed `AssistantStep` row; a crashed worker resumes from the last completed step on restart (tasks younger than 2 h are resumed automatically; older are marked failed). Sessions can be branched (up to 3 levels deep) from any message. Rolling conversation history is lazily compressed via LLM summarization (verbatim window: last 10 messages; summary regenerated only when older messages fall out of the window). File uploads (PDF, image, DOCX, plain text, code; 25 MB cap) are parsed and attached as session-scoped context. Every assistant turn streams typed `AssistantEvent` objects over SSE (plan, step, ReAct, HITL, message_delta). |
 | **Token Usage** | Per-call accounting of every LLM completion (input/output tokens, model, cost estimate, latency). Settings → **Token Usage** tab shows totals, daily bar chart, per-workflow and per-model breakdowns. Defaults to today; supports custom date ranges with quick presets (7 days, 30 days, year). |
 | **Settings** | Provider config, topic subscriptions, notifications, manual RSS refresh. |
 
@@ -166,16 +170,16 @@ is cut off.
 │   /assistant (sessions/messages/steps/SSE/HITL/attachments)      │
 │   /admin (panel + global settings) · /dev (gated)                │
 ├──────────────────────────────────────────────────────────────────┤
-│  Workflows — 6 LangGraph StateGraphs + async generators          │
-│   Ingestion · Study · RAG · Podcast · Slides                     │
-│   FolderConsolidation                                            │
-│   Genie · Genie-Combine · Deep Dive (async streaming generators) │
+│  Workflows — 7 LangGraph StateGraphs + async generators          │
+│   Ingestion · Study · RAG · Podcast · Slides ·                   │
+│   FolderConsolidation · Genie-Combine                            │
+│   Genie · Deep Dive (async streaming generators)                 │
 ├──────────────────────────────────────────────────────────────────┤
 │  Research Assistant — Persistent agentic workspace               │
 │   LLMPlanner (+ HeuristicPlanner fallback)                       │
 │   Orchestrator (parallel waves · 12-step / 180 s / 3-empty caps) │
-│   ReAct loop (8 iters / 90 s / 9-middleware chain)               │
-│   41-tool registry · namespace packs                             │
+│   ReAct loop (8 iters / 30 min / 9-middleware chain)             │
+│   42-tool registry · namespace packs                             │
 │   Synthesizer + claim ledger + provenance + repair-drift         │
 │   Recovery · Step cache · SSE bus · HITL inbox                   │
 ├──────────────────────────────────────────────────────────────────┤
@@ -499,7 +503,7 @@ Force-directed graph of your research space:
 | Amber | Methods |
 | Gray | Papers |
 
-Click "Expand" on any node to load its neighbors. Animated yellow edges = cross-namespace bridges (built weekly).
+Click "Expand" on any node to load its neighbors. Dashed violet edges = semantic `related_to` links between similar papers; dashed amber edges = the subset of those links that bridge two different namespaces (`cross_namespace=true`). Both are created during **Build Deep** (the `_build_related_edges` ANN pass), not by a separate weekly job — the `cross_namespace_weekly` cron is still a post-MVP scaffold.
 
 While a Build Deep job is active, the graph auto-reloads every 20 seconds to pick up intermediate commits. SUBTOPIC nodes with 0 children show an amber **"Building taxonomy…"** hint instead of "0 research areas" while the build is in progress.
 
@@ -704,7 +708,7 @@ asyncio.run(run_ingestion("cs.AI"))
 | `EMAIL_FROM` | `noreply@researchflow.ai` | ✗ | "From" address for transactional emails (PoTD, digest, breakthrough). |
 | `EMAIL_FROM_NAME` | `ResearchFlow` | ✗ | "From" display name. |
 | `LANGSMITH_PROJECT` | `researchflow` | ✗ | LangSmith project name when tracing is enabled. |
-| `LANGCHAIN_TRACING_V2` | `false` | ✗ | When `true`, LangChain + LangGraph runs trace to LangSmith. |
+| `LANGCHAIN_TRACING_V2` | `True` (code) / `false` (templates) | ✗ | Pydantic default is `True`, but both `.env.example` templates ship `false`. Either way tracing only actually runs when `LANGSMITH_API_KEY` is also set, so leaving it as the template's `false` keeps tracing off until you opt in. |
 | `ARXIV_MCP_TRANSPORT` | `stdio` | ✗ | Transport for the official arXiv MCP server: `stdio` (default — backend spawns the subprocess) or `sse`. |
 | `ARXIV_MCP_COMMAND` | `python -m arxiv_mcp_server --storage-path /data/papers` | ✗ | Subprocess invocation used when `ARXIV_MCP_TRANSPORT=stdio`. |
 | `ARXIV_MCP_URL` | `http://localhost:8765/sse` | ✗ | Endpoint used when `ARXIV_MCP_TRANSPORT=sse`. |
@@ -743,14 +747,38 @@ The switch from local to Azure is **env-var only** — zero code changes.
 | Scheduled jobs | Azure Container Apps Jobs running `python -c "from app.workflows.ingestion import run_all_ingestion; ..."` |
 | Queue (future) | Azure Service Bus — see `services/job_store.py` ABC for swap point |
 
-### Vector index migration (local IVFFlat → Azure HNSW)
+### Schema & vector index provisioning
+
+The startup lifespan (`backend/main.py`) is the source of truth for schema and
+indexes, and runs idempotently on **every** boot:
+
+- An **HNSW** vector index (`idx_chunks_embedding_hnsw`, `m=16,
+  ef_construction=64`, cosine ops) is created with `CREATE INDEX IF NOT EXISTS`
+  — locally **and** in the cloud. (If the pgvector build is too old for HNSW it
+  silently falls back to an exact scan.) There is no separate "IVFFlat → HNSW"
+  migration step; HNSW is the only index this codebase creates.
+- GIN full-text (`idx_papers_fts`), `pg_trgm` fuzzy-title, and composite
+  filtering indexes are also ensured here.
+- Additive `ADD COLUMN IF NOT EXISTS` guards patch the schema forward.
+
+> **Cloud caveat:** `create_all_tables()` (the SQLAlchemy `metadata.create_all`
+> baseline) only runs automatically when `ENVIRONMENT=local`. On a managed
+> cloud database with `ENVIRONMENT=azure` you must create the **tables**
+> out-of-band before first boot — run `python scripts/seed_db.py` once (it calls
+> `create_all_tables()` then seeds), or invoke `create_all_tables()` from a
+> one-off job. Note that `alembic upgrade head` does **not** bootstrap the
+> schema: the only revision (`001_add_wolfram_key`, `down_revision=None`) is an
+> incremental `ADD COLUMN` that assumes the baseline tables already exist. The
+> index/extension/`ADD COLUMN` guards above still run on every boot regardless
+> of environment.
+
+To re-tune HNSW for a large cloud corpus, rebuild with a higher build budget:
 
 ```sql
-DROP INDEX paper_chunks_emb_768;
-CREATE INDEX paper_chunks_emb_768_hnsw ON paper_chunks
+DROP INDEX IF EXISTS idx_chunks_embedding_hnsw;
+CREATE INDEX idx_chunks_embedding_hnsw ON paper_chunks
 USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64)
-WHERE embedding_dim = 768;
+WITH (m = 16, ef_construction = 128);
 ```
 
 ### Generation-specific Azure notes
@@ -874,6 +902,7 @@ research_flow/
 │       │   ├── study.py         # On-demand: parse→structure→explain→stream
 │       │   ├── rag.py           # On-demand: rewrite→retrieve→rerank→synthesize
 │       │   ├── genie.py         # Synthesis + Auto-batch + Deep Dive (custom async generators)
+│       │   ├── genie_combine.py  # 11-node StateGraph: fuse 2–3 existing IdeaCapsules into one
 │       │   ├── _generation_prompts.py # Shared prompts/heuristics for media gen
 │       │   ├── _generation_runtime.py # Queue/recovery helpers + orphan re-dispatch
 │       │   ├── podcast.py       # 5-node StateGraph + multi-turn segmented script + TTS
@@ -899,17 +928,18 @@ research_flow/
 │       │   ├── scheduler.py     # submit(job_id) / cancel(job_id) — in-process task runner
 │       │   ├── recovery.py      # Startup reconciliation of orphaned running/pending tasks
 │       │   ├── step_cache.py    # Per-tool result cache (TTL-keyed, Redis or local)
-│       │   ├── react_loop.py    # ReAct mid-turn THINK/ACT/OBSERVE loop (max 8 iters, 90 s deadline)
+│       │   ├── react_loop.py    # ReAct mid-turn THINK/ACT/OBSERVE loop (max 8 iters, 30-min deadline)
 │       │   ├── react/           # ReAct data model: state, middleware, investigation plan, subagents
 │       │   │   └── middlewares/ # 9 middlewares: param_preflight, tool_ban, hitl_gate, diminishing_returns,
 │       │   │                    #   paper_ledger, observability_mw, critic_gate, contradiction_mw, full_paper_gate
-│       │   └── tools/           # 41 registered AssistantTool implementations
+│       │   └── tools/           # 42 registered AssistantTool implementations
 │       │       ├── registry.py  # register_tool / get_tool / describe_for_planner
 │       │       ├── base.py      # AssistantTool protocol, ToolContext, ToolResult
 │       │       ├── namespace_packs.py # Domain-specific tool overlays per namespace
 │       │       └── *.py         # deep_search, arxiv_import, arxiv_search, paper_import, frontier_scan,
 │       │                        # concept_explain, compare_papers, genie_synthesize, genie_deep_dive,
-│       │                        # genie_read, genie_combine, paper_qa, study_paper, bookmarks_query,
+│       │                        # genie_read, genie_combine, paper_qa, deep_paper_analysis,
+│       │                        # study_paper, bookmarks_query,
 │       │                        # graph_build (planner-forbidden), graph_query, web_search,
 │       │                        # pubmed, inspire_hep, nasa_ads, fred, nvd_cve, clinicaltrials,
 │       │                        # github_search, huggingface_search, wolfram_alpha, wikipedia,

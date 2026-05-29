@@ -272,12 +272,21 @@ def _render_agent_notes(agent_notes: dict | None) -> str:
     if contras:
         parts.append(
             "- CONTRADICTIONS detected across retrieved evidence — call them "
-            "out in the answer rather than picking a side silently:"
+            "out in the answer rather than picking a side silently. RESOLUTION "
+            "RULES (the user explicitly asks for this):\n"
+            "    • If a contradiction was investigated and the evidence now "
+            "favours one side, state the resolved position and briefly note "
+            "what was contested.\n"
+            "    • If a contradiction is still UN-investigated, you MUST "
+            "DOWNGRADE the affected conclusion — present it as contested / "
+            "provisional (hedge the wording, e.g. \"evidence is mixed\"), never "
+            "as a settled fact. Do not silently pick the side that fits the "
+            "narrative."
         )
         for c in contras[:4]:
             span = str(c.get("span") or "").strip()
             srcs = ", ".join(map(str, c.get("sources") or []))[:120]
-            flag = " (addressed by counter-search)" if c.get("addressed") else " (UN-investigated)"
+            flag = " (addressed by counter-search)" if c.get("addressed") else " (UN-investigated — downgrade the affected claim)"
             parts.append(f"    • {span[:220]}{flag} [{srcs}]")
     # Strong-claim ledger — full-paper verification verdicts. The
     # synthesizer reads this to distinguish "verified against paper
@@ -686,7 +695,11 @@ def _strip_unresolvable_citations(
     cleaned = re.sub(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]", _replace_paper, cleaned)
     # Tidy: orphan punctuation left behind when we dropped a marker
     # (``"...baseline ." → "...baseline."``, ``"...sentence  ;" → "...sentence;"``).
-    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    # Use ``[^\S\n]+`` (horizontal whitespace only) rather than ``\s+`` so a
+    # dropped marker at a line end can't pull the next line's punctuation up
+    # and collapse an intended line break — the final answer must stay
+    # correctly newlined for readability.
+    cleaned = re.sub(r"[^\S\n]+([.,;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned
 

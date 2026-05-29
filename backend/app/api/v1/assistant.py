@@ -91,7 +91,7 @@ async def get_session_hierarchy(
     ancestor path and any descendants under it — NEVER sibling
     branches that share a parent but aren't on its line.
 
-    Shape:
+    Shape::
 
         {
           "current_id": "...",

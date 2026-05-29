@@ -89,6 +89,34 @@ async def parse_with_fallback(pdf_bytes: bytes) -> ParsedPaper:
     Returns:
         Best-effort ``ParsedPaper``.
     """
+    # Magic-byte guard. Callers fetch ``paper.pdf_url`` over the network;
+    # a non-200 error page, a redirect stub, or a paywall/landing page can
+    # return HTML (or empty) bytes — sometimes even with a 200 status.
+    # Feeding those into the parser chain wastes an expensive Gemini Vision
+    # OCR call and, worse, can yield hallucinated "sections" that get
+    # persisted as RAG chunks, silently poisoning retrieval grounding. A
+    # real PDF carries the ``%PDF-`` signature in its first bytes (Adobe
+    # scans the first 1 KB), so reject anything without it and degrade to
+    # the same minimal result the all-parsers-failed path returns.
+    if not pdf_bytes or b"%PDF" not in pdf_bytes[:1024]:
+        log.warning(
+            "parse_with_fallback: input is not a PDF (len=%d head=%r) — "
+            "skipping parse, returning minimal result",
+            len(pdf_bytes or b""), (pdf_bytes[:16] if pdf_bytes else b""),
+        )
+        return ParsedPaper(
+            title="(not a pdf)",
+            sections=[Section(
+                section_type="abstract",
+                content="Document was not a valid PDF. Using abstract from metadata.",
+            )],
+            references=[],
+            figures=[],
+            parser_name="none",
+            fallback_used=False,
+            parser_confidence=0.0,
+        )
+
     chosen = (settings.pdf_parser or "marker").lower()
     chain: list[tuple[str, PDFParser, float]] = []
     seen: set[str] = set()

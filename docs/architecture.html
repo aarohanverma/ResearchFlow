@@ -352,7 +352,7 @@ details[open] summary::before{transform:rotate(90deg)}
     <tr><td><strong>RAG Chat</strong></td><td>Query rewrite → intent classify → 3-tier scoped retrieval → graph augment → LLM rerank → Self-RAG check → cited synthesis</td><td><code>workflows/rag.py</code></td></tr>
     <tr><td><strong>Genie</strong></td><td>Seed elements → bridge discovery → hypothesis generation → LLM critique → elaboration → diagrams → PoC code → saved IdeaCapsule</td><td><code>workflows/genie.py</code></td></tr>
     <tr><td><strong>Deep Dive</strong></td><td>Single-pass: reasoning model writes a complete 11-section synthesis article grounded in the source paper text, streams tokens to the frontend, persists result to <code>idea_capsules.deep_dive_content</code></td><td><code>workflows/genie.py:run_deep_dive</code></td></tr>
-    <tr><td><strong>Research Assistant</strong></td><td>Persistent workspace per session. LLM planner selects from 41 tools per turn; orchestrator executes steps in parallel waves (12-step / 180 s / 3-empty caps), writes per-step checkpoint rows, runs a bounded ReAct loop on deep-tier turns (8 iters, 90 s, 9-middleware chain including HITL gate + full-paper claim verification), and synthesizes a block-rendered answer with evidence/inference labelling. Crashed workers resume from last completed step (tasks &lt; 2 h). Sessions branch up to 3 levels deep. File uploads (PDF, image, text, DOCX; 25 MB cap) parsed and attached as session context.</td><td><code>assistant/orchestrator.py</code> · <code>assistant/react_loop.py</code> · <code>assistant/tools/</code></td></tr>
+    <tr><td><strong>Research Assistant</strong></td><td>Persistent workspace per session. LLM planner selects from 42 tools per turn; orchestrator executes steps in parallel waves (12-step / 180 s / 3-empty caps), writes per-step checkpoint rows, runs a bounded ReAct loop on deep-tier turns (8 iters, 30-min wall-clock deadline, 9-middleware chain including HITL gate + full-paper claim verification), and synthesizes a block-rendered answer with evidence/inference labelling. Crashed workers resume from last completed step (tasks &lt; 2 h). Sessions branch up to 3 levels deep. File uploads (PDF, image, text, DOCX; 25 MB cap) parsed and attached as session context.</td><td><code>assistant/orchestrator.py</code> · <code>assistant/react_loop.py</code> · <code>assistant/tools/</code></td></tr>
   </table>
 
   <div class="callout callout-anchor">
@@ -405,8 +405,8 @@ details[open] summary::before{transform:rotate(90deg)}
       <div class="arch-layer-num">3</div>
       <div>
         <div class="arch-layer-name" style="color:var(--purple)">Workflows (LangGraph)</div>
-        <div class="arch-layer-desc">6 LangGraph StateGraph workflows: Ingestion · Study · RAG · Podcast · Slides · FolderConsolidation. Each is a compiled graph of typed async node functions, with the podcast/slides graphs persisted through an async PostgreSQL <code>BaseCheckpointSaver</code> so a crashed worker resumes from the last completed node. Genie synthesis and Deep Dive are custom async streaming generators in <code>workflows/genie.py</code>, not StateGraphs.</div>
-        <div class="arch-layer-files">backend/app/workflows/ingestion.py · rag.py · study.py · podcast.py · slides.py · folder_consolidation.py · genie.py</div>
+        <div class="arch-layer-desc">7 LangGraph StateGraph workflows: Ingestion · Study · RAG · Podcast · Slides · FolderConsolidation · Genie-Combine. Each is a compiled graph of typed async node functions, with the podcast/slides graphs persisted through an async PostgreSQL <code>BaseCheckpointSaver</code> so a crashed worker resumes from the last completed node. Genie synthesis and Deep Dive are custom async streaming generators in <code>workflows/genie.py</code>, not StateGraphs.</div>
+        <div class="arch-layer-files">backend/app/workflows/ingestion.py · rag.py · study.py · podcast.py · slides.py · folder_consolidation.py · genie_combine.py · genie.py</div>
       </div>
     </div>
     <div class="arch-layer layer-4">
@@ -433,7 +433,7 @@ details[open] summary::before{transform:rotate(90deg)}
       <div>
         <div class="arch-layer-name" style="color:var(--red)">Database</div>
         <div class="arch-layer-desc">Single PostgreSQL 16 + pgvector instance. The relational data, knowledge graph, and 768-dim vector index all coexist. No separate Neo4j / Pinecone / Weaviate.</div>
-        <div class="arch-layer-files">docker-compose.yml → db service · pgvector extension · HNSW index on paper_chunks.embedding (m=16, ef_construction=64) with IVFFlat/exact-scan fallback</div>
+        <div class="arch-layer-files">docker-compose.yml → db service · pgvector extension · HNSW index on paper_chunks.embedding (m=16, ef_construction=64), created idempotently by the startup lifespan with an exact-scan fallback if the pgvector build lacks HNSW</div>
       </div>
     </div>
   </div>
@@ -502,7 +502,7 @@ graph TB
       distributed-transaction complexity, simplifies ops (one backup, one migration system),
       and lets joins happen in-process rather than via network round-trips. pgvector's
       HNSW index (m=16, ef_construction=64) gives approximate nearest-neighbour search fast enough for the load
-      ResearchFlow targets, with IVFFlat/exact-scan fallback when pgvector HNSW is unavailable. The cost is that switching to a specialized vector store later
+      ResearchFlow targets, falling back to an exact scan when pgvector HNSW is unavailable. The cost is that switching to a specialized vector store later
       (Pinecone, Weaviate) would require a migration — a deliberate trade-off for an
       early-stage system that values operational simplicity over peak retrieval throughput.
     </p>
@@ -547,7 +547,7 @@ graph TB
     </div>
     <div class="tech-card">
       <div class="tech-card-name" style="color:var(--cyan)">APScheduler</div>
-      <div class="tech-card-role">In-process async cron · nightly ingestion · weekly clustering</div>
+      <div class="tech-card-role">In-process async cron · nightly ingestion · weekly memory consolidation + bookmark re-embed (clustering/cross-namespace crons are post-MVP stubs)</div>
       <div class="tech-card-why">Simple cron inside FastAPI lifespan; swappable for Celery/Azure Container Jobs in prod</div>
     </div>
     <div class="tech-card">
@@ -1064,7 +1064,7 @@ erDiagram
   <table>
     <tr><th>Table</th><th>Role</th><th>Notes</th></tr>
     <tr><td><code>knowledge_nodes</code></td><td>Polymorphic — TOPIC / SUBTOPIC / CONCEPT / METHOD / PAPER</td><td>For PAPER nodes, <code>paper_id</code> FKs back to <code>papers</code>. For others, <code>label</code> is canonical text used for embedding + display. <code>UniqueConstraint(label, node_type, namespace_key)</code>.</td></tr>
-    <tr><td><code>knowledge_edges</code></td><td>Directed typed edges</td><td><code>edge_type</code> ∈ has_subtopic, belongs_to, introduces, uses_method, cites, related_to. <code>weight</code> = cosine similarity for related_to edges. <code>cross_namespace</code> flag set by the weekly cross-namespace job.</td></tr>
+    <tr><td><code>knowledge_edges</code></td><td>Directed typed edges</td><td><code>edge_type</code> ∈ has_subtopic, belongs_to, introduces, uses_method, cites, related_to. <code>weight</code> = cosine similarity for related_to edges. <code>cross_namespace</code> flag is set during graph build by <code>_build_related_edges</code> (true when a similar paper lives in a different namespace) — not by the weekly cross-namespace cron, which is still a post-MVP stub.</td></tr>
     <tr><td><code>source_mappings</code></td><td>Maps internal namespace_key → external arXiv category</td><td>e.g. <code>cs.ML</code> → arXiv RSS feed <code>cs.LG</code>. Lets us decouple display labels from source feeds.</td></tr>
   </table>
 
@@ -1404,7 +1404,7 @@ rag_graph <span class="op">=</span> _build_rag_graph()</code></pre>
 <span class="kw">return</span> state</code></pre>
 
   <h3>The eight workflow modules in this codebase</h3>
-  <p>Six are compiled LangGraph <code>StateGraph</code> instances (Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation). Two (Genie synthesis, Deep Dive) are custom async streaming generators in <code>genie.py</code>. Generation graphs (podcast, slides) attach an async PostgreSQL checkpoint saver so each node's state is persisted — a crashed worker resumes from the last completed node rather than wasting tokens on already-paid work.</p>
+  <p>Seven are compiled LangGraph <code>StateGraph</code> instances (Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation, Genie-Combine). The eighth — <code>genie.py</code> — holds two custom async streaming generators (Genie synthesis, Deep Dive) rather than a compiled graph. Generation graphs (podcast, slides) attach an async PostgreSQL checkpoint saver so each node's state is persisted — a crashed worker resumes from the last completed node rather than wasting tokens on already-paid work.</p>
   <div class="diagram-wrap">
     <div class="diagram-title">State types &amp; their workflow files</div>
     <div class="mermaid">
@@ -1416,14 +1416,16 @@ flowchart LR
     PS["<b>PodcastState</b><br/>user_id<br/>source_type<br/>source_id<br/>expertise_level<br/>orientation<br/>artifact_id<br/>content_text<br/>episode_plan<br/>script_segments<br/>audio_bytes<br/>blob_path"]
     SLS["<b>SlidesState</b><br/>user_id<br/>source_type<br/>source_id<br/>expertise_level<br/>orientation<br/>artifact_id<br/>content_text<br/>deck_plan<br/>marp_markdown<br/>rendered_html<br/>blob_path"]
     FCS["<b>FolderAnalysisState</b><br/>folder_id<br/>user_id<br/>paper_ids_override<br/>papers<br/>coherence_report<br/>consolidated_content<br/>error"]
+    CS["<b>CombineState</b><br/>user_id<br/>capsule_ids<br/>session_id<br/>capsules<br/>distilled<br/>namespace_ok<br/>feasibility<br/>paper_chunks<br/>fused<br/>diagrams<br/>combined_capsule_id"]
 
     IW["<b>ingestion.py</b><br/>StateGraph · 7 nodes + error<br/>run_ingestion(ns)"]
-    RW["<b>rag.py</b><br/>StateGraph · 9 nodes + topic gate<br/>run_rag / run_rag_stream"]
+    RW["<b>rag.py</b><br/>StateGraph · 9 nodes (topic-gated)<br/>run_rag / run_rag_stream"]
     SW["<b>study.py</b><br/>StateGraph · 7 nodes<br/>run_study (SSE)"]
     GW["<b>genie.py (generators)</b><br/>run_genie (SSE)<br/>run_genie_background<br/>run_deep_dive (SSE)"]
     PW["<b>podcast.py</b><br/>StateGraph · 5 nodes<br/>+ async pg checkpointer<br/>queue_podcast"]
     SLW["<b>slides.py</b><br/>StateGraph · 4 nodes<br/>+ async pg checkpointer<br/>queue_slides"]
     FCW["<b>folder_consolidation.py</b><br/>StateGraph · 3 nodes<br/>run_folder_analysis"]
+    GCW["<b>genie_combine.py</b><br/>StateGraph · 11 nodes<br/>run_capsule_combine_background"]
 
     IW ==>|"threads"| IS
     RW ==>|"threads"| RS
@@ -1432,6 +1434,7 @@ flowchart LR
     PW ==>|"threads"| PS
     SLW ==>|"threads"| SLS
     FCW ==>|"threads"| FCS
+    GCW ==>|"threads"| CS
 
     style IS fill:#0d2137,stroke:#58a6ff,color:#e6edf3
     style RS fill:#0d2e1a,stroke:#3fb950,color:#e6edf3
@@ -1447,7 +1450,9 @@ flowchart LR
     style SLW fill:#21262d,stroke:#3fd9d9,color:#e6edf3
     style FCS fill:#0d211a,stroke:#56d364,color:#e6edf3
     style FCW fill:#21262d,stroke:#56d364,color:#e6edf3
-    </div>
+    style CS fill:#130d21,stroke:#bc8cff,color:#e6edf3
+    style GCW fill:#21262d,stroke:#bc8cff,color:#e6edf3
+</div>
   </div>
 
   <h3>Why LangGraph in this codebase</h3>
@@ -1796,10 +1801,12 @@ graph LR
 
   <h3>Full state diagram (UML)</h3>
   <div class="diagram-wrap">
-    <div class="diagram-title">RAG StateGraph · 7 nodes + conditional retry</div>
+    <div class="diagram-title">RAG StateGraph · 9 nodes + conditional retry</div>
     <div class="mermaid">
 stateDiagram-v2
-    [*] --> rewrite_query : raw_query
+    [*] --> topic_gate : raw_query
+    topic_gate --> rewrite_query : on-topic
+    topic_gate --> refuse_off_topic : off-topic
     rewrite_query --> classify_intent : rewritten_query
     classify_intent --> vector_retrieve : intent ∈ INTENTS
     vector_retrieve --> graph_retrieve : chunks + scope_level
@@ -1808,6 +1815,7 @@ stateDiagram-v2
     self_rag_check --> synthesize : passed OR retry exhausted
     self_rag_check --> vector_retrieve : retry with wider scope
     synthesize --> [*] : answer + citation_paper_ids
+    refuse_off_topic --> [*] : scope refusal
     note right of self_rag_check
         YES/NO sufficiency check
         retry up to 1 time
@@ -4635,7 +4643,9 @@ breakthrough_threshold: float <span class="op">=</span> Field(default<span class
     <tr><td><code>ENVIRONMENT</code></td><td><code>local</code></td><td><code>azure</code></td></tr>
   </table>
   <p>
-    Zero code changes. The vector index migration (IVFFlat → HNSW) is a one-shot SQL
+    Zero code changes. The HNSW vector index is created by the startup lifespan on
+    every boot (local and cloud alike), so there is no separate index migration to
+    run; re-tuning HNSW build parameters for a larger corpus is a one-shot SQL
     statement, not a code change.
   </p>
 
@@ -4687,7 +4697,10 @@ breakthrough_threshold: float <span class="op">=</span> Field(default<span class
     <tr><td><code>clustering_weekly</code></td><td><code>0 5 * * 0</code> (Sun 05:00 UTC)</td><td><code>_run_clustering</code></td><td>Stub — will run HDBSCAN subtopic discovery (post-MVP)</td></tr>
     <tr><td><code>cross_namespace_weekly</code></td><td><code>30 5 * * 0</code> (Sun 05:30 UTC)</td><td><code>_run_cross_namespace_links</code></td><td>Stub — will compute concept-bridge edges via cosine similarity (post-MVP)</td></tr>
     <tr><td><code>bookmark_index_rebuild_weekly</code></td><td>Sun 03:00 UTC (hardcoded)</td><td><code>_rebuild_bookmark_index</code></td><td>Re-embeds bookmarked papers that are missing an abstract chunk</td></tr>
+    <tr><td><code>memory_consolidation_weekly</code></td><td>Sun 04:30 UTC (hardcoded)</td><td><code>_run_memory_consolidation</code></td><td>Clusters + LLM-merges related session-memory entries across every user's chat/tree/namespace tiers so the store grows by summary, not raw events</td></tr>
+    <tr><td><code>checkpoint_cleanup_monthly</code></td><td>Day 1, 04:00 UTC (hardcoded)</td><td><code>_cleanup_checkpoints</code></td><td>Deletes LangGraph checkpoint threads older than 30 days to bound the three checkpoint tables</td></tr>
   </table>
+  <p>Six jobs total. Only the first three schedules are environment-configurable (<code>INGESTION_CRON</code> / <code>CLUSTERING_CRON</code> / <code>CROSS_NAMESPACE_CRON</code>); the last three are hardcoded.</p>
 
   <h3>Lifespan integration</h3>
   <div class="diagram-wrap">
@@ -5010,7 +5023,7 @@ sequenceDiagram
   <p>
     Unlike a chatbot, the RA's intelligence is its <strong>planner</strong> and its power is its
     <strong>tool surface</strong>. An LLM planner (with a heuristic fallback that never fails)
-    selects from 41 registered tools per turn, groups them into parallel execution waves, and
+    selects from 42 registered tools per turn, groups them into parallel execution waves, and
     then a synthesizer composes the step results into a block-rendered final message with inline citations.
   </p>
 
@@ -5046,7 +5059,7 @@ flowchart LR
     SCHED["Scheduler<br/>(asyncio tasks)"]
     ORCH["Orchestrator<br/>run_turn()"]
     PLAN["LLMPlanner<br/>(+ HeuristicPlanner fallback)"]
-    REG[("Tool Registry<br/>41 tools")]
+    REG[("Tool Registry<br/>42 tools")]
     CACHE[("StepCache<br/>per-tool TTL")]
     SYN["Synthesizer<br/>(stream + blocks)"]
     BUS{{"AssistantEvent bus<br/>(in-process pub/sub)"}}
@@ -5507,7 +5520,7 @@ flowchart TD
   <table>
     <tr><th>Knob (<code>ReactConfig</code>)</th><th>Default</th><th>Meaning</th></tr>
     <tr><td><code>max_iterations</code></td><td>8</td><td>Hard cap on THINK / ACT / OBSERVE cycles</td></tr>
-    <tr><td><code>deadline_seconds</code></td><td>90.0</td><td>Wall-clock budget</td></tr>
+    <tr><td><code>deadline_seconds</code></td><td>1800.0</td><td>Wall-clock budget (30 min — deliberately generous for a deep turn with several full-paper verification rounds. The orchestrator builds <code>ReactConfig</code> without overriding it, so 30 min is the live default; subagents use 35–45 s.)</td></tr>
     <tr><td><code>_MIN_ITERS_BEFORE_FREE_FINALIZE</code></td><td>3</td><td>No free finalize before iter 3 — the loop forces a critique first</td></tr>
     <tr><td><code>_MAX_FANOUT_BRANCHES</code></td><td>4</td><td>Hard cap on parallel branches per fanout action</td></tr>
   </table>
@@ -5803,10 +5816,10 @@ flowchart LR
   <div class="section-tag">End</div>
   <h2>Bringing it together</h2>
   <p>
-    You now have the full picture: six layers, eight workflow modules (six LangGraph
-    StateGraphs — Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation — plus the
-    Genie synthesis and Deep Dive async generators), a persistent Research Assistant
-    layer with 41 tools, an LLM planner with heuristic fallback, six new
+    You now have the full picture: six layers, eight workflow modules (seven LangGraph
+    StateGraphs — Ingestion, RAG, Study, Podcast, Slides, FolderConsolidation, Genie-Combine —
+    plus the <code>genie.py</code> async generators for Genie synthesis and Deep Dive), a
+    persistent Research Assistant layer with 42 tools, an LLM planner with heuristic fallback, six new
     <code>assistant_*</code> tables (sessions, messages, tasks, steps, attachments, artifacts),
     typed SSE event streaming, per-step checkpointed resume, ten adapter families, seven
     repositories, one PostgreSQL 16 database with pgvector HNSW index, a knowledge graph,

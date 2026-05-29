@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import TypedDict
 from uuid import UUID
 
@@ -59,8 +60,48 @@ log = logging.getLogger(__name__)
 # Side channel for audio bytes — LangGraph checkpoints state between nodes, so
 # storing large binary audio in PodcastState causes asyncpg to timeout trying
 # to write megabytes of data to the checkpoint table.  Instead we keep audio
-# in this in-memory dict (keyed by artifact_id) and clear it after upload.
-_AUDIO_BUFFER: dict[str, bytes] = {}
+# in this in-memory map (keyed by artifact_id) and pop it after upload.
+#
+# The map is self-bounding: each entry is stamped with an insertion time and
+# the writer reclaims entries older than ``_AUDIO_BUFFER_TTL_S`` plus enforces
+# a hard ``_AUDIO_BUFFER_MAX`` cap (oldest-first). Without this, a run that
+# fails or is cancelled between ``synthesize_audio`` (writer) and
+# ``save_artifact`` (reader) would strand multi-MB audio in the process
+# forever — an unbounded memory leak that compounds across repeated failures.
+_AUDIO_BUFFER: dict[str, tuple[float, bytes]] = {}
+_AUDIO_BUFFER_TTL_S = 3600.0   # abandoned entries are reclaimed after 1h
+_AUDIO_BUFFER_MAX = 32         # hard cap on retained episodes
+
+
+def _audio_buffer_put(artifact_id: str, audio: bytes) -> None:
+    """Buffer ``audio`` for later pickup by ``save_artifact``, bounding the map.
+
+    Reclaims entries older than ``_AUDIO_BUFFER_TTL_S`` and, if still at the
+    ``_AUDIO_BUFFER_MAX`` cap, evicts the oldest. Bounding on every write means
+    a failed or cancelled run that never reaches ``save_artifact`` cannot leak
+    audio indefinitely.
+
+    Side effects:
+        Mutates the module-level ``_AUDIO_BUFFER`` (may evict other entries).
+    """
+    now = time.monotonic()
+    stale = [k for k, (ts, _) in _AUDIO_BUFFER.items() if now - ts > _AUDIO_BUFFER_TTL_S]
+    for k in stale:
+        _AUDIO_BUFFER.pop(k, None)
+    if len(_AUDIO_BUFFER) >= _AUDIO_BUFFER_MAX:
+        # Evict oldest-first until there is room for the new entry.
+        overflow = sorted(_AUDIO_BUFFER, key=lambda k: _AUDIO_BUFFER[k][0])[
+            : len(_AUDIO_BUFFER) - _AUDIO_BUFFER_MAX + 1
+        ]
+        for k in overflow:
+            _AUDIO_BUFFER.pop(k, None)
+    _AUDIO_BUFFER[artifact_id] = (now, audio)
+
+
+def _audio_buffer_pop(artifact_id: str) -> bytes | None:
+    """Remove and return buffered audio for ``artifact_id`` (``None`` if absent)."""
+    item = _AUDIO_BUFFER.pop(artifact_id, None)
+    return item[1] if item else None
 
 # Human-readable label per source type — used in prompts so the LLM names
 # the source correctly rather than always calling it a "paper".
@@ -1272,7 +1313,7 @@ async def _synthesize_audio(state: PodcastState) -> PodcastState:
     # Store in side channel instead of state — keeps audio out of the
     # LangGraph checkpoint so the DB write doesn't timeout on large MP3s.
     if audio_bytes:
-        _AUDIO_BUFFER[state["artifact_id"]] = audio_bytes
+        _audio_buffer_put(state["artifact_id"], audio_bytes)
     state["audio_bytes"] = None  # never checkpoint binary audio
     log.info(
         "podcast.synthesize_audio utterances=%d audio_kb=%d",
@@ -1352,7 +1393,7 @@ async def _save_artifact(state: PodcastState) -> PodcastState:
 
     blob_path: str | None = None
     # Read from side channel (bypasses checkpointer); state["audio_bytes"] is always None here.
-    audio_bytes = _AUDIO_BUFFER.pop(state["artifact_id"], None) or state.get("audio_bytes")
+    audio_bytes = _audio_buffer_pop(state["artifact_id"]) or state.get("audio_bytes")
 
     if audio_bytes:
         try:

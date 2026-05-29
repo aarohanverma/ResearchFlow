@@ -70,6 +70,7 @@ class UserRepository:
             email=email.lower(),
             hashed_password=hashed_password,
             display_name=display_name,
+            onboarding_complete=True,
         )
         self._db.add(user)
         await self._db.flush()

@@ -70,9 +70,16 @@ async def complete_onboarding(body: OnboardingRequest, user_id: CurrentUserID, d
     from sqlalchemy import select
     for ns_key in namespace_keys:
         existing = await db.execute(
-            select(SourceMapping).where(SourceMapping.namespace_key == ns_key)
+            select(SourceMapping).where(
+                SourceMapping.namespace_key == ns_key,
+                SourceMapping.source_name == "arxiv_rss",
+            )
         )
-        if not existing.scalar_one_or_none():
+        # A namespace_key has one row per source_name (arxiv_rss, arxiv_mcp),
+        # so an unfiltered existence check matched multiple rows and raised
+        # MultipleResultsFound. Filter to the row we insert and use .first()
+        # for resilience against pre-existing duplicates.
+        if not existing.scalars().first():
             arxiv_cat = ns_manager.arxiv_category(ns_key) or ns_key
             db.add(SourceMapping(
                 namespace_key=ns_key,
@@ -412,9 +419,16 @@ async def update_subscriptions(
     from sqlalchemy import select
     for ns_key in valid:
         existing = await db.execute(
-            select(SourceMapping).where(SourceMapping.namespace_key == ns_key)
+            select(SourceMapping).where(
+                SourceMapping.namespace_key == ns_key,
+                SourceMapping.source_name == "arxiv_rss",
+            )
         )
-        if not existing.scalar_one_or_none():
+        # A namespace_key has one row per source_name (arxiv_rss, arxiv_mcp),
+        # so an unfiltered existence check matched multiple rows and raised
+        # MultipleResultsFound. Filter to the row we insert and use .first()
+        # for resilience against pre-existing duplicates.
+        if not existing.scalars().first():
             arxiv_cat = ns_manager.arxiv_category(ns_key) or ns_key
             db.add(SourceMapping(
                 namespace_key=ns_key,
@@ -1387,6 +1401,7 @@ class MemoryClearRequest(BaseModel):
       * ``tier="long"`` + no namespace      → clear every namespace bucket.
       * ``tier="medium"``                   → clear the tree_memory bucket.
       * ``tier="all"``                      → clear medium AND long.
+
     Short-term (chat) memory is intentionally NOT clearable here — it
     lives on individual chat sessions and is auto-pruned on session
     end. The user spec explicitly says clearing long-term memory must

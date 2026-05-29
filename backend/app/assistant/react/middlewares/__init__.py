@@ -1,20 +1,23 @@
 """Concrete middlewares assembled into the default ReAct chain.
 
-Order matters — the default chain is::
+Order matters — the default chain (see ``default_chain_factory``) is::
 
     1. ParamPreflight             (placeholder strip + auto-fill from ledger)
     2. ToolBan                    (block banned tools, redirect or abort)
-    3. DiminishingReturns         (skip identical-param redo; stop on no-new-IDs)
-    4. RetrievalObservability     (record per-call coverage / dispersion / rerank)
-    5. ContradictionDetector      (lexical + numeric + LLM semantic; adaptive force)
-    6. CriticGate                 (force critique before too-early finalize)
-    7. PaperLedger                (accumulate paper IDs from results)
+    3. HitlGate                   (pause for user approval, e.g. genie_synthesize)
+    4. DiminishingReturns         (skip identical-param redo; stop on no-new-IDs)
+    5. PaperLedger                (accumulate paper IDs from results)
+    6. RetrievalObservability     (record per-call coverage / dispersion / rerank)
+    7. CriticGate                 (force critique before too-early finalize)
+    8. ContradictionDetector      (lexical + numeric + LLM semantic; adaptive force)
+    9. FullPaperVerification      (force paper_qa on abstract-only strong claims at finalize)
 
 Earlier middlewares get the first say on ``before_tool`` (param fixing
-runs before ban checks; ban checks run before redundancy checks).
-``gate_finalize`` walks the same order — critique gate fires before
-contradiction-forced-counter-search so a sufficient-evidence turn
-isn't kept open just to verify a soft contradiction.
+runs before ban checks; ban checks run before the HITL pause and the
+redundancy check). ``gate_finalize`` walks the same order — critique gate
+fires before contradiction-forced counter-search (so a sufficient-evidence
+turn isn't kept open just to verify a soft contradiction), and
+full-paper verification fires last.
 
 Each middleware is independently testable and disable-able (env flag
 or per-call list omission). New cross-cutting concerns become one file

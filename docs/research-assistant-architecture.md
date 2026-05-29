@@ -21,7 +21,7 @@ The RA is the product surface that unifies all other ResearchFlow capabilities. 
 | `backend/app/assistant/react/` | ReAct loop data model — `state.py`, `middleware.py`, `investigation_plan.py`, `subagents.py`, `subagent_runner.py` |
 | `backend/app/assistant/react/middlewares/` | Concrete middleware files — `param_preflight`, `tool_ban`, `hitl_gate`, `diminishing_returns`, `paper_ledger`, `observability_mw`, `critic_gate`, `contradiction_mw`, `full_paper_gate` |
 | `backend/app/assistant/react_loop.py` | The loop driver itself — `ReactConfig`, `ReactOutcome`, `run_react_loop()` |
-| `backend/app/assistant/tools/` | 41 registered `AssistantTool` implementations + registry + namespace packs |
+| `backend/app/assistant/tools/` | 42 registered `AssistantTool` implementations + registry + namespace packs |
 | `backend/app/services/research_assistant.py` | Session/message/task bookkeeping and JobStore integration |
 | `backend/app/services/arxiv_import.py` | ArxivImportService — search + import pipeline used by the RA |
 | `backend/app/models/assistant.py` | All ORM models: session, message, task, step, attachment, artifact |
@@ -123,7 +123,7 @@ class AssistantTool(Protocol):
 
 `ToolContext` carries session ID, user ID, namespace, topic keys, orientation, expertise level, job ID, DB session factory, `should_cancel()` coroutine, and `emit_progress()` coroutine.
 
-### Registered tools (41 total)
+### Registered tools (42 total)
 
 Counted from `app.assistant.tools.__init__` at boot. The registry is the source of truth; the list below mirrors the live state at the time of writing. Two academically obvious tools are intentionally *not* registered:
 
@@ -134,7 +134,7 @@ Counted from `app.assistant.tools.__init__` at boot. The registry is the source 
 
 `paper_import` is the manual-import button as a tool: takes a list of arXiv IDs/URLs (max 10), runs the full ingestion pipeline, and flags each paper with `is_manually_imported=True`. Use it when a citation tool or the user supplied specific IDs; use `arxiv_import` for search-and-import.
 
-**Synthesis & writing** — `concept_explain`, `compare_papers`, `genie_synthesize`, `genie_deep_dive`, `genie_read`, `genie_combine`, `paper_qa`, `bookmarks_query`, `literature_survey`, `draft_section`, `study_paper`
+**Synthesis & writing** — `concept_explain`, `compare_papers`, `genie_synthesize`, `genie_deep_dive`, `genie_read`, `genie_combine`, `paper_qa`, `deep_paper_analysis`, `bookmarks_query`, `literature_survey`, `draft_section`, `study_paper`
 
 `graph_build` is registered but **planner-forbidden** — it remains in `/assistant/tools` for operator visibility; the planner_llm forbidden set keeps it out of generated plans (it's a multi-minute background job that has its own UI trigger).
 
@@ -251,7 +251,7 @@ Loops until the model finalises, the iteration cap is hit, or the wall-clock dea
 | Field | Default | Meaning |
 |---|---|---|
 | `max_iterations` | 8 | Hard cap on THINK/ACT/OBSERVE cycles |
-| `deadline_seconds` | 90.0 | Wall-clock budget |
+| `deadline_seconds` | 1800.0 | Wall-clock budget (30 min — intentionally generous so a deep turn with several full-paper verification rounds can finish; per-tool timeouts derive from the remaining budget, and infra timeouts still bound any single hang). The orchestrator constructs `ReactConfig` without overriding this, so 30 min is the live default for a normal turn; subagents use much shorter budgets (35–45 s). |
 | `_MIN_ITERS_BEFORE_FREE_FINALIZE` | 3 | A turn cannot finalize before iter 3 without a critique |
 | `_MAX_FANOUT_BRANCHES` | 4 | Hard cap on parallel branches per fanout action |
 
@@ -271,7 +271,7 @@ The loop wraps every iteration in a 9-step middleware chain composed by `default
 | 6 | `RetrievalObservability` | Records per-call coverage, dispersion, and rerank disagreement so the synth can downgrade confidence on thin retrievals |
 | 7 | `CriticGate` | Forces one critique step before a too-early finalize |
 | 8 | `ContradictionDetector` | Lexical + numeric + LLM-semantic; can force at most one counter-search on a high-confidence open signal |
-| 9 | `FullPaperVerification` | At finalize, inspects every strong claim in the claim ledger and forces up to **2** `paper_qa` rounds (`_MAX_FORCED_PAPER_QA_PER_TURN = 2`) on those whose source was only the abstract/snippet; remaining strong claims without chunk-level evidence are labelled `unverifiable` so the synth caveats them |
+| 9 | `FullPaperVerification` | At finalize, inspects every strong claim in the claim ledger and forces up to **4** `paper_qa` rounds (`_MAX_FORCED_PAPER_QA_PER_TURN = 4`) on those whose source was only the abstract/snippet; remaining strong claims without chunk-level evidence are labelled `unverifiable` so the synth caveats them |
 
 Each middleware returns a `MiddlewareDecision` (`Allow` / `DispatchOverride` / `AbortDispatch` / `FinalizeForceAction` / `FinalizeForceCritique` / `FinalizeAllow`) so the loop driver can compose decisions deterministically.
 

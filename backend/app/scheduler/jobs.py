@@ -187,16 +187,26 @@ async def _run_memory_consolidation() -> None:
 def start_scheduler() -> None:
     """Initialise and start the APScheduler instance with all configured cron jobs.
 
-    Creates an ``AsyncIOScheduler`` and registers four recurring jobs:
+    Creates an ``AsyncIOScheduler`` and registers **six** recurring jobs:
 
     - **ingestion_nightly**: runs ``_run_ingestion_all`` on the cron schedule
-      defined by ``settings.ingestion_cron``.
+      defined by ``settings.ingestion_cron`` (default Tue–Fri 05:00 UTC).
     - **clustering_weekly**: runs ``_run_clustering`` on the cron schedule
-      defined by ``settings.clustering_cron``.
+      defined by ``settings.clustering_cron``. *Currently a no-op scaffold —
+      the HDBSCAN subtopic-discovery implementation is post-MVP.*
     - **cross_namespace_weekly**: runs ``_run_cross_namespace_links`` on the
-      cron schedule defined by ``settings.cross_namespace_cron``.
+      cron schedule defined by ``settings.cross_namespace_cron``. *Currently a
+      no-op scaffold — the cosine-similarity bridge pass is post-MVP.*
     - **bookmark_index_rebuild_weekly**: runs ``_rebuild_bookmark_index``
       every Sunday at 03:00 UTC.
+    - **memory_consolidation_weekly**: runs ``_run_memory_consolidation``
+      every Sunday at 04:30 UTC.
+    - **checkpoint_cleanup_monthly**: runs ``_cleanup_checkpoints`` on the
+      1st of each month at 04:00 UTC.
+
+    Only the first three schedules are configurable via environment variables
+    (``INGESTION_CRON`` / ``CLUSTERING_CRON`` / ``CROSS_NAMESPACE_CRON``); the
+    last three have fixed schedules.
 
     This function is idempotent — if the scheduler is already running it
     returns immediately without creating a second instance.

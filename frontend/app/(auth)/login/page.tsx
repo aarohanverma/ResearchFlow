@@ -29,7 +29,7 @@ export default function LoginPage() {
       try {
         const user = await api.get<User>("/auth/me");
         setUser(user);
-        router.push(user.onboarding_complete ? "/feed" : "/settings/onboarding");
+        router.push("/feed");
       } catch {
         // Token valid but profile fetch failed — likely transient. Send to
         // /feed and let the layout's auth guard refetch as part of nav.
@@ -57,7 +57,7 @@ export default function LoginPage() {
       const user = await api.get<User>("/auth/me");
       await api.patch("/settings/profile", { display_name: "Guest Researcher" });
       setUser({ ...user, display_name: "Guest Researcher" });
-      router.push(user.onboarding_complete ? "/feed" : "/settings/onboarding");
+      router.push("/feed");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Guest login failed");
     } finally {

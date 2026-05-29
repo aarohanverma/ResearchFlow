@@ -859,7 +859,7 @@ class GraphService:
         """Create ``related_to`` edges between papers whose abstract embeddings are similar.
 
         Uses pgvector ANN search (one query per paper) to find the most similar
-        papers efficiently — leverages the IVFFlat/HNSW index rather than a
+        papers efficiently — leverages the HNSW index rather than a
         brute-force O(N²) pairwise loop.  Only adds edges that don't already
         exist.
 

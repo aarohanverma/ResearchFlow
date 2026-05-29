@@ -15,7 +15,9 @@ sys.path.insert(0, _backend)
 project = "ResearchFlow"
 copyright = "2026, Aarohan Verma"
 author = "ResearchFlow Team"
-release = "1.0.0"
+# Keep in sync with the FastAPI app version in backend/main.py and
+# frontend/package.json (both 0.1.0).
+release = "0.1.0"
 
 # ── Extensions ────────────────────────────────────────────────────────────────
 extensions = [
@@ -107,13 +109,12 @@ autodoc_mock_imports = [
     "marker", "marker_pdf", "docling", "fitz", "pymupdf", "easyocr",
     # ML / numerics
     "numpy", "hdbscan", "sklearn", "scikit_learn", "numexpr",
-    # Cloud
-    "azure", "azure.storage", "azure.identity", "azure.keyvault",
+    # Cloud (only azure-storage-blob is a real dependency)
+    "azure", "azure.storage",
     # Utilities
     "resend", "feedparser",
     "duckduckgo_search", "tavily",
     "tenacity", "pybreaker",
-    "orjson", "ujson",
     # Scheduling — mocked even though installed; APScheduler uses AsyncIOScheduler | None
     # type annotations at module level. The Mock object doesn't support `|` so the
     # annotation is evaluated lazily by wrapping the jobs page in autodoc.import_object.

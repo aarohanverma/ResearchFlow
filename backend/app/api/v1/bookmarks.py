@@ -128,7 +128,7 @@ async def _index_paper_background(paper_id: UUID, user_id: UUID) -> None:
                             GenieElement.paper_id == paper_id,
                         )
                     )
-                    if not existing.scalar_one_or_none():
+                    if not existing.scalars().first():
                         db2.add(GenieElement(
                             user_id=user_id,
                             element_type=ElementType.paper,
@@ -144,7 +144,7 @@ async def _index_paper_background(paper_id: UUID, user_id: UUID) -> None:
                     GenieElement.paper_id == paper_id,
                 )
             )
-            if not existing.scalar_one_or_none():
+            if not existing.scalars().first():
                 db.add(GenieElement(
                     user_id=user_id,
                     element_type=ElementType.paper,

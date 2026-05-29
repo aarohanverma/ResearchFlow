@@ -68,10 +68,15 @@ pymupdf==1.27.2.3          # required by GeminiVisionFallback for page rendering
 # Slides:  Marp CLI (Node.js, install separately):
 #   npm install -g @marp-team/marp-cli
 
-# ─── Clustering ───────────────────────────────────────────────────────────────
-hdbscan==0.8.40
+# ─── Numerics / Clustering ────────────────────────────────────────────────────
+# numpy is used at runtime (Genie pair-scoring / embedding math). hdbscan and
+# scikit-learn are reserved for the weekly subtopic-discovery clustering job,
+# which is still a no-op scaffold (see app/scheduler/jobs.py:_run_clustering —
+# "post-MVP"). They are kept pinned so the planned ClusteringWorkflow drops in
+# without a dependency change; nothing in the current runtime imports them.
 numpy==2.2.1
-scikit-learn==1.6.0
+hdbscan==0.8.40        # reserved for post-MVP clustering (not yet imported at runtime)
+scikit-learn==1.6.0    # reserved for post-MVP clustering (not yet imported at runtime)
 numexpr==2.14.1   # must be >=2.10.1 for NumPy 2.x compatibility (marker-pdf transitive dep)
 
 # ─── Email ────────────────────────────────────────────────────────────────────
@@ -81,18 +86,18 @@ resend==2.5.1
 redis[hiredis]==5.2.1
 
 # ─── Azure (cloud tier) ───────────────────────────────────────────────────────
+# Only the Blob SDK is used (app/adapters/blob/azure_blob.py, via connection
+# string). Key Vault / Managed Identity are NOT used in code — the documented
+# Azure deployment injects secrets as plain env vars into Container Apps, so the
+# azure-keyvault-secrets / azure-identity SDKs were dropped to slim the image.
 azure-storage-blob==12.24.0
-azure-keyvault-secrets==4.9.0
-azure-identity==1.19.0
 
 # ─── Feed parsing ─────────────────────────────────────────────────────────────
 feedparser==6.0.11
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
-python-dotenv==1.0.1
-cryptography==44.0.0
-orjson==3.10.12
-ujson==5.10.0
+python-dotenv==1.0.1   # used by pydantic-settings to load .env / .env.local
+cryptography==44.0.0   # Fernet encryption of per-user provider API keys
 
 # ─── Web search (LLM tool) ────────────────────────────────────────────────────
 duckduckgo-search==6.3.7      # free, no API key; default web search provider
@@ -102,4 +107,5 @@ tavily-python==0.5.0           # optional; set TAVILY_API_KEY to enable
 pytest==8.3.4
 pytest-asyncio==0.24.0
 pytest-mock==3.14.0
-httpx==0.28.1
+# httpx is already pinned under "Async I/O" above — used by both runtime and the
+# FastAPI TestClient, so no separate test pin is needed.
